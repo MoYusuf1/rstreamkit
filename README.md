@@ -40,3 +40,9 @@ cargo test
 
 The integration tests transmux real segments and have `ffmpeg` decode the result, and compare the
 decoded AC-3, E-AC-3 and MP2 sound with ffmpeg's own (skipped if `ffmpeg` isn't installed).
+
+## License
+
+Licensed under either of [Apache License, Version 2.0](LICENSE-APACHE) or [MIT license](LICENSE-MIT) at
+your option. Unless you say otherwise, any contribution you submit for inclusion is dual licensed as
+above, with no additional terms.
