@@ -14,7 +14,7 @@ use std::{
 };
 
 use futures_core::Stream;
-use wasm_bindgen::{JsCast, JsValue};
+use wasm_bindgen::{JsCast, JsValue, closure::Closure};
 use wasm_bindgen_futures::JsFuture;
 use web_sys::{
     Headers, HtmlVideoElement, MediaSource, MediaSourceReadyState, ReadableStreamDefaultReader,
@@ -449,10 +449,19 @@ fn buffered_ahead(video: &HtmlVideoElement) -> f64 {
     }
 }
 
+/// Resolves when the buffer has finished what it was doing: the browser says so (`updateend`, which
+/// follows success, error and abort alike), so nothing has to ask every few milliseconds.
 async fn wait_idle(sb: &SourceBuffer) {
-    while sb.updating() {
-        sleep(Duration::from_millis(5)).await;
+    if !sb.updating() {
+        return;
     }
+    let done = js_sys::Promise::new(&mut |resolve, _| {
+        let resolve_once = Closure::once_into_js(move || {
+            let _ = resolve.call0(&JsValue::UNDEFINED);
+        });
+        sb.set_onupdateend(Some(resolve_once.unchecked_ref()));
+    });
+    let _ = JsFuture::from(done).await;
 }
 
 /// Drops buffered media far behind the playhead so a long live session doesn't fill memory.
@@ -470,14 +479,18 @@ async fn trim(video: &HtmlVideoElement, sb: &SourceBuffer, keep: f64) {
     }
 }
 
-async fn append(video: &HtmlVideoElement, sb: &SourceBuffer, bytes: &[u8]) -> Result<(), String> {
+/// Hands `bytes` to the browser, which copies what it needs before returning: they are lent as a
+/// view of wasm memory, not copied into a JS buffer of ours first.
+async fn append(
+    video: &HtmlVideoElement,
+    sb: &SourceBuffer,
+    bytes: &mut [u8],
+) -> Result<(), String> {
     wait_idle(sb).await;
-    // Copy into a JS-side ArrayBuffer of exactly the right size (the wasm heap view overload is flaky).
-    let buf = js_sys::Uint8Array::from(bytes).buffer();
-    if let Err(e) = sb.append_buffer_with_array_buffer(&buf) {
+    if let Err(e) = sb.append_buffer_with_u8_array(bytes) {
         // Out of room: free everything old and try once more.
         trim(video, sb, 5.0).await;
-        sb.append_buffer_with_array_buffer(&buf)
+        sb.append_buffer_with_u8_array(bytes)
             .map_err(|_| js_err(e))?;
     }
     wait_idle(sb).await;
@@ -564,7 +577,7 @@ async fn run(
             if stop.get() {
                 return Ok(());
             }
-            let out = tx.push_owned(data.body)?;
+            let mut out = tx.push_owned(data.body)?;
             if let Some(codec) = &out.skipped_audio {
                 if !partial {
                     return Err(Unsupported::Sound(codec.clone()).into());
@@ -576,7 +589,7 @@ async fn run(
                     )));
                 }
             }
-            if let Some(init) = out.init {
+            if let Some(mut init) = out.init {
                 if init.interlaced && !partial {
                     return Err(Unsupported::Interlaced.into());
                 }
@@ -586,12 +599,12 @@ async fn run(
                             mime: init.mime.clone(),
                             why: js_err(e),
                         })?;
-                append(video, &buffer, &init.bytes).await?;
+                append(video, &buffer, &mut init.bytes).await?;
                 sb = Some(buffer);
             }
             let buffer = sb.as_ref().ok_or("no media buffer")?;
             if !out.fragment.is_empty() {
-                append(video, buffer, &out.fragment).await?;
+                append(video, buffer, &mut out.fragment).await?;
             }
             next_seq = Some(seg.seq + 1);
 
@@ -836,7 +849,7 @@ mod movie {
                 report(s)
             }
         };
-        let init = movie.init().map_err(|e| e.to_string())?;
+        let mut init = movie.init().map_err(|e| e.to_string())?;
 
         let ms = MediaSource::new().map_err(js_err)?;
         let object_url =
@@ -859,7 +872,7 @@ mod movie {
             })?;
         sb.set_timestamp_offset(movie.shift());
         ms.set_duration(movie.duration);
-        append(video, &sb, &init.bytes).await?;
+        append(video, &sb, &mut init.bytes).await?;
         if start > 0.0 {
             video.set_current_time(start);
         }
@@ -914,10 +927,10 @@ mod movie {
             if !buffered_at(video, t) && (t - frontier).abs() > 1.0 {
                 continue;
             }
-            let fragment = session.push(&part.bytes).map_err(|e| e.to_string())?;
+            let mut fragment = session.push(&part.bytes).map_err(|e| e.to_string())?;
             evict(video, &sb).await;
             if !fragment.is_empty() {
-                append(video, &sb, &fragment).await?;
+                append(video, &sb, &mut fragment).await?;
             }
             frontier = session.reached();
             if !started && buffered_at(video, video.current_time().max(start)) {
