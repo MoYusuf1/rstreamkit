@@ -29,12 +29,14 @@ let out = t.push(&segment_bytes)?;      // out.init (once), out.fragment, out.sk
 dropped and named in `skipped_audio` (in the browser glue, `mse::start(.., decode_sound, ..)` reports
 `Status::Unsupported(Unsupported::Sound(..))`), for a caller that has real ffmpeg do it instead.
 
-In the browser, `mse::start(video, playlist_url, fetcher, partial, decode_sound, report)` plays a stream.
-`fetcher` is how bytes reach the page: `mse::Direct::default()` uses the browser's own `fetch` (the server
-must allow it, CORS), and an app that goes through a proxy implements the small `mse::Fetch` trait for it.
-rstreamkit knows nothing about proxies or headers; it asks for real URLs (and, for movie files read with
-`mse::probe` and `mse::play_movie`, byte ranges) and resolves playlist entries against each response's
-final URL.
+In the browser, `mse::start(video, playlist_url, fetcher, partial, decode_sound, report)` plays a stream
+(addresses are plain strings). `fetcher` is how bytes reach the page: `mse::Direct` uses the browser's own
+`fetch` (the server must allow it: CORS, and `Access-Control-Expose-Headers: Content-Range` for byte
+ranges), and an app that goes through a proxy implements the small `mse::Fetch` trait for it.
+rstreamkit knows nothing about proxies or headers; it asks for real addresses (and, for movie files read
+with `mse::probe` and `mse::play_movie`, byte ranges) and resolves playlist entries against each
+response's final address. It depends on no HTTP or URL crate: the browser already has `fetch`, and
+`url::join` resolves references as RFC 3986 says.
 
 `cargo run --example transmux -- out.mp4 seg1.ts seg2.ts` writes a playable file from local segments.
 

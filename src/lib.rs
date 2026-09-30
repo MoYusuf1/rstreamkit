@@ -13,6 +13,7 @@ pub mod mp4;
 pub mod mse;
 pub mod sound;
 pub mod ts;
+pub mod url;
 pub mod vod;
 
 #[derive(Debug, thiserror::Error)]
