@@ -1,11 +1,13 @@
-//! Browser side: fetch HLS playlists and segments through the proxy, transmux them, and feed a
+//! Browser side: fetch HLS playlists and segments (through a [`Fetch`]), transmux them, and feed a
 //! `<video>` element through MediaSource. Live playlists are refreshed until stopped.
 //!
 //! ponytail: `SourceBuffer.updating` is polled every few ms instead of awaiting events, and
 //! failed downloads are retried a fixed number of times. Both are simple and good enough.
 
-use std::{cell::Cell, rc::Rc, time::Duration};
+use std::{cell::Cell, ops::Range, pin::Pin, rc::Rc, time::Duration};
 
+use futures_core::Stream;
+use futures_util::StreamExt;
 use reqwest::Url;
 use wasm_bindgen::JsValue;
 use wasm_bindgen_futures::JsFuture;
@@ -52,14 +54,15 @@ impl Drop for Player {
     }
 }
 
-/// `playlist` is the (proxied) playlist URL; `wrap` turns any upstream URL into a proxied one.
+/// `playlist` is the playlist's real URL, and `http` gets every URL the player needs ([`Direct`]
+/// goes straight to the server; an app behind a proxy brings its own [`Fetch`]).
 /// With `partial` a stream whose sound can't be played still plays, silently; without it that is
 /// reported as `NeedsConversion` so it can be fixed instead. `decode_sound` decodes AC-3, E-AC-3 and
 /// MP2 sound here; without it that sound is such a problem too.
 pub fn start(
     video: HtmlVideoElement,
     playlist: Url,
-    wrap: impl Fn(Url) -> Url + 'static,
+    http: impl Fetch + 'static,
     partial: bool,
     decode_sound: bool,
     report: impl FnMut(Status) + 'static,
@@ -71,7 +74,7 @@ pub fn start(
         match run(
             &video,
             playlist,
-            &wrap,
+            &http,
             partial,
             decode_sound,
             &stopped,
@@ -110,95 +113,121 @@ pub async fn sleep(d: Duration) {
     let _ = JsFuture::from(p).await;
 }
 
-/// Hostname behind a proxied URL, for error messages (never the path or credentials).
-fn upstream_host(proxied: &Url) -> String {
-    proxied
-        .query_pairs()
-        .find(|(k, _)| k == "url")
-        .and_then(|(_, v)| Url::parse(&v).ok())
-        .and_then(|u| u.host_str().map(str::to_owned))
-        .unwrap_or_else(|| "the server".into())
+/// How the player reaches the network. The app supplies it, so rffmpeg knows nothing about proxies,
+/// credentials or headers: [`Direct`] is the plain case, and an app that has to go through a proxy
+/// implements this for it. Dropping the future or the [`Response::body`] cancels the request.
+// Not `Send` on purpose: this only ever runs on the browser's one thread.
+#[allow(async_fn_in_trait)]
+pub trait Fetch {
+    /// GETs `url`, which is always the real address; with a `range` (never empty), only those bytes
+    /// of it, as an HTTP `Range` request. `Ok` means a response came back, whatever its status;
+    /// `Err` is for when it didn't, or when the app itself refuses or can't make the request.
+    async fn get(&self, url: &Url, range: Option<Range<u64>>) -> Result<Response, FetchError>;
+}
+
+pub struct Response {
+    pub status: u16,
+    /// Where the request ended up after redirects: relative playlist entries resolve against it.
+    pub url: Url,
+    pub content_type: String,
+    pub content_length: Option<u64>,
+    /// For a range request the server answered with 206: the whole file's length, from `Content-Range`.
+    pub range_total: Option<u64>,
+    pub body: Body,
+}
+
+/// A response body, chunk by chunk (the player stops reading one that grows past its limit).
+pub type Body = Pin<Box<dyn Stream<Item = Result<Vec<u8>, String>>>>;
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum FetchError {
+    /// Might go away: a network error, a server that is down.
+    Temporary(String),
+    /// Won't get better by asking again: a refusal, or a proxy that doesn't answer as expected.
+    Permanent(String),
+}
+
+/// Fetches with the browser's own `fetch`, straight from the server, which therefore has to allow it
+/// (CORS). Good for a server you run yourself; behind a proxy, implement [`Fetch`] for that instead.
+#[derive(Default, Clone)]
+pub struct Direct(reqwest::Client);
+
+impl Fetch for Direct {
+    async fn get(&self, url: &Url, range: Option<Range<u64>>) -> Result<Response, FetchError> {
+        let mut request = self.0.get(url.clone());
+        if let Some(r) = range {
+            request = request.header("Range", format!("bytes={}-{}", r.start, r.end - 1));
+        }
+        let r = request.send().await.map_err(|e| {
+            FetchError::Temporary(format!(
+                "request to {} failed: {}",
+                url.host_str().unwrap_or("the server"),
+                e.without_url()
+            ))
+        })?;
+        Ok(r.into())
+    }
+}
+
+/// For a [`Fetch`] that makes its own `reqwest` request (say, through a proxy) and only has to
+/// adjust what comes back, such as the final URL.
+impl From<reqwest::Response> for Response {
+    fn from(r: reqwest::Response) -> Self {
+        let content_type = r
+            .headers()
+            .get("content-type")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("")
+            .to_owned();
+        // "bytes 0-262143/1234567"
+        let range_total = r
+            .headers()
+            .get("content-range")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.rsplit('/').next())
+            .and_then(|t| t.parse().ok());
+        Response {
+            status: r.status().as_u16(),
+            url: r.url().clone(),
+            content_type,
+            content_length: r.content_length(),
+            range_total,
+            body: Box::pin(r.bytes_stream().map(|chunk| {
+                chunk
+                    .map(|b| b.to_vec())
+                    .map_err(|e| e.without_url().to_string())
+            })),
+        }
+    }
 }
 
 struct Fetched {
     body: Vec<u8>,
     content_type: String,
-    /// Final URL after redirects, as reported by the proxy; relative playlist entries resolve against it.
-    upstream: Url,
+    /// Final URL after redirects; relative playlist entries resolve against it.
+    url: Url,
 }
 
-async fn fetch_once(
-    http: &reqwest::Client,
-    proxied: &Url,
-    limit: usize,
-) -> Result<Fetched, String> {
-    let host = upstream_host(proxied);
-    let r = http
-        .get(proxied.clone())
-        .send()
-        .await
-        .map_err(|e| format!("request to the proxy failed: {}", e.without_url()))?;
-    let status = r.status();
-    if !status.is_success() {
-        // The proxy explains its own refusals; anything else is the provider talking.
-        if let Some(why) = r
-            .headers()
-            .get("x-riptv-error")
-            .and_then(|v| v.to_str().ok())
-        {
-            // "refused" marks a permanent no, which the retry loop below gives up on.
-            let what = if status == 403 {
-                "refused"
-            } else {
-                "could not reach"
-            };
-            return Err(format!("the proxy {what} {host}: {why}"));
-        }
-        return Err(format!("{host} answered HTTP {status}"));
-    }
-    let upstream = r
-        .headers()
-        .get("x-upstream-url")
-        .and_then(|v| v.to_str().ok())
-        .and_then(|s| Url::parse(s).ok())
-        .ok_or("the proxy did not report the upstream URL (is it an old build?)")?;
-    let content_type = r
-        .headers()
-        .get("content-type")
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("")
-        .to_owned();
-    // Refuse a raw stream by what the server says it is, or how long it says it is, before reading
-    // any of it.
-    if limit == PLAYLIST_LIMIT {
-        let kind = content_type.to_ascii_lowercase();
-        if kind.starts_with("video/") && !kind.contains("mpegurl") {
-            return Err(raw_stream());
-        }
-    }
-    if r.content_length().is_some_and(|n| n > limit as u64) {
-        return Err(too_big(&host, limit));
-    }
-    // The length may be missing or wrong (chunked, or a stream dressed up as a file): count as it arrives.
-    let body = body::read_capped(std::pin::pin!(r.bytes_stream()), limit)
-        .await
-        .map_err(|e| match e {
-            Capped::TooBig => too_big(&host, limit),
-            Capped::Failed(e) => format!("download from {host} failed: {}", e.without_url()),
-        })?;
-    Ok(Fetched {
-        body,
-        content_type,
-        upstream,
-    })
+/// Why one download failed, and whether asking again could help.
+enum Fail {
+    Retry(String),
+    Final(String),
 }
 
-async fn fetch(
-    http: &reqwest::Client,
-    proxied: &Url,
-    limit: usize,
+impl From<FetchError> for Fail {
+    fn from(e: FetchError) -> Self {
+        match e {
+            FetchError::Temporary(why) => Fail::Retry(why),
+            FetchError::Permanent(why) => Fail::Final(why),
+        }
+    }
+}
+
+/// Runs `once` up to three times, a second apart, until it works or fails for good.
+async fn with_retries<T, F: Future<Output = Result<T, Fail>>>(
     stop: &Cell<bool>,
-) -> Result<Fetched, String> {
+    mut once: impl FnMut() -> F,
+) -> Result<T, String> {
     let mut last = String::new();
     for attempt in 0..3 {
         if attempt > 0 {
@@ -207,25 +236,56 @@ async fn fetch(
         if stop.get() {
             break;
         }
-        match fetch_once(http, proxied, limit).await {
-            Ok(f) => return Ok(f),
-            // A refusal or a bad build won't get better by asking again.
-            Err(e)
-                if e.contains("refused")
-                    || e.contains("did not report")
-                    || e.ends_with(TOO_BIG)
-                    || crate::needs_conversion(&e).is_some() =>
-            {
-                return Err(e);
-            }
-            Err(e) => last = e,
+        match once().await {
+            Ok(v) => return Ok(v),
+            // A refusal, or something that isn't what was asked for, won't get better by asking again.
+            Err(Fail::Final(e)) => return Err(e),
+            Err(Fail::Retry(e)) => last = e,
         }
     }
     Err(last)
 }
 
-/// Ends the error for a body past its cap: reading it again would only read it all again.
-const TOO_BIG: &str = "that is a stream, not HLS";
+async fn fetch_once(http: &impl Fetch, url: &Url, limit: usize) -> Result<Fetched, Fail> {
+    let host = url.host_str().unwrap_or("the server");
+    let r = http.get(url, None).await?;
+    if !(200..300).contains(&r.status) {
+        return Err(Fail::Retry(format!("{host} answered HTTP {}", r.status)));
+    }
+    // Refuse a raw stream by what the server says it is, or how long it says it is, before reading
+    // any of it.
+    if limit == PLAYLIST_LIMIT {
+        let kind = r.content_type.to_ascii_lowercase();
+        if kind.starts_with("video/") && !kind.contains("mpegurl") {
+            return Err(Fail::Final(raw_stream()));
+        }
+    }
+    if r.content_length.is_some_and(|n| n > limit as u64) {
+        return Err(Fail::Final(too_big(host, limit)));
+    }
+    // The length may be missing or wrong (chunked, or a stream dressed up as a file): count as it arrives.
+    let body = body::read_capped(r.body, limit)
+        .await
+        .map_err(|e| match e {
+            // Reading it again would only read it all again.
+            Capped::TooBig => Fail::Final(too_big(host, limit)),
+            Capped::Failed(why) => Fail::Retry(format!("download from {host} failed: {why}")),
+        })?;
+    Ok(Fetched {
+        body,
+        content_type: r.content_type,
+        url: r.url,
+    })
+}
+
+async fn fetch(
+    http: &impl Fetch,
+    url: &Url,
+    limit: usize,
+    stop: &Cell<bool>,
+) -> Result<Fetched, String> {
+    with_retries(stop, || fetch_once(http, url, limit)).await
+}
 
 fn too_big(host: &str, limit: usize) -> String {
     let what = if limit == PLAYLIST_LIMIT {
@@ -234,7 +294,7 @@ fn too_big(host: &str, limit: usize) -> String {
         "a segment"
     };
     format!(
-        "{host} sent more than {} MB where {what} was expected; {TOO_BIG}",
+        "{host} sent more than {} MB where {what} was expected; that is a stream, not HLS",
         limit >> 20
     )
 }
@@ -322,7 +382,7 @@ impl Drop for ObjectUrl {
 async fn run(
     video: &HtmlVideoElement,
     playlist: Url,
-    wrap: &dyn Fn(Url) -> Url,
+    http: &impl Fetch,
     partial: bool,
     decode_sound: bool,
     stop: &Cell<bool>,
@@ -334,16 +394,15 @@ async fn run(
             report(s)
         }
     };
-    let http = reqwest::Client::new();
 
     // A master playlist points at variants; pick one and follow it. `media_url` is what we refresh.
-    let first = fetch(&http, &playlist, PLAYLIST_LIMIT, stop).await?;
+    let first = fetch(http, &playlist, PLAYLIST_LIMIT, stop).await?;
     let (media_url, mut latest) = match hls::parse(&first.body).map_err(|e| describe(&first, e))? {
         hls::Parsed::Media(_) => (playlist, first),
         hls::Parsed::Master(variants) => {
             let v = hls::pick_variant(&variants).ok_or("the playlist lists no streams")?;
-            let url = wrap(first.upstream.join(&v.uri).map_err(|e| e.to_string())?);
-            let f = fetch(&http, &url, PLAYLIST_LIMIT, stop).await?;
+            let url = first.url.join(&v.uri).map_err(|e| e.to_string())?;
+            let f = fetch(http, &url, PLAYLIST_LIMIT, stop).await?;
             (url, f)
         }
     };
@@ -387,8 +446,8 @@ async fn run(
             if stop.get() {
                 return Ok(());
             }
-            let url = wrap(latest.upstream.join(&seg.uri).map_err(|e| e.to_string())?);
-            let data = fetch(&http, &url, SEGMENT_LIMIT, stop).await?;
+            let url = latest.url.join(&seg.uri).map_err(|e| e.to_string())?;
+            let data = fetch(http, &url, SEGMENT_LIMIT, stop).await?;
             if stop.get() {
                 return Ok(());
             }
@@ -460,7 +519,7 @@ async fn run(
         if stop.get() {
             return Ok(());
         }
-        latest = fetch(&http, &media_url, PLAYLIST_LIMIT, stop).await?;
+        latest = fetch(http, &media_url, PLAYLIST_LIMIT, stop).await?;
         media = parse_media(&latest)?;
     }
 }
@@ -482,80 +541,37 @@ struct Part {
     total: u64,
 }
 
-/// `len` bytes of the file from `start`, through the proxy.
+/// `len` bytes of the file from `start`.
 async fn get_range(
-    http: &reqwest::Client,
+    http: &impl Fetch,
     url: &Url,
     start: u64,
     len: u64,
     stop: &Cell<bool>,
 ) -> Result<Part, String> {
-    let mut last = String::new();
-    for attempt in 0..3 {
-        if attempt > 0 {
-            sleep(Duration::from_secs(1)).await;
-        }
-        if stop.get() {
-            break;
-        }
-        match get_range_once(http, url, start, len).await {
-            Ok(p) => return Ok(p),
-            Err(e) if e.contains("refused") || e.contains("ranges") => return Err(e),
-            Err(e) => last = e,
-        }
-    }
-    Err(last)
+    with_retries(stop, || get_range_once(http, url, start, len)).await
 }
 
-async fn get_range_once(
-    http: &reqwest::Client,
-    url: &Url,
-    start: u64,
-    len: u64,
-) -> Result<Part, String> {
-    let host = upstream_host(url);
-    let r = http
-        .get(url.clone())
-        .header("Range", format!("bytes={start}-{}", start + len.max(1) - 1))
-        .send()
-        .await
-        .map_err(|e| format!("request to the proxy failed: {}", e.without_url()))?;
-    let status = r.status();
-    if status != 206 {
-        if let Some(why) = r
-            .headers()
-            .get("x-riptv-error")
-            .and_then(|v| v.to_str().ok())
-        {
-            let what = if status == 403 {
-                "refused"
-            } else {
-                "could not reach"
-            };
-            return Err(format!("the proxy {what} {host}: {why}"));
-        }
+async fn get_range_once(http: &impl Fetch, url: &Url, start: u64, len: u64) -> Result<Part, Fail> {
+    let host = url.host_str().unwrap_or("the server");
+    let no_ranges = || Fail::Final(format!("{host} does not serve byte ranges"));
+    let r = http.get(url, Some(start..start + len.max(1))).await?;
+    if r.status != 206 {
         // A 200 would be the whole file: dropping the response stops it.
-        return Err(if status == 200 {
-            format!("{host} does not serve byte ranges")
+        return Err(if r.status == 200 {
+            no_ranges()
         } else {
-            format!("{host} answered HTTP {status}")
+            Fail::Retry(format!("{host} answered HTTP {}", r.status))
         });
     }
-    // "bytes 0-262143/1234567"
-    let total = r
-        .headers()
-        .get("content-range")
-        .and_then(|v| v.to_str().ok())
-        .and_then(|v| v.rsplit('/').next())
-        .and_then(|t| t.parse().ok())
-        .ok_or_else(|| format!("{host} does not serve byte ranges"))?;
+    let total = r.range_total.ok_or_else(no_ranges)?;
     // A range answers with at most what was asked for; anything more is not a range.
     let limit = usize::try_from(len).unwrap_or(usize::MAX >> 1) + 1024;
-    let bytes = body::read_capped(std::pin::pin!(r.bytes_stream()), limit)
+    let bytes = body::read_capped(r.body, limit)
         .await
         .map_err(|e| match e {
-            Capped::TooBig => format!("{host} sent more than the range asked for"),
-            Capped::Failed(e) => format!("download from {host} failed: {}", e.without_url()),
+            Capped::TooBig => Fail::Final(format!("{host} sent more than the range asked for")),
+            Capped::Failed(why) => Fail::Retry(format!("download from {host} failed: {why}")),
         })?;
     Ok(Part { bytes, total })
 }
@@ -563,12 +579,11 @@ async fn get_range_once(
 /// Reads what kind of movie a file is: MP4 or Matroska, its tracks and its index, from a few range
 /// requests. Fails for anything else (or a server without ranges), in which case the browser
 /// should be left to play the file itself.
-pub async fn probe(url: &Url) -> Result<Rc<vod::Movie>, String> {
+pub async fn probe(http: &impl Fetch, url: &Url) -> Result<Rc<vod::Movie>, String> {
     /// The index of a movie is megabytes at the very most.
     const INDEX_LIMIT: u64 = 64 << 20;
     let stop = Cell::new(false);
-    let http = reqwest::Client::new();
-    let head = get_range(&http, url, 0, 256 << 10, &stop).await?;
+    let head = get_range(http, url, 0, 256 << 10, &stop).await?;
     let total = head.total;
 
     if head.bytes.starts_with(&[0x1A, 0x45, 0xDF, 0xA3]) {
@@ -584,7 +599,7 @@ pub async fn probe(url: &Url) -> Result<Rc<vod::Movie>, String> {
                     if len > INDEX_LIMIT {
                         return Err("the movie's index is too big".into());
                     }
-                    part = get_range(&http, url, start, len, &stop).await?;
+                    part = get_range(http, url, start, len, &stop).await?;
                     at = start;
                 }
             }
@@ -604,7 +619,7 @@ pub async fn probe(url: &Url) -> Result<Rc<vod::Movie>, String> {
                 let moov = if inside {
                     part.bytes[(off - at) as usize..][..len as usize].to_vec()
                 } else {
-                    get_range(&http, url, off, len, &stop).await?.bytes
+                    get_range(http, url, off, len, &stop).await?.bytes
                 };
                 let (_, _, head) = mp4::box_header(&moov).ok_or("the MP4 index is damaged")?;
                 let movie =
@@ -612,7 +627,7 @@ pub async fn probe(url: &Url) -> Result<Rc<vod::Movie>, String> {
                 return Ok(Rc::new(movie));
             }
             mp4::Moov::Next(to) if to < total => {
-                part = get_range(&http, url, to, 64 << 10, &stop).await?;
+                part = get_range(http, url, to, 64 << 10, &stop).await?;
                 at = to;
             }
             _ => return Err("this is not an MP4 file".into()),
@@ -627,6 +642,7 @@ pub fn play_movie(
     video: HtmlVideoElement,
     movie: Rc<vod::Movie>,
     url: Url,
+    http: impl Fetch + 'static,
     start: f64,
     report: impl FnMut(Status) + 'static,
 ) -> Player {
@@ -634,7 +650,7 @@ pub fn play_movie(
     let stopped = stop.clone();
     let mut report = report;
     wasm_bindgen_futures::spawn_local(async move {
-        if let Err(e) = run_movie(&video, &movie, &url, start, &stopped, &mut report).await
+        if let Err(e) = run_movie(&video, &movie, &url, &http, start, &stopped, &mut report).await
             && !stopped.get()
         {
             report(match crate::needs_conversion(&e) {
@@ -685,6 +701,7 @@ async fn run_movie(
     video: &HtmlVideoElement,
     movie: &Rc<vod::Movie>,
     url: &Url,
+    http: &impl Fetch,
     start: f64,
     stop: &Cell<bool>,
     report: &mut dyn FnMut(Status),
@@ -694,7 +711,6 @@ async fn run_movie(
             report(s)
         }
     };
-    let http = reqwest::Client::new();
     let init = movie.init().map_err(|e| e.to_string())?;
 
     let ms = MediaSource::new().map_err(js_err)?;
@@ -761,7 +777,7 @@ async fn run_movie(
             continue;
         };
         first_chunk = false;
-        let part = get_range(&http, url, offset, len, stop).await?;
+        let part = get_range(http, url, offset, len, stop).await?;
         if stop.get() {
             return Ok(());
         }
