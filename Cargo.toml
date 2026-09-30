@@ -2,6 +2,7 @@
 name = "rffmpeg"
 version = "0.1.0"
 edition = "2024"
+license = "MIT OR Apache-2.0"
 description = "Pure-Rust media engine: HLS and MPEG-TS in, fragmented MP4 out, with AC-3, E-AC-3 and MP2 sound decoded in Rust. Plays in a browser through MediaSource."
 
 [dependencies]
