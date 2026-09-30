@@ -77,6 +77,50 @@ fn a_timestamp_jump_is_glued_onto_the_end_of_the_previous_fragment() {
     assert!(first.fragment.len() > 10_000 && second.fragment.len() > 10_000);
 }
 
+/// Every track's base time in a fragment (video first, then audio).
+fn tfdts(fragment: &[u8]) -> Vec<u64> {
+    fragment
+        .windows(4)
+        .enumerate()
+        .filter(|(_, w)| *w == b"tfdt")
+        .map(|(p, _)| u64::from_be_bytes(fragment[p + 8..p + 16].try_into().unwrap()))
+        .collect()
+}
+
+/// A stream whose clock restarts below the media already sent (encoder restart, ad splice with reset
+/// timestamps) must play on after it, not be written on top of what is buffered. Pushing one
+/// segment over and over restarts the clock every time; once the sent media is longer than the
+/// segment's own start time, the restarted clock is *below* it.
+#[test]
+fn a_clock_restarting_below_the_sent_media_still_plays_on() {
+    let d = ts::demux(SEGMENT).unwrap();
+    let span = d.video.last().unwrap().dts - d.video[0].dts;
+    assert!(
+        d.video[0].dts < 4 * span,
+        "fixture must start early enough for the restart to fall below the sent media"
+    );
+
+    let mut t = Transmuxer::default();
+    let mut previous: Option<Vec<u64>> = None;
+    for push in 0..12 {
+        let at = tfdts(&t.push(SEGMENT).unwrap().fragment);
+        assert_eq!(at.len(), 2, "video and audio");
+        if let Some(before) = &previous {
+            for (track, (now, was)) in at.iter().zip(before).enumerate() {
+                assert!(now > was, "push {push}, track {track}: {now} after {was}");
+            }
+            // Each segment follows the last, about one segment further on.
+            assert!(
+                at[0].abs_diff(before[0] + span) < 3 * 3003,
+                "push {push}: video at {} after {}, a segment is {span}",
+                at[0],
+                before[0]
+            );
+        }
+        previous = Some(at);
+    }
+}
+
 /// Independent check: hand the muxed bytes to ffmpeg, which must decode every frame without complaint.
 #[test]
 fn ffmpeg_decodes_the_output_without_errors() {

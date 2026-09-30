@@ -70,7 +70,9 @@ enum Audio {
 /// Turns consecutive HLS TS segments into a continuous fMP4 stream.
 #[derive(Default)]
 pub struct Transmuxer {
-    base: Option<u64>,
+    /// Source time (90 kHz, unwrapped) that maps to zero in the output. Negative if the source
+    /// clock restarted below the media already sent.
+    base: Option<i64>,
     /// Last (unwrapped) timestamp seen, used to resolve the 33-bit rollover.
     last: u64,
     /// Where the previous fragment ended, relative to `base`, in 90 kHz ticks.
@@ -180,14 +182,17 @@ impl Transmuxer {
         };
 
         // Timelines start at zero, and a jump in the source timeline is re-based so it plays on.
+        // `base` is signed: a clock that restarts below the media already sent puts it under zero.
+        let (first, sent) = (first as i64, self.end as i64);
         let base = match self.base {
-            Some(b) if first.abs_diff(b + self.end) <= JUMP => b,
+            Some(b) if first.abs_diff(b + sent) <= JUMP => b,
             _ => {
                 self.audio_next = None;
-                first.saturating_sub(self.end)
+                first - sent
             }
         };
         self.base = Some(base);
+        let rel = |t: u64| (t as i64 - base).max(0) as u64;
 
         let mut runs = vec![];
         let mut end = 0;
@@ -210,7 +215,7 @@ impl Transmuxer {
                     }
                 })
                 .collect();
-            let start = video[0].0.saturating_sub(base);
+            let start = rel(video[0].0);
             end = end.max(start + samples.iter().map(|s| s.duration as u64).sum::<u64>());
             runs.push(fmp4::TrackRun {
                 track: fmp4::VIDEO_TRACK,
@@ -220,7 +225,7 @@ impl Transmuxer {
         }
         if let (Some(cfg), Audio::Aac, false) = (d.aac, self.audio, audio.is_empty()) {
             let rate = cfg.sample_rate() as u64;
-            let derived = audio[0].saturating_sub(base) * rate / 90_000;
+            let derived = rel(audio[0]) * rate / 90_000;
             // Keep audio gapless: 90 kHz -> sample-rate rounding must not open 1-tick holes between fragments.
             let start = match self.audio_next {
                 Some(next) if derived.abs_diff(next) <= 1024 => next,
@@ -263,7 +268,7 @@ impl Transmuxer {
                 self.flac_frames += 1;
             }
             let rate = u64::from(rate);
-            let derived = sound_pts[0].saturating_sub(base) * rate / 90_000;
+            let derived = rel(sound_pts[0]) * rate / 90_000;
             // Gapless, as for AAC: rounding 90 kHz ticks to samples must not open holes.
             let tolerance = u64::from(flac[0].1);
             let start = match self.audio_next {
