@@ -74,6 +74,24 @@ For the page's release profile, `opt-level = "s"` with `lto = true`, `codegen-un
 faster but 23% bigger, so it isn't worth it. The sound decoders' speed is the decoders': about 55 ms
 for six seconds of 5.1 AC-3, whatever the level.
 
+## What it costs
+
+Measured on the `wasm32` build (`opt-level = "z"`) running under V8, and in Chrome 152. Wasm memory is
+the figure that matters: the browser never gives it back, so the peak is what the page keeps.
+
+| | Memory | Time |
+|---|---|---|
+| A 6 s, 6.1 MB 1080p H.264 + AAC segment | 7.7 MB (1.3x the segment) | 4.5 ms |
+| The same with 5.1 AC-3 decoded in Rust | 10.3 MB (1.6x) | 59 ms (the decoder's 55, FLAC 4) |
+| An MP4 film's index | 24 bytes a sample: 2.4 MB for 30 minutes, about 10 MB for 2 hours | 6 ms for 30 minutes; a seek is under 0.1 ms |
+| A Matroska film's index | 16 bytes a cue: about 1 MB for 30 minutes | 1.6 ms |
+| Playing a film | flat; pieces of 5 s | 43 ms a piece with AC-3 decoded (none without), the same from the first piece to the last |
+
+Live video costs almost nothing: the transmuxer only rewraps it (H.264 and AAC are never decoded), about
+1,300 times faster than real time. The expensive thing is decoding sound the browser can't play, and it
+is opt-in (`sound`). Segments are demuxed as they download and written straight into the buffer they are
+sent in, which is why one takes about its own size.
+
 ## What it doesn't do
 
 HEVC and other video codecs (only H.264 passes through), AES-128, fMP4 segments, adaptive bitrate.
