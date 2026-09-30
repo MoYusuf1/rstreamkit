@@ -131,7 +131,7 @@ pub fn pick_variant(variants: &[Variant]) -> Option<&Variant> {
 }
 
 pub const RAW_STREAM: &str =
-    "this channel sends a raw MPEG-TS stream instead of an HLS playlist, which isn't supported yet";
+    "this is a raw MPEG-TS stream, not an HLS playlist, and that isn't supported yet";
 
 /// MPEG-TS packets are 188 bytes and each starts with 0x47.
 pub fn looks_like_ts(body: &[u8]) -> bool {

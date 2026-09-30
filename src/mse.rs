@@ -14,7 +14,7 @@ use wasm_bindgen_futures::JsFuture;
 use web_sys::{HtmlVideoElement, MediaSource, MediaSourceReadyState, SourceBuffer};
 
 use crate::{
-    Transmuxer,
+    Transmuxer, Unsupported,
     body::{self, Capped},
     hls, mkv, mp4, vod,
 };
@@ -32,15 +32,68 @@ const PLAYLIST_LIMIT: usize = 2 << 20;
 const SEGMENT_LIMIT: usize = 64 << 20;
 
 #[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
 pub enum Status {
     Playing,
     /// Something the viewer should know but playback continues (e.g. audio codec unsupported).
     Note(String),
-    /// This browser can't play the stream as it is, but a converted copy might play: HEVC video,
-    /// sound it can't decode, or a raw stream. The reason is for the viewer.
-    NeedsConversion(String),
+    /// The stream can't be played as it is, and why. What to do about it (say so, play without the
+    /// sound, hand the stream to something that can convert it) is up to the app.
+    Unsupported(Unsupported),
     Ended,
+    /// Playback stopped for any other reason, in words for the viewer.
     Failed(String),
+}
+
+/// Why playback stopped, inside the player.
+enum Failure {
+    Unsupported(Unsupported),
+    Other(String),
+}
+
+impl From<String> for Failure {
+    fn from(why: String) -> Self {
+        Failure::Other(why)
+    }
+}
+
+impl From<&str> for Failure {
+    fn from(why: &str) -> Self {
+        Failure::Other(why.to_owned())
+    }
+}
+
+impl From<Unsupported> for Failure {
+    fn from(why: Unsupported) -> Self {
+        Failure::Unsupported(why)
+    }
+}
+
+impl From<crate::Error> for Failure {
+    fn from(e: crate::Error) -> Self {
+        match e.unsupported() {
+            Some(why) => why.into(),
+            None => Failure::Other(e.to_string()),
+        }
+    }
+}
+
+impl From<Failure> for Status {
+    fn from(f: Failure) -> Self {
+        match f {
+            Failure::Unsupported(why) => Status::Unsupported(why),
+            Failure::Other(why) => Status::Failed(why),
+        }
+    }
+}
+
+impl From<Failure> for String {
+    fn from(f: Failure) -> Self {
+        match f {
+            Failure::Unsupported(why) => why.to_string(),
+            Failure::Other(why) => why,
+        }
+    }
 }
 
 /// Stops playback when dropped.
@@ -57,7 +110,7 @@ impl Drop for Player {
 /// `playlist` is the playlist's real URL, and `http` gets every URL the player needs ([`Direct`]
 /// goes straight to the server; an app behind a proxy brings its own [`Fetch`]).
 /// With `partial` a stream whose sound can't be played still plays, silently; without it that is
-/// reported as `NeedsConversion` so it can be fixed instead. `decode_sound` decodes AC-3, E-AC-3 and
+/// reported as `Status::Unsupported` so the app can decide what to do about it. `decode_sound` decodes AC-3, E-AC-3 and
 /// MP2 sound here; without it that sound is such a problem too.
 pub fn start(
     video: HtmlVideoElement,
@@ -83,10 +136,7 @@ pub fn start(
         .await
         {
             Ok(()) if !stopped.get() => report(Status::Ended),
-            Err(e) if !stopped.get() => report(match crate::needs_conversion(&e) {
-                Some(reason) => Status::NeedsConversion(reason.to_string()),
-                None => Status::Failed(e),
-            }),
+            Err(e) if !stopped.get() => report(e.into()),
             _ => {}
         }
     });
@@ -140,6 +190,7 @@ pub struct Response {
 pub type Body = Pin<Box<dyn Stream<Item = Result<Vec<u8>, String>>>>;
 
 #[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
 pub enum FetchError {
     /// Might go away: a network error, a server that is down.
     Temporary(String),
@@ -212,6 +263,7 @@ struct Fetched {
 enum Fail {
     Retry(String),
     Final(String),
+    Unsupported(Unsupported),
 }
 
 impl From<FetchError> for Fail {
@@ -227,7 +279,7 @@ impl From<FetchError> for Fail {
 async fn with_retries<T, F: Future<Output = Result<T, Fail>>>(
     stop: &Cell<bool>,
     mut once: impl FnMut() -> F,
-) -> Result<T, String> {
+) -> Result<T, Failure> {
     let mut last = String::new();
     for attempt in 0..3 {
         if attempt > 0 {
@@ -239,11 +291,12 @@ async fn with_retries<T, F: Future<Output = Result<T, Fail>>>(
         match once().await {
             Ok(v) => return Ok(v),
             // A refusal, or something that isn't what was asked for, won't get better by asking again.
-            Err(Fail::Final(e)) => return Err(e),
+            Err(Fail::Final(e)) => return Err(e.into()),
+            Err(Fail::Unsupported(why)) => return Err(why.into()),
             Err(Fail::Retry(e)) => last = e,
         }
     }
-    Err(last)
+    Err(last.into())
 }
 
 async fn fetch_once(http: &impl Fetch, url: &Url, limit: usize) -> Result<Fetched, Fail> {
@@ -257,7 +310,7 @@ async fn fetch_once(http: &impl Fetch, url: &Url, limit: usize) -> Result<Fetche
     if limit == PLAYLIST_LIMIT {
         let kind = r.content_type.to_ascii_lowercase();
         if kind.starts_with("video/") && !kind.contains("mpegurl") {
-            return Err(Fail::Final(raw_stream()));
+            return Err(Fail::Unsupported(Unsupported::RawStream));
         }
     }
     if r.content_length.is_some_and(|n| n > limit as u64) {
@@ -283,7 +336,7 @@ async fn fetch(
     url: &Url,
     limit: usize,
     stop: &Cell<bool>,
-) -> Result<Fetched, String> {
+) -> Result<Fetched, Failure> {
     with_retries(stop, || fetch_once(http, url, limit)).await
 }
 
@@ -299,26 +352,21 @@ fn too_big(host: &str, limit: usize) -> String {
     )
 }
 
-/// A raw stream where a playlist should be: something a converter can play.
-fn raw_stream() -> String {
-    format!("{}{}", crate::CONVERT, hls::RAW_STREAM)
-}
-
 /// When a "playlist" isn't one, say what it was (`hls::describe_non_playlist`).
-fn describe(f: &Fetched, why: impl ToString) -> String {
+fn describe(f: &Fetched, why: impl ToString) -> Failure {
     let why = why.to_string();
     if why.contains("EXTM3U") {
         if hls::looks_like_ts(&f.body) {
-            raw_stream()
+            Unsupported::RawStream.into()
         } else {
-            hls::describe_non_playlist(&f.body, &f.content_type)
+            Failure::Other(hls::describe_non_playlist(&f.body, &f.content_type))
         }
     } else {
-        why
+        Failure::Other(why)
     }
 }
 
-fn parse_media(f: &Fetched) -> Result<hls::Media, String> {
+fn parse_media(f: &Fetched) -> Result<hls::Media, Failure> {
     match hls::parse(&f.body).map_err(|e| describe(f, e))? {
         hls::Parsed::Media(m) => Ok(m),
         hls::Parsed::Master(_) => {
@@ -387,7 +435,7 @@ async fn run(
     decode_sound: bool,
     stop: &Cell<bool>,
     report: &mut dyn FnMut(Status),
-) -> Result<(), String> {
+) -> Result<(), Failure> {
     // Never report after the viewer left: the UI state behind the callback may be gone.
     let mut say = |s: Status| {
         if !stop.get() {
@@ -451,13 +499,10 @@ async fn run(
             if stop.get() {
                 return Ok(());
             }
-            let out = tx.push(&data.body).map_err(|e| e.to_string())?;
+            let out = tx.push(&data.body)?;
             if let Some(codec) = &out.skipped_audio {
                 if !partial {
-                    return Err(format!(
-                        "{}{codec} sound can't be played by this browser",
-                        crate::CONVERT
-                    ));
+                    return Err(Unsupported::Sound(codec.clone()).into());
                 }
                 if !warned_audio {
                     warned_audio = true;
@@ -468,16 +513,14 @@ async fn run(
             }
             if let Some(init) = out.init {
                 if init.interlaced && !partial {
-                    return Err(format!("{}interlaced video", crate::CONVERT));
+                    return Err(Unsupported::Interlaced.into());
                 }
-                let buffer = ms.add_source_buffer(&init.mime).map_err(|e| {
-                    format!(
-                        "{}this browser can't play {}: {}",
-                        crate::CONVERT,
-                        init.mime,
-                        js_err(e)
-                    )
-                })?;
+                let buffer =
+                    ms.add_source_buffer(&init.mime)
+                        .map_err(|e| Unsupported::MediaType {
+                            mime: init.mime.clone(),
+                            why: js_err(e),
+                        })?;
                 append(video, &buffer, &init.bytes).await?;
                 sb = Some(buffer);
             }
@@ -548,7 +591,7 @@ async fn get_range(
     start: u64,
     len: u64,
     stop: &Cell<bool>,
-) -> Result<Part, String> {
+) -> Result<Part, Failure> {
     with_retries(stop, || get_range_once(http, url, start, len)).await
 }
 
@@ -653,10 +696,7 @@ pub fn play_movie(
         if let Err(e) = run_movie(&video, &movie, &url, &http, start, &stopped, &mut report).await
             && !stopped.get()
         {
-            report(match crate::needs_conversion(&e) {
-                Some(reason) => Status::NeedsConversion(reason.to_string()),
-                None => Status::Failed(e),
-            });
+            report(e.into());
         }
     });
     Player { stop }
@@ -705,7 +745,7 @@ async fn run_movie(
     start: f64,
     stop: &Cell<bool>,
     report: &mut dyn FnMut(Status),
-) -> Result<(), String> {
+) -> Result<(), Failure> {
     let mut say = |s: Status| {
         if !stop.get() {
             report(s)
@@ -725,14 +765,12 @@ async fn run_movie(
     if ms.ready_state() != MediaSourceReadyState::Open {
         return Err("the browser did not open the media source".into());
     }
-    let sb = ms.add_source_buffer(&init.mime).map_err(|e| {
-        format!(
-            "{}this browser can't play {}: {}",
-            crate::CONVERT,
-            init.mime,
-            js_err(e)
-        )
-    })?;
+    let sb = ms
+        .add_source_buffer(&init.mime)
+        .map_err(|e| Unsupported::MediaType {
+            mime: init.mime.clone(),
+            why: js_err(e),
+        })?;
     sb.set_timestamp_offset(movie.shift());
     ms.set_duration(movie.duration);
     append(video, &sb, &init.bytes).await?;
