@@ -1,8 +1,12 @@
-# rffmpeg
+# rstreamkit
 
-The part of ffmpeg a live-TV player needs, in pure Rust: no C, no ffmpeg install, and small enough for
-WebAssembly. It turns HLS + MPEG-TS into fragmented MP4 that a browser plays through MediaSource,
-decoding the sound browsers can't (AC-3, E-AC-3, MP2) on the way.
+A streaming toolkit for the browser, in pure Rust: no C, no ffmpeg install, and small enough for
+WebAssembly. It turns HLS, MPEG-TS and movie files (MP4, Matroska) into fragmented MP4 that a browser
+plays through MediaSource, decoding the sound browsers can't (AC-3, E-AC-3, MP2) on the way.
+
+It is a standalone, open-source library (MIT OR Apache-2.0), browser-first for now, and apps plug into
+it, not the other way round: see [CONTRIBUTING.md](CONTRIBUTING.md). Its first client is
+[RIPTV](https://github.com/MoYusuf1/riptv), a live-TV app.
 
 | Module | Job |
 |---|---|
@@ -13,10 +17,11 @@ decoding the sound browsers can't (AC-3, E-AC-3, MP2) on the way.
 | `body` | Reads a response body with a size cap, so an endless stream can't fill memory |
 | `fmp4` | fMP4 init segment and fragments (`avc1` + `mp4a` or `fLaC`) |
 | `Transmuxer` (crate root) | Feeds segments in, gets an init segment and fragments out |
+| `vod`, `mp4`, `mkv` | Movie files (MP4, Matroska): index, tracks and byte-range reading, played as fMP4 |
 | `mse` (wasm only) | Fetches the playlist and segments (through a `Fetch` you supply) and appends them to a `<video>` |
 
 ```rust
-let mut t = rffmpeg::Transmuxer::default();
+let mut t = rstreamkit::Transmuxer::default();
 let out = t.push(&segment_bytes)?;      // out.init (once), out.fragment, out.skipped_audio
 ```
 
@@ -27,7 +32,7 @@ dropped and named in `skipped_audio` (in the browser glue, `mse::start(.., decod
 In the browser, `mse::start(video, playlist_url, fetcher, partial, decode_sound, report)` plays a stream.
 `fetcher` is how bytes reach the page: `mse::Direct::default()` uses the browser's own `fetch` (the server
 must allow it, CORS), and an app that goes through a proxy implements the small `mse::Fetch` trait for it.
-rffmpeg knows nothing about proxies or headers; it asks for real URLs (and, for movie files read with
+rstreamkit knows nothing about proxies or headers; it asks for real URLs (and, for movie files read with
 `mse::probe` and `mse::play_movie`, byte ranges) and resolves playlist entries against each response's
 final URL.
 
@@ -37,7 +42,8 @@ final URL.
 
 HEVC and other video codecs (only H.264 passes through), AES-128, fMP4 segments, adaptive bitrate.
 Streams it can't handle are reported with a `convert:` marker (`needs_conversion`), so a caller can
-hand them to real ffmpeg. [RIPTV](https://github.com/MoYusuf1/riptv) does exactly that.
+hand them to real ffmpeg: that policy belongs to the app (RIPTV does exactly that), and a browser that
+can't decode a codec can't play it, whatever the library does.
 
 ## Test
 

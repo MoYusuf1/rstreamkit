@@ -1,4 +1,4 @@
-//! rffmpeg: the part of ffmpeg a live-TV player needs, in pure Rust. HLS playlists, MPEG-TS
+//! rstreamkit: a pure-Rust streaming toolkit for the browser. HLS playlists, MPEG-TS
 //! demuxing, fMP4 muxing and AC-3, E-AC-3 and MP2 sound decoding (pure, testable natively), movie
 //! files (MP4 and Matroska, `vod`), plus the MediaSource glue that feeds a `<video>` element (wasm
 //! only, `mse`).

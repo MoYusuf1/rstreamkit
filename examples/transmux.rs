@@ -1,7 +1,7 @@
 //! Transmux local HLS segments into one fMP4 file, to inspect with ffprobe/mpv:
 //!   cargo run --example transmux -- out.mp4 seg1.ts seg2.ts ...
 
-use rffmpeg::Transmuxer;
+use rstreamkit::Transmuxer;
 
 fn main() {
     let mut args = std::env::args().skip(1);
