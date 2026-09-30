@@ -346,8 +346,10 @@ fn traf(run: &TrackRun, data_offset: i32) -> Vec<u8> {
     )
 }
 
-/// `moof` + `mdat` for the given tracks (in order).
-pub fn fragment(sequence: u32, runs: &[TrackRun]) -> Vec<u8> {
+/// The `moof` for the given tracks (in order), whose samples' bytes are to follow, run after
+/// run, as the payload of an `mdat` (see [`mdat_header`]). Only the samples' lengths are read, so
+/// the bytes can be anywhere until they are sent.
+pub fn moof(sequence: u32, runs: &[TrackRun]) -> Vec<u8> {
     let build = |offsets: &[i32]| {
         let mfhd = full(b"mfhd", 0, 0, &[&u32s(&[sequence])]);
         let trafs: Vec<Vec<u8>> = runs.iter().zip(offsets).map(|(r, &o)| traf(r, o)).collect();
@@ -363,13 +365,29 @@ pub fn fragment(sequence: u32, runs: &[TrackRun]) -> Vec<u8> {
         offsets.push(at);
         at += r.samples.iter().map(|s| s.data.len() as i32).sum::<i32>();
     }
-    let moof = build(&offsets);
-    let payload_len = (at - moof_len - 8) as u32;
+    build(&offsets)
+}
+
+/// The 8 bytes that begin an `mdat` holding `payload_len` bytes.
+pub fn mdat_header(payload_len: usize) -> [u8; 8] {
+    let mut header = [0; 8];
+    header[..4].copy_from_slice(&(8 + payload_len as u32).to_be_bytes());
+    header[4..].copy_from_slice(b"mdat");
+    header
+}
+
+/// `moof` + `mdat` for the given tracks (in order), in one piece.
+pub fn fragment(sequence: u32, runs: &[TrackRun]) -> Vec<u8> {
+    let moof = moof(sequence, runs);
+    let payload_len: usize = runs
+        .iter()
+        .flat_map(|r| &r.samples)
+        .map(|s| s.data.len())
+        .sum();
     // The whole fragment is known by now: allocate it once, not by doubling.
-    let mut out = Vec::with_capacity(moof.len() + 8 + payload_len as usize);
+    let mut out = Vec::with_capacity(moof.len() + 8 + payload_len);
     out.extend(moof);
-    out.extend((8 + payload_len).to_be_bytes());
-    out.extend(b"mdat");
+    out.extend(mdat_header(payload_len));
     for r in runs {
         for s in &r.samples {
             out.extend(s.data);

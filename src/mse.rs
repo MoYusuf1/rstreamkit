@@ -5,7 +5,7 @@
 //! failed downloads are retried a fixed number of times. Both are simple and good enough.
 
 use std::{
-    cell::Cell,
+    cell::{Cell, RefCell},
     ops::Range,
     pin::Pin,
     rc::Rc,
@@ -22,7 +22,7 @@ use web_sys::{
 };
 
 use crate::{
-    Transmuxer, Unsupported,
+    Segment, Transmuxer, Unsupported,
     body::{self, Capped},
     hls,
 };
@@ -433,6 +433,49 @@ async fn fetch(
     with_retries(stop, || fetch_once(http, url, limit)).await
 }
 
+/// A segment, downloaded straight into the transmuxer as it arrives, so no copy of it is ever held
+/// whole. A download that fails part way is tried again from the start, into a fresh segment.
+async fn fetch_segment(
+    http: &impl Fetch,
+    url: &str,
+    limit: usize,
+    stop: &Cell<bool>,
+    tx: &RefCell<Transmuxer>,
+) -> Result<crate::Output, Failure> {
+    with_retries(stop, || fetch_segment_once(http, url, limit, tx)).await
+}
+
+async fn fetch_segment_once(
+    http: &impl Fetch,
+    url: &str,
+    limit: usize,
+    tx: &RefCell<Transmuxer>,
+) -> Result<crate::Output, Fail> {
+    let host = host_of(url);
+    let r = http.get(url, None).await?;
+    if !(200..300).contains(&r.status) {
+        return Err(Fail::Retry(format!("{host} answered HTTP {}", r.status)));
+    }
+    if r.content_length.is_some_and(|n| n > limit as u64) {
+        return Err(Fail::Final(too_big(&host, limit)));
+    }
+    // What the server says it will send, never trusted beyond the limit, is allocated once.
+    let mut segment = Segment::new(r.content_length.map_or(0, |n| (n as usize).min(limit)));
+    body::read_each(r.body, limit, |chunk| segment.feed(chunk))
+        .await
+        .map_err(|e| match e {
+            // Reading it again would only read it all again.
+            Capped::TooBig => Fail::Final(too_big(&host, limit)),
+            Capped::Failed(why) => Fail::Retry(format!("download from {host} failed: {why}")),
+        })?;
+    tx.borrow_mut()
+        .finish(segment)
+        .map_err(|e| match e.unsupported() {
+            Some(why) => Fail::Unsupported(why),
+            None => Fail::Final(e.to_string()),
+        })
+}
+
 fn too_big(host: &str, limit: usize) -> String {
     let what = if limit == PLAYLIST_LIMIT {
         "a playlist"
@@ -575,7 +618,7 @@ async fn run(
         return Err("the browser did not open the media source".into());
     }
 
-    let mut tx = Transmuxer::default().decode_sound(decode_sound);
+    let tx = RefCell::new(Transmuxer::default().decode_sound(decode_sound));
     let mut sb: Option<SourceBuffer> = None;
     let mut next_seq: Option<u64> = None;
     let mut started = false;
@@ -601,11 +644,10 @@ async fn run(
                 return Ok(());
             }
             let url = resolve(&latest.url, &seg.uri)?;
-            let data = fetch(http, &url, SEGMENT_LIMIT, stop).await?;
+            let mut out = fetch_segment(http, &url, SEGMENT_LIMIT, stop, &tx).await?;
             if stop.get() {
                 return Ok(());
             }
-            let mut out = tx.push_owned(data.body)?;
             if let Some(codec) = &out.skipped_audio {
                 if !partial {
                     return Err(Unsupported::Sound(codec.clone()).into());
@@ -631,8 +673,9 @@ async fn run(
                 sb = Some(buffer);
             }
             let buffer = sb.as_ref().ok_or("no media buffer")?;
-            if !out.fragment.is_empty() {
-                append(video, buffer, &mut out.fragment).await?;
+            for fragment in &mut out.fragments {
+                append(video, buffer, &mut fragment.moof).await?;
+                append(video, buffer, &mut fragment.mdat).await?;
             }
             next_seq = Some(seg.seq + 1);
 

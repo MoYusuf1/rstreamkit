@@ -87,10 +87,35 @@ pub struct Init {
 pub struct Output {
     /// Present for the first segment only.
     pub init: Option<Init>,
-    /// moof+mdat to append; empty if the segment held no samples.
-    pub fragment: Vec<u8>,
+    /// What to append, in this order: a `moof` and `mdat` for each track that has samples in the
+    /// segment, the pictures first. (Empty if it held none.) Tracks get their own, which a browser
+    /// takes as it does any other, so the pictures, the bulk of it, go out in the buffer they were
+    /// written in, with nothing copied around them.
+    pub fragments: Vec<Fragment>,
     pub skipped_audio: Option<String>,
 }
+
+/// A `moof` box and the `mdat` box that follows it.
+#[derive(Debug)]
+#[non_exhaustive]
+pub struct Fragment {
+    pub moof: Vec<u8>,
+    pub mdat: Vec<u8>,
+}
+
+impl Output {
+    /// Every fragment in one buffer (a copy), for when one piece is what is wanted.
+    pub fn fragment(&self) -> Vec<u8> {
+        self.fragments
+            .iter()
+            .flat_map(|f| [f.moof.as_slice(), f.mdat.as_slice()])
+            .collect::<Vec<_>>()
+            .concat()
+    }
+}
+
+/// Room at the front of a segment's buffer for the `mdat` header.
+const MDAT_HEADER: usize = 8;
 
 const WRAP: u64 = 1 << 33; // PES timestamps are 33 bits
 /// A segment starting further than this (90 kHz ticks, 2 s) from where the last one ended is a
@@ -152,20 +177,20 @@ impl Transmuxer {
         u
     }
 
+    /// A whole segment at once. See [`segment`](Self::segment) for one that arrives in pieces.
     pub fn push(&mut self, segment: &[u8]) -> Result<Output, Error> {
-        let d = ts::demux(segment)?;
+        let mut s = Segment::new(segment.len());
+        s.feed(segment);
+        self.finish(s)
+    }
+
+    /// Turns a segment that arrived in pieces (see [`Segment`]) into what to append.
+    pub fn finish(&mut self, segment: Segment) -> Result<Output, Error> {
+        let d = segment.demuxer.finish()?;
         self.assemble(d)
     }
 
-    /// [`push`](Self::push) for a segment you are done with: it is freed before the fragment is
-    /// put together, so the two are never in memory at once (for a big segment that is a third of
-    /// the peak).
-    pub fn push_owned(&mut self, segment: Vec<u8>) -> Result<Output, Error> {
-        let d = ts::demux(&segment)?;
-        drop(segment);
-        self.assemble(d)
-    }
-
+    /// `d`'s pictures must begin after room for the `mdat` header (see `segment`).
     fn assemble(&mut self, mut d: ts::Demuxed) -> Result<Output, Error> {
         if self.skip_sound {
             d.sound.clear();
@@ -230,7 +255,7 @@ impl Transmuxer {
         let Some(first) = video_first.into_iter().chain(sound_first).min() else {
             return Ok(Output {
                 init,
-                fragment: vec![],
+                fragments: vec![],
                 skipped_audio: d.skipped_audio,
             });
         };
@@ -269,6 +294,7 @@ impl Transmuxer {
         let mut runs = vec![];
         if !video.is_empty() {
             let mut last_dur = 3003; // ~29.97 fps, only used if the segment has a single frame
+            let mut at = MDAT_HEADER;
             let samples: Vec<_> = d
                 .video
                 .iter()
@@ -278,11 +304,13 @@ impl Transmuxer {
                         .get(i + 1)
                         .map_or(last_dur, |n| n.0.saturating_sub(video[i].0) as u32);
                     last_dur = dur;
+                    let data = &d.video_data[at..at + s.len as usize];
+                    at += s.len as usize;
                     fmp4::Sample {
                         duration: dur,
                         key: s.key,
                         cts: (video[i].1 as i64 - video[i].0 as i64) as i32,
-                        data: &s.data,
+                        data,
                     }
                 })
                 .collect();
@@ -363,12 +391,72 @@ impl Transmuxer {
                     .collect(),
             });
         }
-        self.seq += 1;
+        // One `moof` and `mdat` for each track: nothing is copied into anything bigger.
+        let moofs: Vec<Vec<u8>> = runs
+            .iter()
+            .map(|run| {
+                self.seq += 1;
+                fmp4::moof(self.seq, std::slice::from_ref(run))
+            })
+            .collect();
+        let mut mdats: Vec<Vec<u8>> = runs
+            .iter()
+            .map(|run| {
+                if run.track == fmp4::VIDEO_TRACK {
+                    return vec![]; // the pictures are already in the buffer they were written in
+                }
+                let len: usize = run.samples.iter().map(|s| s.data.len()).sum();
+                let mut mdat = Vec::with_capacity(MDAT_HEADER + len);
+                mdat.extend(fmp4::mdat_header(len));
+                run.samples
+                    .iter()
+                    .for_each(|s| mdat.extend_from_slice(s.data));
+                mdat
+            })
+            .collect();
+        let with_pictures = runs.first().is_some_and(|r| r.track == fmp4::VIDEO_TRACK);
+        drop(runs);
+        if with_pictures {
+            let mut mdat = d.video_data;
+            let header = fmp4::mdat_header(mdat.len() - MDAT_HEADER);
+            mdat[..MDAT_HEADER].copy_from_slice(&header);
+            mdats[0] = mdat;
+        }
         Ok(Output {
             init,
-            fragment: fmp4::fragment(self.seq, &runs),
+            fragments: moofs
+                .into_iter()
+                .zip(mdats)
+                .map(|(moof, mdat)| Fragment { moof, mdat })
+                .collect(),
             skipped_audio: d.skipped_audio,
         })
+    }
+}
+
+/// One segment as it arrives, as a download delivers it: [`feed`](Self::feed) it what comes, then
+/// hand it to [`Transmuxer::finish`]. Nothing holds the whole segment, and the pictures are written
+/// straight into the buffer they leave in, so it takes about its own size in memory, not several
+/// times that. It touches nothing else, so one dropped unfinished (a failed download) leaves no
+/// trace.
+pub struct Segment {
+    demuxer: ts::Demuxer,
+}
+
+impl Segment {
+    /// `expected` is how big the segment will be, if known (`Content-Length`): room for it is
+    /// allocated once.
+    pub fn new(expected: usize) -> Segment {
+        let mut video = Vec::with_capacity(MDAT_HEADER + expected);
+        video.resize(MDAT_HEADER, 0);
+        Segment {
+            demuxer: ts::Demuxer::new(video),
+        }
+    }
+
+    /// The next piece of the segment; pieces can be cut anywhere.
+    pub fn feed(&mut self, chunk: &[u8]) {
+        self.demuxer.feed(chunk);
     }
 }
 
@@ -388,7 +476,7 @@ mod tests {
         let mime = off.init.unwrap().mime;
         assert!(!mime.contains("flac") && !mime.contains("mp4a"), "{mime}");
         assert_eq!(off.skipped_audio.as_deref(), Some("AC-3"));
-        assert!(!off.fragment.is_empty(), "the picture still plays");
+        assert!(!off.fragments.is_empty(), "the picture still plays");
     }
 
     #[test]
@@ -474,10 +562,44 @@ mod tests {
             {
                 let (vend, aend) = (t.vend, t.audio_next.unwrap());
                 let moved = shifted(segment, start - first);
-                let starts = base_times(&t.push(&moved).unwrap().fragment);
+                let starts = base_times(&t.push(&moved).unwrap().fragment());
                 assert_eq!(starts, [vend, aend], "{name}, jump {n} (to {start})");
             }
         }
+    }
+
+    /// A segment that arrives in pieces comes out exactly as the same segment all at once.
+    #[test]
+    fn a_segment_fed_in_pieces_is_the_same_as_one_pushed_whole() {
+        let clip: &[u8] = include_bytes!("../tests/fixtures/bbb_480p.ts");
+        let whole = Transmuxer::default().push(clip).unwrap();
+        let mut t = Transmuxer::default();
+        let mut segment = Segment::new(clip.len());
+        clip.chunks(1234).for_each(|c| segment.feed(c));
+        let pieces = t.finish(segment).unwrap();
+        assert!(!whole.fragments.is_empty());
+        assert_eq!(pieces.fragments.len(), whole.fragments.len());
+        for (p, w) in pieces.fragments.iter().zip(&whole.fragments) {
+            assert_eq!((&p.moof, &p.mdat), (&w.moof, &w.mdat));
+            // The mdat is one box, sized to what it holds.
+            let size = u32::from_be_bytes(p.mdat[..4].try_into().unwrap()) as usize;
+            assert_eq!((size, &p.mdat[4..8]), (p.mdat.len(), &b"mdat"[..]));
+        }
+        assert_eq!(pieces.init.unwrap().bytes, whole.init.unwrap().bytes);
+    }
+
+    /// A download that fails part way is dropped, and the transmuxer has not noticed: the next
+    /// segment is still the first one, with its init segment and its place at zero.
+    #[test]
+    fn a_segment_dropped_unfinished_leaves_no_trace() {
+        let clip: &[u8] = include_bytes!("../tests/fixtures/bbb_480p.ts");
+        let mut t = Transmuxer::default();
+        let mut half = Segment::new(clip.len());
+        half.feed(&clip[..clip.len() / 2]);
+        drop(half);
+        let out = t.push(clip).unwrap();
+        assert!(out.init.is_some());
+        assert_eq!(base_times(&out.fragment())[0], 0);
     }
 
     #[test]

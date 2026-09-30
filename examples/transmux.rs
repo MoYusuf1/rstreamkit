@@ -13,15 +13,16 @@ fn main() {
     for path in args {
         let seg = std::fs::read(&path).unwrap_or_else(|e| panic!("{path}: {e}"));
         let o = t.push(&seg).unwrap_or_else(|e| panic!("{path}: {e}"));
-        if let Some(init) = o.init {
+        if let Some(init) = &o.init {
             println!("codecs: {}", init.mime);
-            file.extend(init.bytes);
+            file.extend(&init.bytes);
         }
-        if let Some(a) = o.skipped_audio {
+        if let Some(a) = &o.skipped_audio {
             println!("note: dropped {a} audio");
         }
-        println!("{path}: {} bytes of fragment", o.fragment.len());
-        file.extend(o.fragment);
+        let fragment = o.fragment();
+        println!("{path}: {} bytes of fragment", fragment.len());
+        file.extend(fragment);
     }
     std::fs::write(&out, file).expect("write output");
     println!("wrote {out}");

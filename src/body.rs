@@ -12,25 +12,37 @@ pub enum Capped<E> {
     Failed(E),
 }
 
-/// Collects a body, stopping with `TooBig` as soon as it passes `limit` bytes. `Content-Length` can
-/// be missing or wrong, and an endless stream where a playlist or segment should be would otherwise
-/// be read into memory forever.
-pub async fn read_capped<B: AsRef<[u8]>, E>(
+/// Hands a body to `each`, chunk by chunk as it arrives, stopping with `TooBig` as soon as it passes
+/// `limit` bytes. `Content-Length` can be missing or wrong, and an endless stream where a playlist
+/// or segment should be would otherwise be read forever.
+pub async fn read_each<B: AsRef<[u8]>, E>(
     mut chunks: impl Stream<Item = Result<B, E>> + Unpin,
     limit: usize,
-    expected: usize,
-) -> Result<Vec<u8>, Capped<E>> {
-    // `expected` is what the server says it will send: allocate that once instead of doubling
-    // (which leaves the freed halves behind). Never trusted beyond the limit.
-    let mut body = Vec::with_capacity(expected.min(limit));
+    mut each: impl FnMut(&[u8]),
+) -> Result<(), Capped<E>> {
+    let mut total = 0;
     while let Some(chunk) = poll_fn(|cx| Pin::new(&mut chunks).poll_next(cx)).await {
         let chunk = chunk.map_err(Capped::Failed)?;
         let chunk = chunk.as_ref();
-        if chunk.len() > limit - body.len() {
+        if chunk.len() > limit - total {
             return Err(Capped::TooBig);
         }
-        body.extend_from_slice(chunk);
+        total += chunk.len();
+        each(chunk);
     }
+    Ok(())
+}
+
+/// A whole body in memory, with the same cap. `expected` is what the server says it will send:
+/// allocated once instead of doubled into place (which leaves the freed halves behind), and never
+/// trusted beyond the limit.
+pub async fn read_capped<B: AsRef<[u8]>, E>(
+    chunks: impl Stream<Item = Result<B, E>> + Unpin,
+    limit: usize,
+    expected: usize,
+) -> Result<Vec<u8>, Capped<E>> {
+    let mut body = Vec::with_capacity(expected.min(limit));
+    read_each(chunks, limit, |chunk| body.extend_from_slice(chunk)).await?;
     Ok(body)
 }
 

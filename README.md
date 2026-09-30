@@ -22,8 +22,17 @@ it, not the other way round: see [CONTRIBUTING.md](CONTRIBUTING.md). Its first c
 
 ```rust
 let mut t = rstreamkit::Transmuxer::default();
-let out = t.push(&segment_bytes)?;      // out.init (once), out.fragment, out.skipped_audio
+let out = t.push(&segment_bytes)?;      // out.init (once), out.fragments, out.skipped_audio
+
+// or as a download delivers it: nothing ever holds the whole segment
+let mut segment = rstreamkit::Segment::new(content_length);
+for chunk in chunks { segment.feed(chunk); }   // chunks can end anywhere
+let out = t.finish(segment)?;
 ```
+
+A segment takes about its own size in memory (measured: 6 MB of 1080p in 7.7 MB of wasm memory, which a
+browser never gives back), because pictures are written straight into the buffer they leave in. Each
+track's `moof` and `mdat` (`out.fragments`) are appended as they are.
 
 `Transmuxer::default().decode_sound(false)` turns the sound decoding off: AC-3, E-AC-3 and MP2 are then
 dropped and named in `skipped_audio` (in the browser glue, `mse::start(.., decode_sound, ..)` reports

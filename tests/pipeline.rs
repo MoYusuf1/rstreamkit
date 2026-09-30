@@ -49,9 +49,12 @@ fn demuxes_video_and_audio_from_a_real_segment() {
 #[test]
 fn first_fragment_starts_at_zero_with_the_right_codecs() {
     let out = Transmuxer::default().push(SEGMENT).unwrap();
-    let init = out.init.expect("first segment carries the init segment");
+    let init = out
+        .init
+        .as_ref()
+        .expect("first segment carries the init segment");
     assert_eq!(init.mime, "video/mp4; codecs=\"avc1.64001f,mp4a.40.2\"");
-    assert_eq!(tfdt(&out.fragment), 0);
+    assert_eq!(tfdt(&out.fragment()), 0);
     assert!(out.skipped_audio.is_none());
 }
 
@@ -69,12 +72,12 @@ fn a_timestamp_jump_is_glued_onto_the_end_of_the_previous_fragment() {
     let first = t.push(SEGMENT).unwrap();
     let second = t.push(SEGMENT).unwrap();
     assert!(second.init.is_none());
-    let start2 = tfdt(&second.fragment);
+    let start2 = tfdt(&second.fragment());
     assert!(
         start2.abs_diff(span) < 3 * 3003,
         "second fragment starts at {start2}, first spans {span}"
     );
-    assert!(first.fragment.len() > 10_000 && second.fragment.len() > 10_000);
+    assert!(first.fragment().len() > 10_000 && second.fragment().len() > 10_000);
 }
 
 /// Every track's base time in a fragment (video first, then audio).
@@ -103,7 +106,7 @@ fn a_clock_restarting_below_the_sent_media_still_plays_on() {
     let mut t = Transmuxer::default();
     let mut previous: Option<Vec<u64>> = None;
     for push in 0..12 {
-        let at = tfdts(&t.push(SEGMENT).unwrap().fragment);
+        let at = tfdts(&t.push(SEGMENT).unwrap().fragment());
         assert_eq!(at.len(), 2, "video and audio");
         if let Some(before) = &previous {
             for (track, (now, was)) in at.iter().zip(before).enumerate() {
@@ -135,7 +138,12 @@ fn ffmpeg_decodes_the_output_without_errors() {
     let file = std::env::temp_dir().join(format!("rstreamkit-test-{}.mp4", std::process::id()));
     std::fs::write(
         &file,
-        [a.init.unwrap().bytes, a.fragment, b.fragment].concat(),
+        [
+            a.init.as_ref().unwrap().bytes.clone(),
+            a.fragment(),
+            b.fragment(),
+        ]
+        .concat(),
     )
     .unwrap();
 
@@ -287,7 +295,7 @@ mod sound {
         for (name, bytes) in clips {
             let out = Transmuxer::default().push(bytes).unwrap();
             assert!(out.skipped_audio.is_none(), "{name}: sound was dropped");
-            let init = out.init.unwrap();
+            let init = out.init.as_ref().unwrap();
             assert!(init.mime.ends_with(",flac\""), "{name}: {}", init.mime);
 
             let dir = std::env::temp_dir();
@@ -298,7 +306,11 @@ mod sound {
                 )),
                 dir.join(format!("rstreamkit-sound-{}-{name}", std::process::id())),
             );
-            std::fs::write(&ours_file, [init.bytes.as_slice(), &out.fragment].concat()).unwrap();
+            std::fs::write(
+                &ours_file,
+                [init.bytes.as_slice(), &out.fragment()].concat(),
+            )
+            .unwrap();
             std::fs::write(&source_file, bytes).unwrap();
 
             let codecs = Command::new("ffprobe")
