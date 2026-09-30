@@ -25,7 +25,7 @@ let out = t.push(&segment_bytes)?;      // out.init (once), out.fragment, out.sk
 
 HEVC and other video codecs (only H.264 passes through), AES-128, fMP4 segments, adaptive bitrate.
 Streams it can't handle are reported with a `convert:` marker (`needs_conversion`), so a caller can
-hand them to real ffmpeg. [RIPTV](../riptv) does exactly that.
+hand them to real ffmpeg. [RIPTV](https://github.com/MoYusuf1/riptv) does exactly that.
 
 ## Test
 
