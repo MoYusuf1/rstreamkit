@@ -1,15 +1,19 @@
 //! rffmpeg: the part of ffmpeg a live-TV player needs, in pure Rust. HLS playlists, MPEG-TS
-//! demuxing, fMP4 muxing and AC-3, E-AC-3 and MP2 sound decoding (pure, testable natively), plus the
-//! MediaSource glue that feeds a `<video>` element (wasm only, `mse`).
+//! demuxing, fMP4 muxing and AC-3, E-AC-3 and MP2 sound decoding (pure, testable natively), movie
+//! files (MP4 and Matroska, `vod`), plus the MediaSource glue that feeds a `<video>` element (wasm
+//! only, `mse`).
 
 pub mod avc;
 pub mod body;
 pub mod fmp4;
 pub mod hls;
+pub mod mkv;
+pub mod mp4;
 #[cfg(target_arch = "wasm32")]
 pub mod mse;
 pub mod sound;
 pub mod ts;
+pub mod vod;
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
@@ -146,6 +150,7 @@ impl Transmuxer {
                     &fmp4::VideoParams {
                         sps,
                         pps,
+                        avcc: None,
                         width,
                         height,
                         pixel_aspect: avc::pixel_aspect(sps).unwrap_or((1, 1)),
