@@ -22,6 +22,12 @@ jobs:
       # The integration tests have ffmpeg decode our output; without it they skip themselves.
       - name: ffmpeg
         run: sudo apt-get update && sudo apt-get install -y ffmpeg
+      # The library serves any app, so nothing in it may know one (see CONTRIBUTING.md).
+      - name: No app names in the library
+        run: |
+          if grep -rIinE 'riptv|xtream' src examples tests Cargo.toml; then
+            echo "an app name is in the library source"; exit 1
+          fi
       - run: cargo fmt --check
       - run: cargo clippy --all-targets -- -D warnings
       # `mse` only exists on wasm, so nothing else compiles it.

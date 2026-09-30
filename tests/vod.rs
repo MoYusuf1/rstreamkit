@@ -4,7 +4,7 @@
 
 use std::{process::Command, rc::Rc};
 
-use rffmpeg::{
+use rstreamkit::{
     mkv, mp4,
     vod::{Audio, Container, Movie, Verdict},
 };
@@ -67,7 +67,7 @@ fn ffmpeg_ok() -> bool {
 /// What ffprobe says about the decoded file: complaints from ffmpeg decoding it, then for each
 /// stream (video, audio) its codec, frames read, first timestamp and end timestamp.
 fn decoded(bytes: &[u8], name: &str) -> (String, Vec<(String, u32, f64, f64)>) {
-    let path = std::env::temp_dir().join(format!("rffmpeg-{name}-{}.mp4", std::process::id()));
+    let path = std::env::temp_dir().join(format!("rstreamkit-{name}-{}.mp4", std::process::id()));
     std::fs::write(&path, bytes).unwrap();
     let decode = Command::new("ffmpeg")
         .args(["-v", "error", "-i"])
