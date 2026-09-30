@@ -402,7 +402,7 @@ mod tests {
     /// `segment` with every PES timestamp moved by `delta` ticks: the same media on another clock.
     fn shifted(segment: &[u8], delta: i64) -> Vec<u8> {
         let mut out = segment.to_vec();
-        for packet in out.chunks_exact_mut(188) {
+        for packet in out.as_chunks_mut::<188>().0 {
             let payload = match (packet[3] >> 4) & 3 {
                 1 => 4,
                 3 => 5 + packet[4] as usize,
