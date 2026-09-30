@@ -7,6 +7,7 @@
 use std::collections::HashMap;
 
 #[derive(Debug, Clone, PartialEq, thiserror::Error)]
+#[non_exhaustive]
 pub enum Error {
     #[error("not an MPEG-TS segment (no sync bytes)")]
     NoSync,

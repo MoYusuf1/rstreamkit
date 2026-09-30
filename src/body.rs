@@ -5,6 +5,7 @@ use std::{future::poll_fn, pin::Pin};
 use futures_core::Stream;
 
 #[derive(Debug, PartialEq)]
+#[non_exhaustive]
 pub enum Capped<E> {
     /// The body passed the limit; it was not read any further.
     TooBig,
