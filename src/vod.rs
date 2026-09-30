@@ -11,7 +11,7 @@
 
 use std::rc::Rc;
 
-use crate::{Error, Init, avc, fmp4, mkv, mp4, sound};
+use crate::{Error, Init, Unsupported, avc, fmp4, mkv, mp4, sound};
 
 /// Every frame time on these types is microseconds.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -34,6 +34,7 @@ pub struct Frame {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
+#[non_exhaustive]
 pub enum Container {
     Mp4,
     Matroska,
@@ -107,13 +108,14 @@ impl VideoInfo {
 
 /// What to do with a file, settled before playing any of it.
 #[derive(Debug, PartialEq)]
+#[non_exhaustive]
 pub enum Verdict {
     /// The browser plays it by itself.
     Native,
     /// We can play it (this module).
     Rust,
-    /// Neither: something that re-encodes has to, and this says why.
-    Convert(String),
+    /// Neither, and why. What to do about it (say so, re-encode it elsewhere) is up to the app.
+    Unsupported(Unsupported),
 }
 
 enum Index {
@@ -185,7 +187,7 @@ impl Movie {
         .join(",")
     }
 
-    /// Whether to let the browser play the file, play it here, or have it converted.
+    /// Whether to let the browser play the file, play it here, or neither.
     /// `can_play` answers a full MIME type with codecs (`canPlayType` in a browser).
     pub fn verdict(&self, can_play: &dyn Fn(&str) -> bool) -> Verdict {
         let known =
@@ -200,13 +202,15 @@ impl Movie {
             return Verdict::Native;
         }
         if self.video.avcc.is_empty() {
-            return Verdict::Convert(format!("{} video", self.video.name));
+            return Verdict::Unsupported(Unsupported::Video(Some(self.video.name.clone())));
         }
         if self.video.interlaced {
-            return Verdict::Convert("interlaced video".into());
+            return Verdict::Unsupported(Unsupported::Interlaced);
         }
         match &self.audio {
-            Some(a) if a.audio == Audio::Other => Verdict::Convert(format!("{} sound", a.name)),
+            Some(a) if a.audio == Audio::Other => {
+                Verdict::Unsupported(Unsupported::Sound(a.name.clone()))
+            }
             _ => Verdict::Rust,
         }
     }

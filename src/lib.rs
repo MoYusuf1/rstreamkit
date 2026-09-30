@@ -16,6 +16,7 @@ pub mod ts;
 pub mod vod;
 
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum Error {
     #[error(transparent)]
     Ts(#[from] ts::Error),
@@ -25,22 +26,52 @@ pub enum Error {
     Unsupported(String),
 }
 
-/// Marks a playback error as "the browser can't play this, but something else could": HEVC video,
-/// sound it can't decode, a raw stream. The page then asks the proxy to convert the stream.
-pub const CONVERT: &str = "convert:";
+impl Error {
+    /// Whether the stream is fine but not something this browser can play, as opposed to broken.
+    /// What to do about it (say so, play without the sound, hand it to something else) is up to the
+    /// app.
+    pub fn unsupported(&self) -> Option<Unsupported> {
+        match self {
+            Error::Ts(ts::Error::NoVideo(codec)) => Some(Unsupported::Video(codec.clone())),
+            _ => None,
+        }
+    }
+}
 
-/// Why this stream needs converting, if the error says it does.
-pub fn needs_conversion(err: &str) -> Option<&str> {
-    if let Some(reason) = err.strip_prefix(CONVERT) {
-        Some(reason)
-    } else if err.contains("no H.264 video") {
-        Some("the video isn't H.264 (probably HEVC)")
-    } else {
-        None
+/// Why a stream can't be played as it is. Its `Display` reads as a sentence for the viewer.
+#[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
+pub enum Unsupported {
+    /// Video that isn't H.264 (HEVC, MPEG-2, ...): what it is, if it could be named.
+    Video(Option<String>),
+    /// Sound the browser can't play and that isn't being decoded here: the codec.
+    Sound(String),
+    /// Interlaced pictures, which play combed and at half the motion rate.
+    Interlaced,
+    /// A raw MPEG-TS stream where an HLS playlist should be.
+    RawStream,
+    /// A media type this browser's MediaSource refuses, and what the browser said.
+    MediaType { mime: String, why: String },
+}
+
+impl std::fmt::Display for Unsupported {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Unsupported::Video(Some(codec)) => write!(f, "the video isn't H.264 (it is {codec})"),
+            Unsupported::Video(None) => f.write_str("the video isn't H.264 (probably HEVC)"),
+            Unsupported::Sound(codec) => write!(f, "{codec} sound can't be played by this browser"),
+            Unsupported::Interlaced => f.write_str("interlaced video"),
+            Unsupported::RawStream => f.write_str(hls::RAW_STREAM),
+            Unsupported::MediaType { mime, why } => {
+                write!(f, "this browser can't play {mime}: {why}")
+            }
+        }
     }
 }
 
 /// What to give `MediaSource.addSourceBuffer` and then append first.
+#[derive(Debug)]
+#[non_exhaustive]
 pub struct Init {
     pub bytes: Vec<u8>,
     pub mime: String,
@@ -48,6 +79,8 @@ pub struct Init {
     pub interlaced: bool,
 }
 
+#[derive(Debug)]
+#[non_exhaustive]
 pub struct Output {
     /// Present for the first segment only.
     pub init: Option<Init>,
@@ -342,17 +375,39 @@ mod tests {
     }
 
     #[test]
-    fn errors_that_a_converter_could_fix_are_recognised() {
-        let hevc = ts::demux(include_bytes!("../tests/fixtures/hevc_ac3.ts")).unwrap_err();
-        assert!(needs_conversion(&hevc.to_string()).is_some(), "{hevc}");
+    fn what_a_stream_lacks_is_said_in_types_not_strings() {
+        // HEVC: the demuxer names the codec, and that maps to `Unsupported::Video`.
+        let hevc = Transmuxer::default()
+            .push(include_bytes!("../tests/fixtures/hevc_ac3.ts"))
+            .unwrap_err();
         assert_eq!(
-            needs_conversion(&format!("{CONVERT}AC-3 sound")),
-            Some("AC-3 sound")
+            hevc.unsupported(),
+            Some(Unsupported::Video(Some("HEVC".into())))
         );
-        assert_eq!(needs_conversion("bad playlist: nothing here"), None);
+        // A stream that is broken is an error, not "unsupported".
+        let broken = Transmuxer::default()
+            .push(b"definitely not transport stream data")
+            .unwrap_err();
+        assert_eq!(broken.unsupported(), None);
+        assert_eq!(Error::Playlist("x".into()).unsupported(), None);
+        // Every reason reads as a sentence for the viewer.
         assert_eq!(
-            needs_conversion("the proxy refused x: address not allowed"),
-            None
+            Unsupported::Sound("AC-3".into()).to_string(),
+            "AC-3 sound can't be played by this browser"
+        );
+        assert_eq!(
+            Unsupported::Video(Some("HEVC".into())).to_string(),
+            "the video isn't H.264 (it is HEVC)"
+        );
+        assert!(Unsupported::Video(None).to_string().contains("H.264"));
+        assert_eq!(Unsupported::RawStream.to_string(), hls::RAW_STREAM);
+        let refused = Unsupported::MediaType {
+            mime: "video/mp4".into(),
+            why: "NotSupportedError".into(),
+        };
+        assert_eq!(
+            refused.to_string(),
+            "this browser can't play video/mp4: NotSupportedError"
         );
     }
 }

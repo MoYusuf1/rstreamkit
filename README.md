@@ -27,7 +27,7 @@ let out = t.push(&segment_bytes)?;      // out.init (once), out.fragment, out.sk
 
 `Transmuxer::default().decode_sound(false)` turns the sound decoding off: AC-3, E-AC-3 and MP2 are then
 dropped and named in `skipped_audio` (in the browser glue, `mse::start(.., decode_sound, ..)` reports
-`NeedsConversion`), for a caller that has real ffmpeg do it instead.
+`Status::Unsupported(Unsupported::Sound(..))`), for a caller that has real ffmpeg do it instead.
 
 In the browser, `mse::start(video, playlist_url, fetcher, partial, decode_sound, report)` plays a stream.
 `fetcher` is how bytes reach the page: `mse::Direct::default()` uses the browser's own `fetch` (the server
@@ -41,9 +41,11 @@ final URL.
 ## What it doesn't do
 
 HEVC and other video codecs (only H.264 passes through), AES-128, fMP4 segments, adaptive bitrate.
-Streams it can't handle are reported with a `convert:` marker (`needs_conversion`), so a caller can
-hand them to real ffmpeg: that policy belongs to the app (RIPTV does exactly that), and a browser that
-can't decode a codec can't play it, whatever the library does.
+Streams it can't handle are reported as typed values, not strings: `Status::Unsupported(Unsupported)` in
+the browser glue (video that isn't H.264, sound it can't decode, interlaced pictures, a raw MPEG-TS
+stream, a media type the browser refuses) and `Error::unsupported()` from the `Transmuxer`. What to do
+about it is the app's policy (say so, play without the sound, hand the stream to real ffmpeg), and a
+browser that can't decode a codec can't play it, whatever the library does.
 
 ## Test
 
