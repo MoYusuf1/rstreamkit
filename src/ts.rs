@@ -87,8 +87,8 @@ pub struct Demuxed {
     /// Sound we have a decoder for, when there is no AAC.
     pub sound: Vec<SoundSample>,
     pub sound_kind: Option<crate::sound::Kind>,
-    /// Set when the segment has audio we can't play at all (an MPEG audio layer we don't decode,
-    /// say); it is dropped.
+    /// Set when the segment has audio a browser can't play itself (AC-3, MP2, ...). It is dropped
+    /// unless `sound` holds its decoded frames, which the transmuxer then plays instead.
     pub skipped_audio: Option<String>,
 }
 
@@ -364,11 +364,13 @@ pub fn demux(data: &[u8]) -> Result<Demuxed, Error> {
     if audio_pid.is_some() {
         // AAC plays as it is; it wins over anything else the stream carries.
         out.sound.clear();
-    } else if out.sound.is_empty() {
-        // Audio we looked for and found no frames of: say what it was instead of going quiet.
-        out.skipped_audio = undecodable_audio;
     } else {
-        out.sound_kind = sound.map(|(_, kind)| kind);
+        // Audio a browser can't play itself: named, so it can be said what was left out, or
+        // cleared by the caller when it decodes the sound instead.
+        out.skipped_audio = undecodable_audio;
+        if !out.sound.is_empty() {
+            out.sound_kind = sound.map(|(_, kind)| kind);
+        }
     }
     Ok(out)
 }

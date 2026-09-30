@@ -19,6 +19,10 @@ let mut t = rffmpeg::Transmuxer::default();
 let out = t.push(&segment_bytes)?;      // out.init (once), out.fragment, out.skipped_audio
 ```
 
+`Transmuxer::default().decode_sound(false)` turns the sound decoding off: AC-3, E-AC-3 and MP2 are then
+dropped and named in `skipped_audio` (in the browser glue, `mse::start(.., decode_sound, ..)` reports
+`NeedsConversion`), for a caller that has real ffmpeg do it instead.
+
 `cargo run --example transmux -- out.mp4 seg1.ts seg2.ts` writes a playable file from local segments.
 
 ## What it doesn't do

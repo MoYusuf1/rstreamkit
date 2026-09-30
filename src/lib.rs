@@ -82,9 +82,17 @@ pub struct Transmuxer {
     decoder: sound::Decoder,
     /// FLAC frames written so far; each frame carries its number.
     flac_frames: u32,
+    skip_sound: bool,
 }
 
 impl Transmuxer {
+    /// Whether to decode AC-3, E-AC-3 and MP2 sound ourselves (the default). Off, that sound is
+    /// dropped and named in `Output::skipped_audio`, for the caller to get converted elsewhere.
+    pub fn decode_sound(mut self, on: bool) -> Self {
+        self.skip_sound = !on;
+        self
+    }
+
     /// Picks the representation of a 33-bit timestamp nearest to the last one seen.
     fn unwrap(&mut self, t: u64) -> u64 {
         let mut u = t + self.last / WRAP * WRAP;
@@ -98,7 +106,13 @@ impl Transmuxer {
     }
 
     pub fn push(&mut self, segment: &[u8]) -> Result<Output, Error> {
-        let d = ts::demux(segment)?;
+        let mut d = ts::demux(segment)?;
+        if self.skip_sound {
+            d.sound.clear();
+            d.sound_kind = None;
+        } else if !d.sound.is_empty() {
+            d.skipped_audio = None; // we decode it
+        }
 
         let init = if self.sent_init {
             None
@@ -287,6 +301,20 @@ impl Transmuxer {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sound_decoding_can_be_switched_off() {
+        let ac3 = include_bytes!("../tests/fixtures/h264_ac3.ts");
+        let on = Transmuxer::default().push(ac3).unwrap();
+        assert!(on.init.unwrap().mime.ends_with(",flac\""));
+        assert_eq!(on.skipped_audio, None);
+
+        let off = Transmuxer::default().decode_sound(false).push(ac3).unwrap();
+        let mime = off.init.unwrap().mime;
+        assert!(!mime.contains("flac") && !mime.contains("mp4a"), "{mime}");
+        assert_eq!(off.skipped_audio.as_deref(), Some("AC-3"));
+        assert!(!off.fragment.is_empty(), "the picture still plays");
+    }
 
     #[test]
     fn timestamp_unwrap_survives_the_33_bit_rollover() {

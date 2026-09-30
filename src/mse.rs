@@ -50,19 +50,31 @@ impl Drop for Player {
 
 /// `playlist` is the (proxied) playlist URL; `wrap` turns any upstream URL into a proxied one.
 /// With `partial` a stream whose sound can't be played still plays, silently; without it that is
-/// reported as `NeedsConversion` so it can be fixed instead.
+/// reported as `NeedsConversion` so it can be fixed instead. `decode_sound` decodes AC-3, E-AC-3 and
+/// MP2 sound here; without it that sound is such a problem too.
 pub fn start(
     video: HtmlVideoElement,
     playlist: Url,
     wrap: impl Fn(Url) -> Url + 'static,
     partial: bool,
+    decode_sound: bool,
     report: impl FnMut(Status) + 'static,
 ) -> Player {
     let stop = Rc::new(Cell::new(false));
     let stopped = stop.clone();
     let mut report = report;
     wasm_bindgen_futures::spawn_local(async move {
-        match run(&video, playlist, &wrap, partial, &stopped, &mut report).await {
+        match run(
+            &video,
+            playlist,
+            &wrap,
+            partial,
+            decode_sound,
+            &stopped,
+            &mut report,
+        )
+        .await
+        {
             Ok(()) if !stopped.get() => report(Status::Ended),
             Err(e) if !stopped.get() => report(match crate::needs_conversion(&e) {
                 Some(reason) => Status::NeedsConversion(reason.to_string()),
@@ -294,6 +306,7 @@ async fn run(
     playlist: Url,
     wrap: &dyn Fn(Url) -> Url,
     partial: bool,
+    decode_sound: bool,
     stop: &Cell<bool>,
     report: &mut dyn FnMut(Status),
 ) -> Result<(), String> {
@@ -331,7 +344,7 @@ async fn run(
         return Err("the browser did not open the media source".into());
     }
 
-    let mut tx = Transmuxer::default();
+    let mut tx = Transmuxer::default().decode_sound(decode_sound);
     let mut sb: Option<SourceBuffer> = None;
     let mut next_seq: Option<u64> = None;
     let mut started = false;
