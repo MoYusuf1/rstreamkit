@@ -130,7 +130,7 @@ fn nal_units(es: &[u8]) -> Vec<&[u8]> {
     out
 }
 
-fn read_ts(b: &[u8]) -> u64 {
+pub(crate) fn read_ts(b: &[u8]) -> u64 {
     (((b[0] as u64 >> 1) & 7) << 30)
         | ((b[1] as u64) << 22)
         | ((b[2] as u64 >> 1) << 15)
