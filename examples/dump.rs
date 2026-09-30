@@ -2,7 +2,7 @@
 //!   cargo run --example dump -- movie.mp4|movie.mkv OUT.mp4 [start seconds] [chunk bytes]
 use std::rc::Rc;
 
-use rffmpeg::{mkv, mp4, vod::Movie};
+use rstreamkit::{mkv, mp4, vod::Movie};
 
 fn main() {
     let a: Vec<String> = std::env::args().collect();
@@ -46,7 +46,7 @@ fn main() {
     println!(
         "{} ({}) duration {:.2}s shift {}",
         movie.video.name,
-        movie.container == rffmpeg::vod::Container::Mp4,
+        movie.container == rstreamkit::vod::Container::Mp4,
         movie.duration,
         movie.shift()
     );
