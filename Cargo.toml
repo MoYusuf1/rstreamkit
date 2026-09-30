@@ -5,12 +5,33 @@ edition = "2024"
 license = "MIT OR Apache-2.0"
 description = "Pure-Rust streaming toolkit for the browser: HLS, MPEG-TS and movie files in, fragmented MP4 out for MediaSource, with AC-3, E-AC-3 and MP2 sound decoded in Rust."
 
+[features]
+default = ["sound", "vod"]
+# AC-3, E-AC-3 and MP2 sound decoded in Rust (about a quarter of a page built from this crate).
+# Without it that sound is reported as unsupported, not played.
+sound = ["dep:oxideav-ac3", "dep:oxideav-core", "dep:oxideav-mp2"]
+# Movie files (MP4 and Matroska): `vod`, `mp4`, `mkv` and, in the browser, `mse::probe` and
+# `mse::play_movie`.
+vod = []
+
 [dependencies]
 futures-core = "0.3"
-oxideav-ac3 = "0.0.11"
-oxideav-core = "0.1"
-oxideav-mp2 = "0.0.10"
+oxideav-ac3 = { version = "0.0.11", optional = true }
+oxideav-core = { version = "0.1", optional = true }
+oxideav-mp2 = { version = "0.0.10", optional = true }
 thiserror = "2.0.21"
+
+[[test]]
+name = "vod"
+required-features = ["vod", "sound"]
+
+[[test]]
+name = "vod_without_sound"
+required-features = ["vod"]
+
+[[example]]
+name = "dump"
+required-features = ["vod"]
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 js-sys = "0.3.105"

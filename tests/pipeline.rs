@@ -200,157 +200,162 @@ fn anamorphic_pixels_are_declared_in_the_init_segment() {
     assert!(!square.windows(4).any(|w| w == b"pasp"));
 }
 
-fn ffmpeg_ok() -> bool {
-    Command::new("ffmpeg")
-        .arg("-version")
-        .output()
-        .is_ok_and(|o| o.status.success())
-}
+#[cfg(feature = "sound")]
+mod sound {
+    use super::*;
 
-/// ffmpeg's own decode of a file's sound: stereo, 48 kHz, 16-bit.
-fn ffmpeg_pcm(path: &std::path::Path) -> Vec<i16> {
-    let out = Command::new("ffmpeg")
-        .args(["-v", "error", "-i"])
-        .arg(path)
-        .args(["-vn", "-ac", "2", "-ar", "48000", "-f", "s16le", "-"])
-        .output()
-        .unwrap();
-    out.stdout
-        .as_chunks::<2>()
-        .0
-        .iter()
-        .map(|&b| i16::from_le_bytes(b))
-        .collect()
-}
-
-/// Signal-to-error ratio in dB, at the best alignment within a few thousand samples.
-fn snr(ours: &[i16], reference: &[i16]) -> (f64, i64) {
-    let n = ours.len().min(reference.len()).saturating_sub(12_000);
-    let mut best = (f64::MIN, 0);
-    // Smallest shifts first, and a later one must be clearly better: tones repeat, so many shifts
-    // look alike and the true one is the nearest.
-    let mut shifts: Vec<i64> = (-4096i64..=4096).step_by(2).collect();
-    shifts.sort_by_key(|s| s.abs());
-    for shift in shifts {
-        let (mut signal, mut error) = (0f64, 0f64);
-        for i in (4096..n).step_by(5) {
-            let j = (i as i64 + shift) as usize;
-            let (a, b) = (f64::from(ours[i]), f64::from(reference[j]));
-            signal += b * b;
-            error += (a - b) * (a - b);
-        }
-        let db = 10.0 * (signal / error.max(1.0)).log10();
-        if db > best.0 + 0.05 {
-            best = (db, shift);
-        }
+    fn ffmpeg_ok() -> bool {
+        Command::new("ffmpeg")
+            .arg("-version")
+            .output()
+            .is_ok_and(|o| o.status.success())
     }
-    best
-}
 
-/// How alike two signals are, ignoring exact levels: correlation, and how much louder `a` is (dB).
-fn compare_shape(a: &[i16], b: &[i16]) -> (f64, f64) {
-    let n = a.len().min(b.len());
-    let (mut ab, mut aa, mut bb) = (0f64, 0f64, 0f64);
-    for i in 0..n {
-        let (x, y) = (f64::from(a[i]), f64::from(b[i]));
-        ab += x * y;
-        aa += x * x;
-        bb += y * y;
-    }
-    (
-        ab / (aa * bb).sqrt().max(1.0),
-        10.0 * (aa / bb.max(1.0)).log10(),
-    )
-}
-
-/// AC-3, E-AC-3 and MP2 sound, which browsers can't decode, comes out of the transmuxer as FLAC
-/// audio in the same MP4 as the picture, and sounds like what ffmpeg makes of the original.
-#[test]
-fn ac3_eac3_and_mp2_sound_is_decoded_to_flac_that_matches_ffmpeg() {
-    if !ffmpeg_ok() {
-        eprintln!("ffmpeg isn't installed: skipping");
-        return;
-    }
-    let clips: [(&str, &[u8]); 4] = [
-        ("h264_ac3_st.ts", include_bytes!("fixtures/h264_ac3_st.ts")),
-        ("h264_ac3_51.ts", include_bytes!("fixtures/h264_ac3_51.ts")),
-        (
-            "h264_eac3_51.ts",
-            include_bytes!("fixtures/h264_eac3_51.ts"),
-        ),
-        ("h264_mp2.ts", include_bytes!("fixtures/h264_mp2.ts")),
-    ];
-    for (name, bytes) in clips {
-        let out = Transmuxer::default().push(bytes).unwrap();
-        assert!(out.skipped_audio.is_none(), "{name}: sound was dropped");
-        let init = out.init.unwrap();
-        assert!(init.mime.ends_with(",flac\""), "{name}: {}", init.mime);
-
-        let dir = std::env::temp_dir();
-        let (ours_file, source_file) = (
-            dir.join(format!(
-                "rstreamkit-sound-{}-{name}.mp4",
-                std::process::id()
-            )),
-            dir.join(format!("rstreamkit-sound-{}-{name}", std::process::id())),
-        );
-        std::fs::write(&ours_file, [init.bytes.as_slice(), &out.fragment].concat()).unwrap();
-        std::fs::write(&source_file, bytes).unwrap();
-
-        let codecs = Command::new("ffprobe")
-            .args([
-                "-v",
-                "error",
-                "-show_entries",
-                "stream=codec_name",
-                "-of",
-                "csv=p=0",
-            ])
-            .arg(&ours_file)
+    /// ffmpeg's own decode of a file's sound: stereo, 48 kHz, 16-bit.
+    fn ffmpeg_pcm(path: &std::path::Path) -> Vec<i16> {
+        let out = Command::new("ffmpeg")
+            .args(["-v", "error", "-i"])
+            .arg(path)
+            .args(["-vn", "-ac", "2", "-ar", "48000", "-f", "s16le", "-"])
             .output()
             .unwrap();
-        let codecs = String::from_utf8_lossy(&codecs.stdout).into_owned();
-        assert!(
-            codecs.contains("h264") && codecs.contains("flac"),
-            "{name}: {codecs}"
-        );
+        out.stdout
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|&b| i16::from_le_bytes(b))
+            .collect()
+    }
 
-        let (ours, reference) = (ffmpeg_pcm(&ours_file), ffmpeg_pcm(&source_file));
-        assert!(
-            ours.len() > 48_000,
-            "{name}: only {} samples came out",
-            ours.len()
-        );
-        let (db, shift) = snr(&ours, &reference);
-        assert!(
-            shift.abs() <= 2,
-            "{name}: sound is {shift} samples out of step"
-        );
-        let (corr, level_db) = compare_shape(&ours, &reference);
-        eprintln!(
-            "{name}: {db:.1} dB against ffmpeg, correlation {corr:.3}, level {level_db:+.1} dB, {} samples",
-            ours.len()
-        );
-        if name.contains("eac3") {
-            // E-AC-3 is folded to stereo with the mix levels in its own metadata, which ffmpeg
-            // weighs differently: the same sound at a similar level, not the same samples.
-            assert!(
-                corr > 0.85 && level_db.abs() < 6.0,
-                "{name}: {corr:.3} {level_db:+.1} dB"
-            );
-        } else if name.contains("51") {
-            // Our decoder folds AC-3 5.1 to stereo with the spec's downmix (§7.8, the mix levels the
-            // stream carries). Recent ffmpeg does the same and matches to 40+ dB; an older one uses
-            // fixed levels, and on CI that matched to 17 dB: the same sound at the same level
-            // (correlation 0.991, +0.2 dB). Stereo AC-3 and MP2 have no downmix and stay strict.
-            assert!(
-                corr > 0.98 && level_db.abs() < 1.5,
-                "{name}: {corr:.3} {level_db:+.1} dB"
-            );
-        } else {
-            assert!(db > 40.0, "{name}: {db:.1} dB against ffmpeg's decode");
+    /// Signal-to-error ratio in dB, at the best alignment within a few thousand samples.
+    fn snr(ours: &[i16], reference: &[i16]) -> (f64, i64) {
+        let n = ours.len().min(reference.len()).saturating_sub(12_000);
+        let mut best = (f64::MIN, 0);
+        // Smallest shifts first, and a later one must be clearly better: tones repeat, so many shifts
+        // look alike and the true one is the nearest.
+        let mut shifts: Vec<i64> = (-4096i64..=4096).step_by(2).collect();
+        shifts.sort_by_key(|s| s.abs());
+        for shift in shifts {
+            let (mut signal, mut error) = (0f64, 0f64);
+            for i in (4096..n).step_by(5) {
+                let j = (i as i64 + shift) as usize;
+                let (a, b) = (f64::from(ours[i]), f64::from(reference[j]));
+                signal += b * b;
+                error += (a - b) * (a - b);
+            }
+            let db = 10.0 * (signal / error.max(1.0)).log10();
+            if db > best.0 + 0.05 {
+                best = (db, shift);
+            }
         }
-        std::fs::remove_file(ours_file).ok();
-        std::fs::remove_file(source_file).ok();
+        best
+    }
+
+    /// How alike two signals are, ignoring exact levels: correlation, and how much louder `a` is (dB).
+    fn compare_shape(a: &[i16], b: &[i16]) -> (f64, f64) {
+        let n = a.len().min(b.len());
+        let (mut ab, mut aa, mut bb) = (0f64, 0f64, 0f64);
+        for i in 0..n {
+            let (x, y) = (f64::from(a[i]), f64::from(b[i]));
+            ab += x * y;
+            aa += x * x;
+            bb += y * y;
+        }
+        (
+            ab / (aa * bb).sqrt().max(1.0),
+            10.0 * (aa / bb.max(1.0)).log10(),
+        )
+    }
+
+    /// AC-3, E-AC-3 and MP2 sound, which browsers can't decode, comes out of the transmuxer as FLAC
+    /// audio in the same MP4 as the picture, and sounds like what ffmpeg makes of the original.
+    #[test]
+    fn ac3_eac3_and_mp2_sound_is_decoded_to_flac_that_matches_ffmpeg() {
+        if !ffmpeg_ok() {
+            eprintln!("ffmpeg isn't installed: skipping");
+            return;
+        }
+        let clips: [(&str, &[u8]); 4] = [
+            ("h264_ac3_st.ts", include_bytes!("fixtures/h264_ac3_st.ts")),
+            ("h264_ac3_51.ts", include_bytes!("fixtures/h264_ac3_51.ts")),
+            (
+                "h264_eac3_51.ts",
+                include_bytes!("fixtures/h264_eac3_51.ts"),
+            ),
+            ("h264_mp2.ts", include_bytes!("fixtures/h264_mp2.ts")),
+        ];
+        for (name, bytes) in clips {
+            let out = Transmuxer::default().push(bytes).unwrap();
+            assert!(out.skipped_audio.is_none(), "{name}: sound was dropped");
+            let init = out.init.unwrap();
+            assert!(init.mime.ends_with(",flac\""), "{name}: {}", init.mime);
+
+            let dir = std::env::temp_dir();
+            let (ours_file, source_file) = (
+                dir.join(format!(
+                    "rstreamkit-sound-{}-{name}.mp4",
+                    std::process::id()
+                )),
+                dir.join(format!("rstreamkit-sound-{}-{name}", std::process::id())),
+            );
+            std::fs::write(&ours_file, [init.bytes.as_slice(), &out.fragment].concat()).unwrap();
+            std::fs::write(&source_file, bytes).unwrap();
+
+            let codecs = Command::new("ffprobe")
+                .args([
+                    "-v",
+                    "error",
+                    "-show_entries",
+                    "stream=codec_name",
+                    "-of",
+                    "csv=p=0",
+                ])
+                .arg(&ours_file)
+                .output()
+                .unwrap();
+            let codecs = String::from_utf8_lossy(&codecs.stdout).into_owned();
+            assert!(
+                codecs.contains("h264") && codecs.contains("flac"),
+                "{name}: {codecs}"
+            );
+
+            let (ours, reference) = (ffmpeg_pcm(&ours_file), ffmpeg_pcm(&source_file));
+            assert!(
+                ours.len() > 48_000,
+                "{name}: only {} samples came out",
+                ours.len()
+            );
+            let (db, shift) = snr(&ours, &reference);
+            assert!(
+                shift.abs() <= 2,
+                "{name}: sound is {shift} samples out of step"
+            );
+            let (corr, level_db) = compare_shape(&ours, &reference);
+            eprintln!(
+                "{name}: {db:.1} dB against ffmpeg, correlation {corr:.3}, level {level_db:+.1} dB, {} samples",
+                ours.len()
+            );
+            if name.contains("eac3") {
+                // E-AC-3 is folded to stereo with the mix levels in its own metadata, which ffmpeg
+                // weighs differently: the same sound at a similar level, not the same samples.
+                assert!(
+                    corr > 0.85 && level_db.abs() < 6.0,
+                    "{name}: {corr:.3} {level_db:+.1} dB"
+                );
+            } else if name.contains("51") {
+                // Our decoder folds AC-3 5.1 to stereo with the spec's downmix (§7.8, the mix levels the
+                // stream carries). Recent ffmpeg does the same and matches to 40+ dB; an older one uses
+                // fixed levels, and on CI that matched to 17 dB: the same sound at the same level
+                // (correlation 0.991, +0.2 dB). Stereo AC-3 and MP2 have no downmix and stay strict.
+                assert!(
+                    corr > 0.98 && level_db.abs() < 1.5,
+                    "{name}: {corr:.3} {level_db:+.1} dB"
+                );
+            } else {
+                assert!(db > 40.0, "{name}: {db:.1} dB against ffmpeg's decode");
+            }
+            std::fs::remove_file(ours_file).ok();
+            std::fs::remove_file(source_file).ok();
+        }
     }
 }

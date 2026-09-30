@@ -3,11 +3,13 @@
 //! as the picture, so the two stay in step with no extra machinery. (FLAC because it needs no
 //! encoder: a frame can carry the samples as they are.)
 //!
+//! The decoders are the `sound` feature (AC-3 and MP2 are a good quarter of what a browser page
+//! built from this crate weighs). Without it `split` finds no frames, so a stream's sound is reported
+//! as unsupported instead of played, and everything else, FLAC writing included, is unchanged.
+//!
 //! ponytail: the result is always stereo, 16-bit. Surround is folded down with the usual -3 dB
 //! centre and surround mix and the LFE channel is dropped; E-AC-3 dependent substreams (the extra
 //! channels of 7.1) are skipped.
-
-use oxideav_core::{CodecId, CodecParameters, Decoder as CodecDecoder, Frame, Packet, TimeBase};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Kind {
@@ -27,195 +29,231 @@ pub struct Coded<'a> {
     pub channels: u8,
 }
 
-/// Cuts a PES payload into frames. Anything that isn't a frame is stepped over.
-pub fn split(kind: Kind, es: &[u8]) -> Vec<Coded<'_>> {
-    match kind {
-        Kind::Ac3 => split_ac3(es),
-        Kind::Mpeg => split_mpeg(es),
-    }
-}
+#[cfg(feature = "sound")]
+mod decode {
+    use oxideav_core::{
+        CodecId, CodecParameters, Decoder as CodecDecoder, Frame, Packet, TimeBase,
+    };
 
-fn split_ac3(es: &[u8]) -> Vec<Coded<'_>> {
-    let mut out = vec![];
-    let mut i = 0;
-    while i + 8 <= es.len() {
-        if es[i] != 0x0B || es[i + 1] != 0x77 {
-            i += 1;
-            continue;
+    use super::{Coded, Kind};
+
+    /// Cuts a PES payload into frames. Anything that isn't a frame is stepped over.
+    pub fn split(kind: Kind, es: &[u8]) -> Vec<Coded<'_>> {
+        match kind {
+            Kind::Ac3 => split_ac3(es),
+            Kind::Mpeg => split_mpeg(es),
         }
-        let bsid = es[i + 5] >> 3;
-        // (frame bytes, samples per channel, rate, worth decoding)
-        let frame = if bsid <= 10 {
-            match oxideav_ac3::syncinfo::parse(&es[i..]) {
-                Ok(si) => Some((si.frame_length as usize, 1536, si.sample_rate, true)),
-                Err(_) => None,
+    }
+
+    fn split_ac3(es: &[u8]) -> Vec<Coded<'_>> {
+        let mut out = vec![];
+        let mut i = 0;
+        while i + 8 <= es.len() {
+            if es[i] != 0x0B || es[i + 1] != 0x77 {
+                i += 1;
+                continue;
             }
-        } else {
-            // E-AC-3: strmtyp(2) substreamid(3) frmsiz(11), then fscod(2) and numblkscod(2).
-            let len = ((((es[i + 2] & 7) as usize) << 8 | es[i + 3] as usize) + 1) * 2;
-            let (fscod, second) = (es[i + 4] >> 6, (es[i + 4] >> 4) & 3);
-            let (rate, blocks) = if fscod == 3 {
-                ([24_000, 22_050, 16_000, 0][second as usize], 6)
+            let bsid = es[i + 5] >> 3;
+            // (frame bytes, samples per channel, rate, worth decoding)
+            let frame = if bsid <= 10 {
+                match oxideav_ac3::syncinfo::parse(&es[i..]) {
+                    Ok(si) => Some((si.frame_length as usize, 1536, si.sample_rate, true)),
+                    Err(_) => None,
+                }
             } else {
-                (
-                    [48_000, 44_100, 32_000][fscod as usize],
-                    [1, 2, 3, 6][second as usize],
-                )
+                // E-AC-3: strmtyp(2) substreamid(3) frmsiz(11), then fscod(2) and numblkscod(2).
+                let len = ((((es[i + 2] & 7) as usize) << 8 | es[i + 3] as usize) + 1) * 2;
+                let (fscod, second) = (es[i + 4] >> 6, (es[i + 4] >> 4) & 3);
+                let (rate, blocks) = if fscod == 3 {
+                    ([24_000, 22_050, 16_000, 0][second as usize], 6)
+                } else {
+                    (
+                        [48_000, 44_100, 32_000][fscod as usize],
+                        [1, 2, 3, 6][second as usize],
+                    )
+                };
+                // Stream type 1 is a dependent substream: extra channels for a 7.1 decoder.
+                Some((len, 256 * blocks, rate, es[i + 2] >> 6 != 1 && rate != 0))
             };
-            // Stream type 1 is a dependent substream: extra channels for a 7.1 decoder.
-            Some((len, 256 * blocks, rate, es[i + 2] >> 6 != 1 && rate != 0))
-        };
-        let Some((len, samples, rate, decode)) = frame else {
-            i += 1;
-            continue;
-        };
-        if len < 8 || i + len > es.len() {
-            break;
-        }
-        if decode {
-            out.push(Coded {
-                data: &es[i..i + len],
-                samples,
-                rate,
-                channels: 2,
-            });
-        }
-        i += len;
-    }
-    out
-}
-
-fn split_mpeg(es: &[u8]) -> Vec<Coded<'_>> {
-    use oxideav_mp2::header::FrameHeader;
-    let mut out = vec![];
-    let mut i = 0;
-    while i + 4 <= es.len() {
-        match FrameHeader::parse(&es[i..]) {
-            Ok(h) if i + h.frame_size_bytes() <= es.len() => {
-                let len = h.frame_size_bytes();
+            let Some((len, samples, rate, decode)) = frame else {
+                i += 1;
+                continue;
+            };
+            if len < 8 || i + len > es.len() {
+                break;
+            }
+            if decode {
                 out.push(Coded {
                     data: &es[i..i + len],
-                    samples: h.samples_per_channel() as u32,
-                    rate: h.sample_rate,
-                    channels: h.channels() as u8,
+                    samples,
+                    rate,
+                    channels: 2,
                 });
-                i += len;
             }
-            Ok(_) => break,
-            Err(_) => i += 1,
+            i += len;
+        }
+        out
+    }
+
+    fn split_mpeg(es: &[u8]) -> Vec<Coded<'_>> {
+        use oxideav_mp2::header::FrameHeader;
+        let mut out = vec![];
+        let mut i = 0;
+        while i + 4 <= es.len() {
+            match FrameHeader::parse(&es[i..]) {
+                Ok(h) if i + h.frame_size_bytes() <= es.len() => {
+                    let len = h.frame_size_bytes();
+                    out.push(Coded {
+                        data: &es[i..i + len],
+                        samples: h.samples_per_channel() as u32,
+                        rate: h.sample_rate,
+                        channels: h.channels() as u8,
+                    });
+                    i += len;
+                }
+                Ok(_) => break,
+                Err(_) => i += 1,
+            }
+        }
+        out
+    }
+
+    pub struct Decoder {
+        ac3: Option<Box<dyn CodecDecoder>>,
+        mpeg: Option<Box<dyn CodecDecoder>>,
+    }
+
+    impl Default for Decoder {
+        fn default() -> Self {
+            Self::new()
         }
     }
-    out
-}
 
-pub struct Decoder {
-    ac3: Option<Box<dyn CodecDecoder>>,
-    mpeg: Option<Box<dyn CodecDecoder>>,
-}
-
-impl Default for Decoder {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl Decoder {
-    pub fn new() -> Self {
-        Self {
-            ac3: None,
-            mpeg: None,
+    impl Decoder {
+        pub fn new() -> Self {
+            Self {
+                ac3: None,
+                mpeg: None,
+            }
         }
-    }
 
-    /// Stereo samples (interleaved) for one frame. A frame that can't be decoded comes back as
-    /// silence of the right length, so the timeline holds instead of the sound running early.
-    pub fn decode(&mut self, kind: Kind, frame: &Coded) -> Vec<i16> {
-        let silence = || vec![0; frame.samples as usize * 2];
-        let (slot, name) = match kind {
-            Kind::Ac3 => (&mut self.ac3, "ac3"),
-            Kind::Mpeg => (&mut self.mpeg, "mp2"),
-        };
-        if slot.is_none() {
-            let mut params = CodecParameters::audio(CodecId::new(name));
-            params.channels = Some(u16::from(frame.channels.max(1)));
-            let made = match kind {
-                Kind::Ac3 => oxideav_ac3::decoder::make_decoder(&params),
-                Kind::Mpeg => oxideav_mp2::codec_decoder::make_decoder(&params),
+        /// Stereo samples (interleaved) for one frame. A frame that can't be decoded comes back as
+        /// silence of the right length, so the timeline holds instead of the sound running early.
+        pub fn decode(&mut self, kind: Kind, frame: &Coded) -> Vec<i16> {
+            let silence = || vec![0; frame.samples as usize * 2];
+            let (slot, name) = match kind {
+                Kind::Ac3 => (&mut self.ac3, "ac3"),
+                Kind::Mpeg => (&mut self.mpeg, "mp2"),
             };
-            *slot = made.ok();
-        }
-        let Some(decoder) = slot.as_mut() else {
-            return silence();
-        };
-        let packet = Packet::new(
-            0,
-            TimeBase::new(1, i64::from(frame.rate)),
-            frame.data.to_vec(),
-        );
-        if decoder.send_packet(&packet).is_err() {
-            return silence();
-        }
-        match decoder.receive_frame() {
-            Ok(Frame::Audio(a)) => match a.data.as_slice() {
-                // One buffer per channel (MP2 does it this way): weave the first two together.
-                [left, right, ..] => weave(left, right, a.samples as usize),
-                // One buffer with the channels interleaved (AC-3).
-                [all] => stereo(all, a.samples as usize),
-                [] => None,
-            }
-            .unwrap_or_else(silence),
-            _ => silence(),
-        }
-    }
-}
-
-/// Two channel buffers of 16-bit samples, woven into one stereo buffer.
-fn weave(left: &[u8], right: &[u8], samples: usize) -> Option<Vec<i16>> {
-    if samples == 0 || left.len() < samples * 2 || right.len() < samples * 2 {
-        return None;
-    }
-    let sample = |b: &[u8], i: usize| i16::from_le_bytes([b[i * 2], b[i * 2 + 1]]);
-    Some(
-        (0..samples)
-            .flat_map(|i| [sample(left, i), sample(right, i)])
-            .collect(),
-    )
-}
-
-/// Interleaved 16-bit samples, however many channels, folded to stereo.
-fn stereo(bytes: &[u8], samples: usize) -> Option<Vec<i16>> {
-    if samples == 0 || bytes.len() < samples * 2 {
-        return None;
-    }
-    let channels = bytes.len() / (samples * 2);
-    let pcm: Vec<i16> = bytes
-        .as_chunks::<2>()
-        .0
-        .iter()
-        .map(|&b| i16::from_le_bytes(b))
-        .collect();
-    let mut out = Vec::with_capacity(samples * 2);
-    match channels {
-        1 => pcm.iter().for_each(|&x| out.extend([x, x])),
-        2 => out = pcm,
-        // 5.1 in WAVE order: front left and right, centre, LFE, back left and right. The gain keeps
-        // the loudest case (everything at full scale in one place) from clipping.
-        6 => {
-            const SIDE: f32 = std::f32::consts::FRAC_1_SQRT_2;
-            const GAIN: f32 = 1.0 / (1.0 + 2.0 * SIDE);
-            for f in pcm.as_chunks::<6>().0 {
-                let (l, r, c, back_l, back_r) = (f[0], f[1], f[2], f[4], f[5]);
-                let mix = |front: i16, back: i16| {
-                    ((f32::from(front) + SIDE * f32::from(c) + SIDE * f32::from(back)) * GAIN)
-                        as i16
+            if slot.is_none() {
+                let mut params = CodecParameters::audio(CodecId::new(name));
+                params.channels = Some(u16::from(frame.channels.max(1)));
+                let made = match kind {
+                    Kind::Ac3 => oxideav_ac3::decoder::make_decoder(&params),
+                    Kind::Mpeg => oxideav_mp2::codec_decoder::make_decoder(&params),
                 };
-                out.extend([mix(l, back_l), mix(r, back_r)]);
+                *slot = made.ok();
+            }
+            let Some(decoder) = slot.as_mut() else {
+                return silence();
+            };
+            let packet = Packet::new(
+                0,
+                TimeBase::new(1, i64::from(frame.rate)),
+                frame.data.to_vec(),
+            );
+            if decoder.send_packet(&packet).is_err() {
+                return silence();
+            }
+            match decoder.receive_frame() {
+                Ok(Frame::Audio(a)) => match a.data.as_slice() {
+                    // One buffer per channel (MP2 does it this way): weave the first two together.
+                    [left, right, ..] => weave(left, right, a.samples as usize),
+                    // One buffer with the channels interleaved (AC-3).
+                    [all] => stereo(all, a.samples as usize),
+                    [] => None,
+                }
+                .unwrap_or_else(silence),
+                _ => silence(),
             }
         }
-        n => pcm.chunks_exact(n).for_each(|f| out.extend([f[0], f[1]])),
     }
-    Some(out)
+
+    /// Two channel buffers of 16-bit samples, woven into one stereo buffer.
+    pub(super) fn weave(left: &[u8], right: &[u8], samples: usize) -> Option<Vec<i16>> {
+        if samples == 0 || left.len() < samples * 2 || right.len() < samples * 2 {
+            return None;
+        }
+        let sample = |b: &[u8], i: usize| i16::from_le_bytes([b[i * 2], b[i * 2 + 1]]);
+        Some(
+            (0..samples)
+                .flat_map(|i| [sample(left, i), sample(right, i)])
+                .collect(),
+        )
+    }
+
+    /// Interleaved 16-bit samples, however many channels, folded to stereo.
+    pub(super) fn stereo(bytes: &[u8], samples: usize) -> Option<Vec<i16>> {
+        if samples == 0 || bytes.len() < samples * 2 {
+            return None;
+        }
+        let channels = bytes.len() / (samples * 2);
+        let pcm: Vec<i16> = bytes
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|&b| i16::from_le_bytes(b))
+            .collect();
+        let mut out = Vec::with_capacity(samples * 2);
+        match channels {
+            1 => pcm.iter().for_each(|&x| out.extend([x, x])),
+            2 => out = pcm,
+            // 5.1 in WAVE order: front left and right, centre, LFE, back left and right. The gain keeps
+            // the loudest case (everything at full scale in one place) from clipping.
+            6 => {
+                const SIDE: f32 = std::f32::consts::FRAC_1_SQRT_2;
+                const GAIN: f32 = 1.0 / (1.0 + 2.0 * SIDE);
+                for f in pcm.as_chunks::<6>().0 {
+                    let (l, r, c, back_l, back_r) = (f[0], f[1], f[2], f[4], f[5]);
+                    let mix = |front: i16, back: i16| {
+                        ((f32::from(front) + SIDE * f32::from(c) + SIDE * f32::from(back)) * GAIN)
+                            as i16
+                    };
+                    out.extend([mix(l, back_l), mix(r, back_r)]);
+                }
+            }
+            n => pcm.chunks_exact(n).for_each(|f| out.extend([f[0], f[1]])),
+        }
+        Some(out)
+    }
 }
+
+#[cfg(not(feature = "sound"))]
+mod decode {
+    use super::{Coded, Kind};
+
+    /// There is nothing to cut sound into frames with: no frames, so the stream's sound is left
+    /// out and reported as unsupported.
+    pub fn split(_: Kind, _: &[u8]) -> Vec<Coded<'_>> {
+        vec![]
+    }
+
+    /// Stands in for the decoder. It is never asked to decode anything, since `split` finds no frames.
+    #[derive(Default)]
+    pub struct Decoder;
+
+    impl Decoder {
+        pub fn new() -> Self {
+            Self
+        }
+
+        pub fn decode(&mut self, _: Kind, frame: &Coded) -> Vec<i16> {
+            vec![0; frame.samples as usize * 2]
+        }
+    }
+}
+
+pub use decode::{Decoder, split};
 
 /// CRC-8 (polynomial 0x07) as FLAC frame headers use it.
 fn crc8(data: &[u8]) -> u8 {
@@ -384,6 +422,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "sound")]
     #[test]
     fn separate_channel_buffers_are_woven_into_stereo() {
         let left: Vec<u8> = [1i16, 2, 3].iter().flat_map(|s| s.to_le_bytes()).collect();
@@ -391,24 +430,31 @@ mod tests {
             .iter()
             .flat_map(|s| s.to_le_bytes())
             .collect();
-        assert_eq!(weave(&left, &right, 3).unwrap(), [1, -1, 2, -2, 3, -3]);
         assert_eq!(
-            weave(&left, &right[..4], 3),
+            decode::weave(&left, &right, 3).unwrap(),
+            [1, -1, 2, -2, 3, -3]
+        );
+        assert_eq!(
+            decode::weave(&left, &right[..4], 3),
             None,
             "a short buffer is refused"
         );
     }
 
+    #[cfg(feature = "sound")]
     #[test]
     fn surround_folds_to_stereo_without_clipping() {
         // Six channels at full scale everywhere: the mix must stay in range.
         let loud = [i16::MAX; 6 * 4];
         let bytes: Vec<u8> = loud.iter().flat_map(|s| s.to_le_bytes()).collect();
-        let out = stereo(&bytes, 4).unwrap();
+        let out = decode::stereo(&bytes, 4).unwrap();
         assert_eq!(out.len(), 8);
         assert!(out.iter().all(|&s| s > 0));
         // Mono is doubled; stereo is untouched.
-        assert_eq!(stereo(&[1, 0, 2, 0], 2).unwrap(), [1, 1, 2, 2]);
-        assert_eq!(stereo(&[1, 0, 2, 0, 3, 0, 4, 0], 2).unwrap(), [1, 2, 3, 4]);
+        assert_eq!(decode::stereo(&[1, 0, 2, 0], 2).unwrap(), [1, 1, 2, 2]);
+        assert_eq!(
+            decode::stereo(&[1, 0, 2, 0, 3, 0, 4, 0], 2).unwrap(),
+            [1, 2, 3, 4]
+        );
     }
 }

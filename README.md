@@ -13,11 +13,11 @@ it, not the other way round: see [CONTRIBUTING.md](CONTRIBUTING.md). Its first c
 | `hls` | Playlist parsing (media and master playlists, sliding windows) |
 | `ts` | MPEG-TS demux: H.264 video, AAC (ADTS), AC-3, E-AC-3 and MPEG audio |
 | `avc` | H.264 SPS: size, pixel aspect ratio (`pasp`), interlacing |
-| `sound` | AC-3 / E-AC-3 / MP2 decoded to stereo PCM, written as FLAC frames |
+| `sound` (decoders: feature `sound`) | AC-3 / E-AC-3 / MP2 decoded to stereo PCM, written as FLAC frames |
 | `body` | Reads a response body with a size cap, so an endless stream can't fill memory |
 | `fmp4` | fMP4 init segment and fragments (`avc1` + `mp4a` or `fLaC`) |
 | `Transmuxer` (crate root) | Feeds segments in, gets an init segment and fragments out |
-| `vod`, `mp4`, `mkv` | Movie files (MP4, Matroska): index, tracks and byte-range reading, played as fMP4 |
+| `vod`, `mp4`, `mkv` (feature `vod`) | Movie files (MP4, Matroska): index, tracks and byte-range reading, played as fMP4 |
 | `mse` (wasm only) | Fetches the playlist and segments (through a `Fetch` you supply) and appends them to a `<video>` |
 
 ```rust
@@ -39,6 +39,22 @@ response's final address. It depends on no HTTP or URL crate: the browser alread
 `url::join` resolves references as RFC 3986 says.
 
 `cargo run --example transmux -- out.mp4 seg1.ts seg2.ts` writes a playable file from local segments.
+
+## Features: pay for what you use
+
+Both are on by default. A page that only plays live HLS can leave them out
+(`rstreamkit = { version = "...", default-features = false }`) and be a fraction of the size.
+
+| Features | Adds | Whole page, compressed |
+|---|---|---|
+| none | live HLS and MPEG-TS, H.264 and AAC | 57 KB |
+| `vod` | MP4 and Matroska movie files (`vod`, `mp4`, `mkv`, `mse::probe`, `mse::play_movie`) | 86 KB |
+| `sound` | AC-3, E-AC-3 and MP2 sound decoded in Rust | 163 KB |
+| `sound` + `vod` (default) | both | 185 KB |
+
+Measured on a page that uses everything its features offer: built for `wasm32` with `opt-level = "z"` and
+LTO, then `wasm-bindgen`, `wasm-opt -Oz` and brotli. Without `sound`, AC-3, E-AC-3 and MP2 are reported as
+`Unsupported::Sound` (and a movie with such sound as `Verdict::Unsupported`) instead of played.
 
 ## What it doesn't do
 

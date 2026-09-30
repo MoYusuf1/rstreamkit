@@ -29,7 +29,15 @@ jobs:
             echo "an app name is in the library source"; exit 1
           fi
       - run: cargo fmt --check
-      - run: cargo clippy --all-targets -- -D warnings
-      # `mse` only exists on wasm, so nothing else compiles it.
-      - run: cargo clippy --target wasm32-unknown-unknown -- -D warnings
+      # Every combination of the optional features must lint clean. `mse` only exists on wasm, so
+      # nothing else compiles it.
+      - name: clippy, native and wasm, in every feature combination
+        run: |
+          for f in "" "--no-default-features" "--no-default-features --features sound" "--no-default-features --features vod"; do
+            cargo clippy --all-targets $f -- -D warnings
+            cargo clippy --target wasm32-unknown-unknown $f -- -D warnings
+          done
       - run: cargo test
+      - run: cargo test --no-default-features
+      # Movies without the sound decoders (they are reported as unsupported).
+      - run: cargo test --no-default-features --features vod

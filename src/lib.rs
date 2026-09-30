@@ -7,13 +7,16 @@ pub mod avc;
 pub mod body;
 pub mod fmp4;
 pub mod hls;
+#[cfg(feature = "vod")]
 pub mod mkv;
+#[cfg(feature = "vod")]
 pub mod mp4;
 #[cfg(target_arch = "wasm32")]
 pub mod mse;
 pub mod sound;
 pub mod ts;
 pub mod url;
+#[cfg(feature = "vod")]
 pub mod vod;
 
 #[derive(Debug, thiserror::Error)]
@@ -361,6 +364,7 @@ impl Transmuxer {
 mod tests {
     use super::*;
 
+    #[cfg(feature = "sound")]
     #[test]
     fn sound_decoding_can_be_switched_off() {
         let ac3 = include_bytes!("../tests/fixtures/h264_ac3.ts");
@@ -438,7 +442,12 @@ mod tests {
     fn each_track_carries_on_exactly_where_it_stopped_after_a_jump() {
         let aac: &[u8] = include_bytes!("../tests/fixtures/bbb_480p.ts");
         let ac3: &[u8] = include_bytes!("../tests/fixtures/h264_ac3_st.ts");
-        for (name, segment) in [("AAC", aac), ("AC-3 decoded", ac3)] {
+        // Without the decoders the sound isn't there to be continuous.
+        let cases = [("AAC", aac), ("AC-3 decoded", ac3)];
+        for (name, segment) in cases
+            .into_iter()
+            .take(if cfg!(feature = "sound") { 2 } else { 1 })
+        {
             let first = ts::demux(segment).unwrap().video[0].dts as i64;
             let mut t = Transmuxer::default();
             t.push(segment).unwrap();

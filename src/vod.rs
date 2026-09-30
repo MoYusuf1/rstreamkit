@@ -213,7 +213,11 @@ impl Movie {
             return Verdict::Unsupported(Unsupported::Interlaced);
         }
         match &self.audio {
-            Some(a) if a.audio == Audio::Other => {
+            // Sound only the decoders here could play: without them, it is unsupported too.
+            Some(a)
+                if a.audio == Audio::Other
+                    || (matches!(a.audio, Audio::Sound(_)) && !cfg!(feature = "sound")) =>
+            {
                 Verdict::Unsupported(Unsupported::Sound(a.name.clone()))
             }
             _ => Verdict::Rust,
