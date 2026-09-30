@@ -14,7 +14,7 @@ use web_sys::{HtmlVideoElement, MediaSource, MediaSourceReadyState, SourceBuffer
 use crate::{
     Transmuxer,
     body::{self, Capped},
-    hls,
+    hls, mkv, mp4, vod,
 };
 
 /// Start a live stream this many segments back from the newest one.
@@ -462,5 +462,324 @@ async fn run(
         }
         latest = fetch(&http, &media_url, PLAYLIST_LIMIT, stop).await?;
         media = parse_media(&latest)?;
+    }
+}
+
+// ---- Movies and episodes: plain files read by byte range ----
+
+/// Ask the browser whether it can play a MIME type with codecs, e.g. `video/mp4; codecs="avc1.64001f"`.
+pub fn can_play(mime: &str) -> bool {
+    web_sys::window()
+        .and_then(|w| w.document())
+        .and_then(|d| d.create_element("video").ok())
+        .and_then(|e| wasm_bindgen::JsCast::dyn_into::<web_sys::HtmlMediaElement>(e).ok())
+        .is_some_and(|v| !v.can_play_type(mime).is_empty())
+}
+
+struct Part {
+    bytes: Vec<u8>,
+    /// The whole file's length.
+    total: u64,
+}
+
+/// `len` bytes of the file from `start`, through the proxy.
+async fn get_range(
+    http: &reqwest::Client,
+    url: &Url,
+    start: u64,
+    len: u64,
+    stop: &Cell<bool>,
+) -> Result<Part, String> {
+    let mut last = String::new();
+    for attempt in 0..3 {
+        if attempt > 0 {
+            sleep(Duration::from_secs(1)).await;
+        }
+        if stop.get() {
+            break;
+        }
+        match get_range_once(http, url, start, len).await {
+            Ok(p) => return Ok(p),
+            Err(e) if e.contains("refused") || e.contains("ranges") => return Err(e),
+            Err(e) => last = e,
+        }
+    }
+    Err(last)
+}
+
+async fn get_range_once(
+    http: &reqwest::Client,
+    url: &Url,
+    start: u64,
+    len: u64,
+) -> Result<Part, String> {
+    let host = upstream_host(url);
+    let r = http
+        .get(url.clone())
+        .header("Range", format!("bytes={start}-{}", start + len.max(1) - 1))
+        .send()
+        .await
+        .map_err(|e| format!("request to the proxy failed: {}", e.without_url()))?;
+    let status = r.status();
+    if status != 206 {
+        if let Some(why) = r
+            .headers()
+            .get("x-riptv-error")
+            .and_then(|v| v.to_str().ok())
+        {
+            let what = if status == 403 {
+                "refused"
+            } else {
+                "could not reach"
+            };
+            return Err(format!("the proxy {what} {host}: {why}"));
+        }
+        // A 200 would be the whole file: dropping the response stops it.
+        return Err(if status == 200 {
+            format!("{host} does not serve byte ranges")
+        } else {
+            format!("{host} answered HTTP {status}")
+        });
+    }
+    // "bytes 0-262143/1234567"
+    let total = r
+        .headers()
+        .get("content-range")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.rsplit('/').next())
+        .and_then(|t| t.parse().ok())
+        .ok_or_else(|| format!("{host} does not serve byte ranges"))?;
+    // A range answers with at most what was asked for; anything more is not a range.
+    let limit = usize::try_from(len).unwrap_or(usize::MAX >> 1) + 1024;
+    let bytes = body::read_capped(std::pin::pin!(r.bytes_stream()), limit)
+        .await
+        .map_err(|e| match e {
+            Capped::TooBig => format!("{host} sent more than the range asked for"),
+            Capped::Failed(e) => format!("download from {host} failed: {}", e.without_url()),
+        })?;
+    Ok(Part { bytes, total })
+}
+
+/// Reads what kind of movie a file is: MP4 or Matroska, its tracks and its index, from a few range
+/// requests. Fails for anything else (or a server without ranges), in which case the browser
+/// should be left to play the file itself.
+pub async fn probe(url: &Url) -> Result<Rc<vod::Movie>, String> {
+    /// The index of a movie is megabytes at the very most.
+    const INDEX_LIMIT: u64 = 64 << 20;
+    let stop = Cell::new(false);
+    let http = reqwest::Client::new();
+    let head = get_range(&http, url, 0, 256 << 10, &stop).await?;
+    let total = head.total;
+
+    if head.bytes.starts_with(&[0x1A, 0x45, 0xDF, 0xA3]) {
+        let mut probe = mkv::Probe::new(total);
+        let mut part = head;
+        let mut at = 0;
+        for _ in 0..16 {
+            match probe.feed(at, &part.bytes).map_err(|e| e.to_string())? {
+                mkv::Step::Done(parsed) => {
+                    return Ok(Rc::new(vod::Movie::from_mkv(*parsed, total)));
+                }
+                mkv::Step::Read(start, len) => {
+                    if len > INDEX_LIMIT {
+                        return Err("the movie's index is too big".into());
+                    }
+                    part = get_range(&http, url, start, len, &stop).await?;
+                    at = start;
+                }
+            }
+        }
+        return Err("could not find the movie's index".into());
+    }
+
+    let (mut part, mut at) = (head, 0);
+    for _ in 0..16 {
+        match mp4::find_moov(&part.bytes, at) {
+            mp4::Moov::At(off, len) => {
+                let len = if len == u64::MAX { total - off } else { len };
+                if len > INDEX_LIMIT {
+                    return Err("the movie's index is too big".into());
+                }
+                let inside = off >= at && off + len <= at + part.bytes.len() as u64;
+                let moov = if inside {
+                    part.bytes[(off - at) as usize..][..len as usize].to_vec()
+                } else {
+                    get_range(&http, url, off, len, &stop).await?.bytes
+                };
+                let (_, _, head) = mp4::box_header(&moov).ok_or("the MP4 index is damaged")?;
+                let movie =
+                    vod::Movie::from_mp4(&moov[head..], total).map_err(|e| e.to_string())?;
+                return Ok(Rc::new(movie));
+            }
+            mp4::Moov::Next(to) if to < total => {
+                part = get_range(&http, url, to, 64 << 10, &stop).await?;
+                at = to;
+            }
+            _ => return Err("this is not an MP4 file".into()),
+        }
+    }
+    Err("could not find the movie's index".into())
+}
+
+/// Plays a movie or episode that `probe` found we can play, from `start` seconds in. Seeking in
+/// the `<video>` works as usual: the player reads from the new place. Stops when dropped.
+pub fn play_movie(
+    video: HtmlVideoElement,
+    movie: Rc<vod::Movie>,
+    url: Url,
+    start: f64,
+    report: impl FnMut(Status) + 'static,
+) -> Player {
+    let stop = Rc::new(Cell::new(false));
+    let stopped = stop.clone();
+    let mut report = report;
+    wasm_bindgen_futures::spawn_local(async move {
+        if let Err(e) = run_movie(&video, &movie, &url, start, &stopped, &mut report).await
+            && !stopped.get()
+        {
+            report(match crate::needs_conversion(&e) {
+                Some(reason) => Status::NeedsConversion(reason.to_string()),
+                None => Status::Failed(e),
+            });
+        }
+    });
+    Player { stop }
+}
+
+/// Seconds buffered ahead of the playhead to keep, and behind it.
+const MOVIE_AHEAD: f64 = 40.0;
+/// The first piece is small so the picture starts quickly; the rest are this big.
+const FIRST_CHUNK: u64 = 768 << 10;
+const CHUNK: u64 = 3 << 20;
+
+fn buffered_at(video: &HtmlVideoElement, t: f64) -> bool {
+    let b = video.buffered();
+    (0..b.length())
+        .any(|i| matches!((b.start(i), b.end(i)), (Ok(s), Ok(e)) if s <= t + 0.05 && t < e - 0.05))
+}
+
+/// Frees what is buffered far behind the playhead, and far beyond where a seek left it.
+async fn evict(video: &HtmlVideoElement, sb: &SourceBuffer) {
+    wait_idle(sb).await;
+    let Ok(b) = sb.buffered() else { return };
+    let t = video.current_time();
+    let ranges: Vec<(f64, f64)> = (0..b.length())
+        .filter_map(|i| Some((b.start(i).ok()?, b.end(i).ok()?)))
+        .collect();
+    for (s, e) in ranges {
+        let (from, to) = if e < t - KEEP_BEHIND {
+            (s, e)
+        } else if s < t - KEEP_BEHIND - 1.0 {
+            (s, t - KEEP_BEHIND)
+        } else if s > t + 3.0 * MOVIE_AHEAD {
+            (s, e)
+        } else {
+            continue;
+        };
+        let _ = sb.remove(from, to);
+        wait_idle(sb).await;
+    }
+}
+
+async fn run_movie(
+    video: &HtmlVideoElement,
+    movie: &Rc<vod::Movie>,
+    url: &Url,
+    start: f64,
+    stop: &Cell<bool>,
+    report: &mut dyn FnMut(Status),
+) -> Result<(), String> {
+    let mut say = |s: Status| {
+        if !stop.get() {
+            report(s)
+        }
+    };
+    let http = reqwest::Client::new();
+    let init = movie.init().map_err(|e| e.to_string())?;
+
+    let ms = MediaSource::new().map_err(js_err)?;
+    let object_url = ObjectUrl(web_sys::Url::create_object_url_with_source(&ms).map_err(js_err)?);
+    video.set_src(&object_url.0);
+    for _ in 0..500 {
+        if ms.ready_state() == MediaSourceReadyState::Open {
+            break;
+        }
+        sleep(Duration::from_millis(10)).await;
+    }
+    if ms.ready_state() != MediaSourceReadyState::Open {
+        return Err("the browser did not open the media source".into());
+    }
+    let sb = ms.add_source_buffer(&init.mime).map_err(|e| {
+        format!(
+            "{}this browser can't play {}: {}",
+            crate::CONVERT,
+            init.mime,
+            js_err(e)
+        )
+    })?;
+    sb.set_timestamp_offset(movie.shift());
+    ms.set_duration(movie.duration);
+    append(video, &sb, &init.bytes).await?;
+    if start > 0.0 {
+        video.set_current_time(start);
+    }
+
+    let mut session = movie.session(start);
+    // Where the next piece will begin, in seconds of the movie.
+    let mut frontier = start;
+    let mut started = false;
+    let mut ended = false;
+    let mut first_chunk = true;
+    loop {
+        if stop.get() {
+            return Ok(());
+        }
+        let t = video.current_time();
+        // The playhead is somewhere nothing is buffered, and not where the reading is up to: a
+        // seek. Start again from there.
+        if !buffered_at(video, t) && (t - frontier).abs() > 1.0 {
+            session = movie.session(t);
+            frontier = t;
+            ended = false;
+            first_chunk = true;
+        }
+        if session.done() {
+            if !ended {
+                wait_idle(&sb).await;
+                let _ = ms.end_of_stream();
+                ended = true;
+            }
+            sleep(Duration::from_millis(250)).await;
+            continue;
+        }
+        if buffered_ahead(video) > MOVIE_AHEAD && buffered_at(video, t) {
+            sleep(Duration::from_millis(250)).await;
+            continue;
+        }
+        let Some((offset, len)) = session.range(if first_chunk { FIRST_CHUNK } else { CHUNK })
+        else {
+            continue;
+        };
+        first_chunk = false;
+        let part = get_range(&http, url, offset, len, stop).await?;
+        if stop.get() {
+            return Ok(());
+        }
+        // A seek during the download: what was fetched belongs to the old place.
+        let t = video.current_time();
+        if !buffered_at(video, t) && (t - frontier).abs() > 1.0 {
+            continue;
+        }
+        let fragment = session.push(&part.bytes).map_err(|e| e.to_string())?;
+        evict(video, &sb).await;
+        if !fragment.is_empty() {
+            append(video, &sb, &fragment).await?;
+        }
+        frontier = session.reached();
+        if !started && buffered_at(video, video.current_time().max(start)) {
+            started = true;
+            let _ = video.play();
+            say(Status::Playing);
+        }
     }
 }
