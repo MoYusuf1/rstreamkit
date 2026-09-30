@@ -3,7 +3,7 @@
 
 use std::process::Command;
 
-use rffmpeg::{Transmuxer, ts};
+use rstreamkit::{Transmuxer, ts};
 
 const SEGMENT: &[u8] = include_bytes!("fixtures/bbb_480p.ts");
 
@@ -132,7 +132,7 @@ fn ffmpeg_decodes_the_output_without_errors() {
     let mut t = Transmuxer::default();
     let a = t.push(SEGMENT).unwrap();
     let b = t.push(SEGMENT).unwrap();
-    let file = std::env::temp_dir().join(format!("rffmpeg-test-{}.mp4", std::process::id()));
+    let file = std::env::temp_dir().join(format!("rstreamkit-test-{}.mp4", std::process::id()));
     std::fs::write(
         &file,
         [a.init.unwrap().bytes, a.fragment, b.fragment].concat(),
@@ -288,8 +288,11 @@ fn ac3_eac3_and_mp2_sound_is_decoded_to_flac_that_matches_ffmpeg() {
 
         let dir = std::env::temp_dir();
         let (ours_file, source_file) = (
-            dir.join(format!("riptv-sound-{}-{name}.mp4", std::process::id())),
-            dir.join(format!("riptv-sound-{}-{name}", std::process::id())),
+            dir.join(format!(
+                "rstreamkit-sound-{}-{name}.mp4",
+                std::process::id()
+            )),
+            dir.join(format!("rstreamkit-sound-{}-{name}", std::process::id())),
         );
         std::fs::write(&ours_file, [init.bytes.as_slice(), &out.fragment].concat()).unwrap();
         std::fs::write(&source_file, bytes).unwrap();

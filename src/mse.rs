@@ -113,7 +113,7 @@ pub async fn sleep(d: Duration) {
     let _ = JsFuture::from(p).await;
 }
 
-/// How the player reaches the network. The app supplies it, so rffmpeg knows nothing about proxies,
+/// How the player reaches the network. The app supplies it, so rstreamkit knows nothing about proxies,
 /// credentials or headers: [`Direct`] is the plain case, and an app that has to go through a proxy
 /// implements this for it. Dropping the future or the [`Response::body`] cancels the request.
 // Not `Send` on purpose: this only ever runs on the browser's one thread.
