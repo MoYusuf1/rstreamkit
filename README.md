@@ -56,6 +56,14 @@ Measured on a page that uses everything its features offer: built for `wasm32` w
 LTO, then `wasm-bindgen`, `wasm-opt -Oz` and brotli. Without `sound`, AC-3, E-AC-3 and MP2 are reported as
 `Unsupported::Sound` (and a movie with such sound as `Verdict::Unsupported`) instead of played.
 
+### Building a small page
+
+For the page's release profile, `opt-level = "s"` with `lto = true`, `codegen-units = 1` and
+`panic = "abort"`, then `wasm-bindgen` and `wasm-opt -Oz`. Measured on the page that uses everything
+(AC-3 decoding at the same time): `"s"` is 3.6% smaller than `"z"` with the same speed, and `3` is 11%
+faster but 23% bigger, so it isn't worth it. The sound decoders' speed is the decoders': about 55 ms
+for six seconds of 5.1 AC-3, whatever the level.
+
 ## What it doesn't do
 
 HEVC and other video codecs (only H.264 passes through), AES-128, fMP4 segments, adaptive bitrate.

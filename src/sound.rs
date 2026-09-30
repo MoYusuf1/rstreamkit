@@ -270,18 +270,32 @@ fn crc8(data: &[u8]) -> u8 {
     })
 }
 
-/// CRC-16 (polynomial 0x8005) as FLAC frames use it.
-fn crc16(data: &[u8]) -> u16 {
-    data.iter().fold(0u16, |mut crc, &b| {
-        crc ^= u16::from(b) << 8;
-        for _ in 0..8 {
+/// CRC-16 (polynomial 0x8005) of each byte value, made at compile time.
+const CRC16: [u16; 256] = {
+    let mut table = [0u16; 256];
+    let mut i = 0;
+    while i < 256 {
+        let mut crc = (i as u16) << 8;
+        let mut bit = 0;
+        while bit < 8 {
             crc = if crc & 0x8000 != 0 {
                 (crc << 1) ^ 0x8005
             } else {
                 crc << 1
             };
+            bit += 1;
         }
-        crc
+        table[i] = crc;
+        i += 1;
+    }
+    table
+};
+
+/// CRC-16 as FLAC frames use it: a table lookup a byte, not eight shifts (it covers every byte of
+/// the sound, about a megabyte for six seconds).
+fn crc16(data: &[u8]) -> u16 {
+    data.iter().fold(0u16, |crc, &b| {
+        (crc << 8) ^ CRC16[usize::from((crc >> 8) as u8 ^ b)]
     })
 }
 
@@ -330,12 +344,14 @@ pub fn flac_frame(pcm: &[i16], number: u32) -> Vec<u8> {
         n if n <= 256 => 6,
         _ => 7,
     };
-    let mut frame = vec![
+    // The size is known: a header, two verbatim subframes and the CRC. Allocate it once.
+    let mut frame = Vec::with_capacity(16 + 2 * (1 + samples * 2) + 2);
+    frame.extend([
         0xFF,
         0xF8,            // sync, fixed block size
         block_code << 4, // sample rate: from the stream info
         0x18,            // two independent channels, 16 bits per sample
-    ];
+    ]);
     frame.extend(coded_number(number));
     match block_code {
         6 => frame.push((samples - 1) as u8),
