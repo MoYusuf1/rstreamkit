@@ -702,11 +702,15 @@ pub fn play_movie(
     Player { stop }
 }
 
-/// Seconds buffered ahead of the playhead to keep, and behind it.
-const MOVIE_AHEAD: f64 = 40.0;
-/// The first piece is small so the picture starts quickly; the rest are this big.
+/// How much of the movie to hold: seconds ahead of the playhead and behind it, and how much each
+/// piece read is worth. Sound we decode is FLAC without compression (1.5 Mbit/s), and Chrome keeps
+/// only about 12 MB of sound in a source buffer: a minute of it. So pieces are sized by time, not
+/// by bytes (a low-bitrate film makes a few megabytes a whole minute).
+const MOVIE_AHEAD: f64 = 25.0;
+const MOVIE_BEHIND: f64 = 10.0;
+const PIECE_SECONDS: f64 = 5.0;
+/// The first piece is small so the picture starts quickly.
 const FIRST_CHUNK: u64 = 768 << 10;
-const CHUNK: u64 = 3 << 20;
 
 fn buffered_at(video: &HtmlVideoElement, t: f64) -> bool {
     let b = video.buffered();
@@ -723,10 +727,10 @@ async fn evict(video: &HtmlVideoElement, sb: &SourceBuffer) {
         .filter_map(|i| Some((b.start(i).ok()?, b.end(i).ok()?)))
         .collect();
     for (s, e) in ranges {
-        let (from, to) = if e < t - KEEP_BEHIND {
+        let (from, to) = if e < t - MOVIE_BEHIND {
             (s, e)
-        } else if s < t - KEEP_BEHIND - 1.0 {
-            (s, t - KEEP_BEHIND)
+        } else if s < t - MOVIE_BEHIND - 1.0 {
+            (s, t - MOVIE_BEHIND)
         } else if s > t + 3.0 * MOVIE_AHEAD {
             (s, e)
         } else {
@@ -778,6 +782,7 @@ async fn run_movie(
         video.set_current_time(start);
     }
 
+    let piece = ((movie.bytes_per_second() * PIECE_SECONDS) as u64).clamp(256 << 10, 6 << 20);
     let mut session = movie.session(start);
     // Where the next piece will begin, in seconds of the movie.
     let mut frontier = start;
@@ -810,8 +815,11 @@ async fn run_movie(
             sleep(Duration::from_millis(250)).await;
             continue;
         }
-        let Some((offset, len)) = session.range(if first_chunk { FIRST_CHUNK } else { CHUNK })
-        else {
+        let Some((offset, len)) = session.range(if first_chunk {
+            piece.min(FIRST_CHUNK)
+        } else {
+            piece
+        }) else {
             continue;
         };
         first_chunk = false;
