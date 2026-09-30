@@ -10,6 +10,7 @@ decoding the sound browsers can't (AC-3, E-AC-3, MP2) on the way.
 | `ts` | MPEG-TS demux: H.264 video, AAC (ADTS), AC-3, E-AC-3 and MPEG audio |
 | `avc` | H.264 SPS: size, pixel aspect ratio (`pasp`), interlacing |
 | `sound` | AC-3 / E-AC-3 / MP2 decoded to stereo PCM, written as FLAC frames |
+| `body` | Reads a response body with a size cap, so an endless stream can't fill memory |
 | `fmp4` | fMP4 init segment and fragments (`avc1` + `mp4a` or `fLaC`) |
 | `Transmuxer` (crate root) | Feeds segments in, gets an init segment and fragments out |
 | `mse` (wasm only) | Fetches the playlist and segments and appends them to a `<video>` |

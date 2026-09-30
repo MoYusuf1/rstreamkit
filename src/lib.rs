@@ -3,6 +3,7 @@
 //! MediaSource glue that feeds a `<video>` element (wasm only, `mse`).
 
 pub mod avc;
+pub mod body;
 pub mod fmp4;
 pub mod hls;
 #[cfg(target_arch = "wasm32")]

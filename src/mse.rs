@@ -11,7 +11,11 @@ use wasm_bindgen::JsValue;
 use wasm_bindgen_futures::JsFuture;
 use web_sys::{HtmlVideoElement, MediaSource, MediaSourceReadyState, SourceBuffer};
 
-use crate::{Transmuxer, hls};
+use crate::{
+    Transmuxer,
+    body::{self, Capped},
+    hls,
+};
 
 /// Start a live stream this many segments back from the newest one.
 const LIVE_BACKLOG: usize = 3;
@@ -19,8 +23,8 @@ const LIVE_BACKLOG: usize = 3;
 const AHEAD: f64 = 30.0;
 /// Free buffered media older than this many seconds behind the playhead.
 const KEEP_BEHIND: f64 = 30.0;
-/// A playlist is a few kilobytes. Anything bigger is a stream that isn't a playlist at all, and
-/// reading it to the end would never finish.
+/// A playlist is a few kilobytes. Anything bigger is a stream that isn't a playlist at all, and is
+/// refused once it passes this.
 const PLAYLIST_LIMIT: usize = 2 << 20;
 /// A segment is a few seconds of video, tens of megabytes at the very most.
 const SEGMENT_LIMIT: usize = 64 << 20;
@@ -164,26 +168,24 @@ async fn fetch_once(
         .and_then(|v| v.to_str().ok())
         .unwrap_or("")
         .to_owned();
-    // Refuse a raw stream by what the server says it is, before reading any of it: reading to the
-    // end would never finish. (A server that mislabels a stream as text can still hang this;
-    // ponytail: streaming the body with a cap would catch that, at ~28 KB of wasm.)
+    // Refuse a raw stream by what the server says it is, or how long it says it is, before reading
+    // any of it.
     if limit == PLAYLIST_LIMIT {
         let kind = content_type.to_ascii_lowercase();
         if kind.starts_with("video/") && !kind.contains("mpegurl") {
             return Err(raw_stream());
         }
-        if r.content_length().is_some_and(|n| n > limit as u64) {
-            return Err(format!(
-                "{host} sent a {} MB response where a playlist was expected; that is a stream, not HLS",
-                limit >> 20
-            ));
-        }
     }
-    let body = r
-        .bytes()
+    if r.content_length().is_some_and(|n| n > limit as u64) {
+        return Err(too_big(&host, limit));
+    }
+    // The length may be missing or wrong (chunked, or a stream dressed up as a file): count as it arrives.
+    let body = body::read_capped(std::pin::pin!(r.bytes_stream()), limit)
         .await
-        .map_err(|e| format!("download from {host} failed: {}", e.without_url()))?
-        .to_vec();
+        .map_err(|e| match e {
+            Capped::TooBig => too_big(&host, limit),
+            Capped::Failed(e) => format!("download from {host} failed: {}", e.without_url()),
+        })?;
     Ok(Fetched {
         body,
         content_type,
@@ -211,6 +213,7 @@ async fn fetch(
             Err(e)
                 if e.contains("refused")
                     || e.contains("did not report")
+                    || e.ends_with(TOO_BIG)
                     || crate::needs_conversion(&e).is_some() =>
             {
                 return Err(e);
@@ -219,6 +222,21 @@ async fn fetch(
         }
     }
     Err(last)
+}
+
+/// Ends the error for a body past its cap: reading it again would only read it all again.
+const TOO_BIG: &str = "that is a stream, not HLS";
+
+fn too_big(host: &str, limit: usize) -> String {
+    let what = if limit == PLAYLIST_LIMIT {
+        "a playlist"
+    } else {
+        "a segment"
+    };
+    format!(
+        "{host} sent more than {} MB where {what} was expected; {TOO_BIG}",
+        limit >> 20
+    )
 }
 
 /// A raw stream where a playlist should be: something a converter can play.
