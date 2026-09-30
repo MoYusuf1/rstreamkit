@@ -99,26 +99,53 @@ pub fn find_moov(bytes: &[u8], at: u64) -> Moov {
     }
 }
 
-/// One frame of a track, straight from the sample tables.
+/// The top bit of a sample's `size_key`: it is a sync sample (a picture to start from).
+const KEY: u32 = 1 << 31;
+
+/// One frame of a track, straight from the sample tables: 24 bytes, because a long film has
+/// hundreds of thousands of them (a 2-hour one, about 14 MB instead of 28).
 struct Sample {
     offset: u64,
-    size: u32,
     /// Ticks of the track's timescale.
     dts: i64,
-    dur: u32,
+    /// The size in the low 31 bits, and the sync flag in the top one.
+    size_key: u32,
     cts: i32,
-    key: bool,
+}
+
+impl Sample {
+    fn size(&self) -> u32 {
+        self.size_key & !KEY
+    }
+
+    fn key(&self) -> bool {
+        self.size_key & KEY != 0
+    }
 }
 
 struct Trak {
     samples: Vec<Sample>,
+    /// How long the last sample lasts, in ticks.
+    last_dur: u32,
     scale: u32,
     /// Where the first edit starts in the media, in ticks: what the player should skip.
     edit: i64,
 }
 
-/// The sample tables of one track: for every frame its place in the file, time and kind.
-fn samples(stbl: &[u8]) -> R<Vec<Sample>> {
+impl Trak {
+    /// Ticks sample `i` lasts: until the next one begins.
+    fn dur(&self, i: u32) -> i64 {
+        let s = &self.samples[i as usize];
+        match self.samples.get(i as usize + 1) {
+            Some(next) => next.dts - s.dts,
+            None => i64::from(self.last_dur),
+        }
+    }
+}
+
+/// The sample tables of one track: for every frame its place in the file, time and kind, and how
+/// long the last one lasts (each of the others lasts until the next begins).
+fn samples(stbl: &[u8]) -> R<(Vec<Sample>, u32)> {
     let table = |kind: &[u8; 4]| child(stbl, kind).ok_or_else(damaged);
 
     let stsz = table(b"stsz")?;
@@ -167,13 +194,15 @@ fn samples(stbl: &[u8]) -> R<Vec<Sample>> {
                 break;
             }
             let s = size(out.len())?;
+            // The top bit of `size_key` is the sync flag, so a size has to leave it free.
+            if s & KEY != 0 {
+                return Err(damaged());
+            }
             out.push(Sample {
                 offset: at,
-                size: s,
                 dts: 0,
-                dur: 0,
+                size_key: s,
                 cts: 0,
-                key: false,
             });
             at += u64::from(s);
         }
@@ -184,13 +213,13 @@ fn samples(stbl: &[u8]) -> R<Vec<Sample>> {
 
     // Decode times and durations.
     let stts = table(b"stts")?;
-    let (mut i, mut t) = (0, 0i64);
+    let (mut i, mut t, mut last_dur) = (0, 0i64, 0);
     for e in 0..be32(stts, 4)? as usize {
         let (n, delta) = (be32(stts, 8 + 8 * e)?, be32(stts, 12 + 8 * e)?);
         for _ in 0..n {
             let Some(s) = out.get_mut(i) else { break };
-            (s.dts, s.dur) = (t, delta);
-            t += i64::from(delta);
+            s.dts = t;
+            (t, last_dur) = (t + i64::from(delta), delta);
             i += 1;
         }
     }
@@ -213,13 +242,20 @@ fn samples(stbl: &[u8]) -> R<Vec<Sample>> {
             for e in 0..be32(stss, 4)? as usize {
                 let n = be32(stss, 8 + 4 * e)? as usize;
                 if let Some(s) = n.checked_sub(1).and_then(|n| out.get_mut(n)) {
-                    s.key = true;
+                    s.size_key |= KEY;
                 }
             }
         }
-        None => out.iter_mut().for_each(|s| s.key = true),
+        None => out.iter_mut().for_each(|s| s.size_key |= KEY),
     }
-    Ok(out)
+    // Reading a range at a time, in file order, needs each track's samples to be stored in order
+    // (every muxer in use does).
+    if out.windows(2).any(|w| w[1].offset < w[0].offset) {
+        return Err(Error::Unsupported(
+            "the movie's samples are not stored in file order".into(),
+        ));
+    }
+    Ok((out, last_dur))
 }
 
 /// The first real edit's start in the media (`media_time`): a clip whose first picture is
@@ -414,8 +450,10 @@ pub fn parse(moov: &[u8]) -> R<Parsed> {
             .next()
             .ok_or_else(damaged)?;
         let make = || -> R<Trak> {
+            let (samples, last_dur) = samples(stbl)?;
             Ok(Trak {
-                samples: samples(stbl)?,
+                samples,
+                last_dur,
                 scale: media_scale,
                 edit: edit(trak),
             })
@@ -451,95 +489,93 @@ pub fn parse(moov: &[u8]) -> R<Parsed> {
     })
 }
 
-/// Where every frame of both tracks is, and the file order they come in.
+/// Where every frame of both tracks is. The two tracks are each stored in order, so the order of
+/// the file is their merge: there is no table of it to build, sort and keep.
 pub struct Index {
     video: Trak,
     audio: Option<Trak>,
     /// Microseconds added to the sound's times so it lines up with the picture (see `edit`).
     audio_shift: i64,
-    /// (file offset, index in its track, is it sound) by offset.
-    order: Vec<(u64, u32, bool)>,
+    /// The pictures one can start from, by index.
+    keys: Vec<u32>,
 }
 
 impl Index {
     fn new(video: Trak, audio: Option<Trak>, shift: i64) -> Index {
         let audio_shift = audio.as_ref().map_or(0, |a| shift - us(a.edit, a.scale));
-        let mut order: Vec<(u64, u32, bool)> = (0..video.samples.len())
-            .map(|i| (video.samples[i].offset, i as u32, false))
-            .chain(
-                audio
-                    .iter()
-                    .flat_map(|a| a.samples.iter().enumerate())
-                    .map(|(i, s)| (s.offset, i as u32, true)),
-            )
+        let keys = (0..video.samples.len() as u32)
+            .filter(|&i| video.samples[i as usize].key())
             .collect();
-        order.sort_unstable_by_key(|e| (e.0, e.2));
         Index {
             video,
             audio,
             audio_shift,
-            order,
+            keys,
         }
     }
 
-    fn video_pts(&self, i: usize) -> i64 {
-        let s = &self.video.samples[i];
+    fn video_pts(&self, i: u32) -> i64 {
+        let s = &self.video.samples[i as usize];
         us(s.dts + i64::from(s.cts), self.video.scale)
     }
 
     /// Where to begin for a moment (microseconds on the output timeline): the picture at the
     /// keyframe before it, the sound from there on.
     pub fn cursor(&self, at: i64) -> Cursor {
-        let keys: Vec<usize> = (0..self.video.samples.len())
-            .filter(|&i| self.video.samples[i].key)
-            .collect();
-        let k = keys.partition_point(|&i| self.video_pts(i) <= at);
-        let v_from = keys.get(k.saturating_sub(1)).copied().unwrap_or(0);
-        let start = self.video_pts(v_from);
-        let a_from = self.audio.as_ref().map_or(0, |a| {
+        let k = self.keys.partition_point(|&i| self.video_pts(i) <= at);
+        let v = self.keys.get(k.saturating_sub(1)).copied().unwrap_or(0);
+        let start = self.video_pts(v);
+        let a = self.audio.as_ref().map_or(0, |a| {
             a.samples
                 .partition_point(|s| us(s.dts, a.scale) + self.audio_shift < start)
+                as u32
         });
-        let first = self.video.samples.get(v_from).map(|s| s.offset).into_iter();
-        let first_audio = self
+        Cursor { v, a }
+    }
+
+    /// The next sample in the order of the file: is it sound, and its index in its track.
+    fn next(&self, v: u32, a: u32) -> Option<(bool, u32)> {
+        let video = self.video.samples.get(v as usize).map(|s| s.offset);
+        let audio = self
             .audio
             .as_ref()
-            .and_then(|a| a.samples.get(a_from))
+            .and_then(|t| t.samples.get(a as usize))
             .map(|s| s.offset);
-        let offset = first.chain(first_audio).min().unwrap_or(0);
-        Cursor {
-            pos: self.order.partition_point(|e| e.0 < offset),
-            v_from: v_from as u32,
-            a_from: a_from as u32,
+        match (video, audio) {
+            (Some(x), Some(y)) if y < x => Some((true, a)),
+            (Some(_), _) => Some((false, v)),
+            (None, Some(_)) => Some((true, a)),
+            (None, None) => None,
         }
     }
 
-    fn wanted(&self, c: &Cursor, e: &(u64, u32, bool)) -> bool {
-        e.1 >= if e.2 { c.a_from } else { c.v_from }
-    }
-
-    fn entry(&self, e: &(u64, u32, bool)) -> (&Sample, &Trak) {
-        if e.2 {
-            let a = self.audio.as_ref().expect("entries of the sound track");
-            (&a.samples[e.1 as usize], a)
+    fn sample(&self, sound: bool, i: u32) -> (&Sample, &Trak) {
+        let trak = if sound {
+            self.audio.as_ref().expect("entries of the sound track")
         } else {
-            (&self.video.samples[e.1 as usize], &self.video)
-        }
+            &self.video
+        };
+        (&trak.samples[i as usize], trak)
     }
 
     /// The next piece of the file to read: its offset and length (at most `max`, but always
     /// whole samples, and at least one).
     pub fn range(&self, c: &Cursor, max: u64) -> Option<(u64, u64)> {
-        let mut rest = self.order[c.pos..].iter().filter(|e| self.wanted(c, e));
-        let first = rest.next()?;
-        let start = first.0;
-        let mut end = start + u64::from(self.entry(first).0.size);
-        for e in rest {
-            let next = e.0 + u64::from(self.entry(e).0.size);
+        let (mut v, mut a) = (c.v, c.a);
+        let advance = |sound: bool, v: &mut u32, a: &mut u32| *(if sound { a } else { v }) += 1;
+        let (sound, i) = self.next(v, a)?;
+        let first = self.sample(sound, i).0;
+        let start = first.offset;
+        let mut end = start + u64::from(first.size());
+        advance(sound, &mut v, &mut a);
+        while let Some((sound, i)) = self.next(v, a) {
+            let s = self.sample(sound, i).0;
+            let next = s.offset + u64::from(s.size());
             if next - start > max {
                 break;
             }
             end = end.max(next);
+            advance(sound, &mut v, &mut a);
         }
         Some((start, end - start))
     }
@@ -549,50 +585,48 @@ impl Index {
     pub fn frames(&self, c: &mut Cursor, start: u64, bytes: &[u8]) -> Vec<Frame> {
         let mut out = vec![];
         let end = start + bytes.len() as u64;
-        while let Some(e) = self.order.get(c.pos) {
-            if !self.wanted(c, e) {
-                c.pos += 1;
-                continue;
-            }
-            let (s, trak) = self.entry(e);
-            if e.0 < start || e.0 + u64::from(s.size) > end {
+        while let Some((sound, i)) = self.next(c.v, c.a) {
+            let (s, trak) = self.sample(sound, i);
+            if s.offset < start || s.offset + u64::from(s.size()) > end {
                 break;
             }
-            let data = bytes[(e.0 - start) as usize..][..s.size as usize].to_vec();
-            c.pos += 1;
-            out.push(if e.2 {
+            let data = bytes[(s.offset - start) as usize..][..s.size() as usize].to_vec();
+            let dur = us(s.dts + trak.dur(i), trak.scale) - us(s.dts, trak.scale);
+            if sound {
+                c.a += 1;
                 let t = us(s.dts, trak.scale) + self.audio_shift;
-                Frame {
+                out.push(Frame {
                     track: Track::Audio,
                     pts: t,
                     dts: t,
-                    dur: us(s.dts + i64::from(s.dur), trak.scale) - us(s.dts, trak.scale),
+                    dur,
                     key: true,
                     data,
-                }
+                });
             } else {
-                Frame {
+                c.v += 1;
+                out.push(Frame {
                     track: Track::Video,
                     pts: us(s.dts + i64::from(s.cts), trak.scale),
                     dts: us(s.dts, trak.scale),
-                    dur: us(s.dts + i64::from(s.dur), trak.scale) - us(s.dts, trak.scale),
-                    key: s.key,
+                    dur,
+                    key: s.key(),
                     data,
-                }
-            });
+                });
+            }
         }
         out
     }
 
     pub fn done(&self, c: &Cursor) -> bool {
-        c.pos >= self.order.len()
+        c.v as usize >= self.video.samples.len()
+            && c.a as usize >= self.audio.as_ref().map_or(0, |t| t.samples.len())
     }
 }
 
-/// How far through the file a session is.
+/// How far through the file a session is: the next sample of each track.
 #[derive(Clone)]
 pub struct Cursor {
-    pos: usize,
-    v_from: u32,
-    a_from: u32,
+    v: u32,
+    a: u32,
 }

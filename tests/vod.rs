@@ -11,6 +11,7 @@ use rstreamkit::{
 
 const MP4: &[u8] = include_bytes!("fixtures/movie_ac3.mp4");
 const MKV: &[u8] = include_bytes!("fixtures/movie_ac3.mkv");
+const AAC: &[u8] = include_bytes!("fixtures/movie_aac.mp4");
 
 fn load_mp4(file: &[u8]) -> Movie {
     // A small window, so the search for `moov` takes more than one step.
@@ -244,4 +245,34 @@ fn a_file_the_index_can_not_be_read_from_is_refused_not_misplayed() {
     assert!(Movie::from_mp4(&[0, 0, 0, 8, b'f', b'r', b'e', b'e'], 8).is_err());
     let mut probe = mkv::Probe::new(MKV.len() as u64);
     assert!(probe.feed(0, &[0xFF; 64]).is_err());
+}
+
+/// AAC sound needs no decoding, so the fragments are made of the file's own sound frames, lent and
+/// not copied: every one of them has to arrive, in order, and ffmpeg has to decode the result.
+#[test]
+fn an_aac_movie_plays_through_ffmpeg_with_all_its_sound() {
+    if !ffmpeg_ok() {
+        eprintln!("ffmpeg isn't installed: skipping");
+        return;
+    }
+    let movie = load_mp4(AAC);
+    assert!(matches!(
+        movie.audio.as_ref().unwrap().audio,
+        Audio::Aac { .. }
+    ));
+    assert_eq!(movie.verdict(&|_| false), Verdict::Rust);
+
+    let played = play(&Rc::new(movie), AAC, 0.0, 64 << 10);
+    let (complaints, streams) = decoded(&played, "aac-movie");
+    let (_, source) = decoded(AAC, "aac-source");
+    assert_eq!(complaints, "", "ffmpeg said so");
+    assert_eq!(streams[0].0, "h264");
+    assert_eq!(streams[1].0, "aac");
+    assert_eq!(streams[1].1, source[1].1, "every sound frame arrives");
+    assert!(
+        streams[0].1.abs_diff(source[0].1) <= 2,
+        "{} pictures of {}",
+        streams[0].1,
+        source[0].1
+    );
 }

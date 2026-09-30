@@ -9,7 +9,7 @@
 //! ponytail: one picture track and one sound track (the first usable one, stereo FLAC for decoded
 //! sound), H.264 with 4-byte NAL lengths only, no subtitles, no edit lists beyond the first entry.
 
-use std::rc::Rc;
+use std::{borrow::Cow, rc::Rc};
 
 use crate::{Error, Init, Unsupported, avc, fmp4, mkv, mp4, sound};
 
@@ -470,7 +470,7 @@ impl Fragmenter {
                         duration: *duration,
                         key: true,
                         cts: 0,
-                        data,
+                        data: data.as_ref(),
                     })
                     .collect(),
             });
@@ -482,19 +482,20 @@ impl Fragmenter {
         fmp4::fragment(self.seq, &runs)
     }
 
-    /// Sound as the samples of the audio track: (bytes, length in sample-rate ticks).
-    fn coded_sound(&mut self, frames: &[Frame]) -> Vec<(Vec<u8>, u32)> {
+    /// Sound as the samples of the audio track: (bytes, length in sample-rate ticks). AAC is
+    /// lent as it is; only sound we decode is new bytes.
+    fn coded_sound<'a>(&mut self, frames: &'a [Frame]) -> Vec<(Cow<'a, [u8]>, u32)> {
         let mut out = vec![];
         match self.audio.as_ref().map(|a| &a.0) {
             Some(Audio::Aac { .. }) => {
-                out.extend(frames.iter().map(|f| (f.data.clone(), 1024)));
+                out.extend(frames.iter().map(|f| (Cow::Borrowed(&f.data[..]), 1024)));
             }
             Some(Audio::Sound(kind)) => {
                 for f in frames {
                     for part in sound::split(*kind, &f.data) {
                         let pcm = self.decoder.decode(*kind, &part);
                         out.push((
-                            sound::flac_frame(&pcm, self.flac_frames),
+                            Cow::Owned(sound::flac_frame(&pcm, self.flac_frames)),
                             (pcm.len() / 2) as u32,
                         ));
                         self.flac_frames += 1;
