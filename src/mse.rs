@@ -24,7 +24,7 @@ use web_sys::{
 use crate::{
     Transmuxer, Unsupported,
     body::{self, Capped},
-    hls, url,
+    hls,
 };
 
 /// Start a live stream this many segments back from the newest one.
@@ -158,6 +158,38 @@ fn js_err(e: JsValue) -> String {
         .unwrap_or_else(|| format!("{e:?}"))
 }
 
+/// Where `reference` points, seen from the address `base`: resolved by the browser's own `URL`,
+/// so there is nothing of ours to get wrong, and nothing to ship.
+fn resolve(base: &str, reference: &str) -> Result<String, String> {
+    web_sys::Url::new_with_base(reference, base)
+        .map(|u| u.href())
+        .map_err(|_| format!("can't resolve \"{reference}\" against \"{base}\""))
+}
+
+/// The host of an address, for error messages (never the path or credentials).
+fn host_of(address: &str) -> String {
+    web_sys::Url::new(address).map_or_else(|_| "the server".into(), |u| u.hostname())
+}
+
+/// Ask the browser whether it can play a MIME type with codecs, e.g. `video/mp4; codecs="avc1.64001f"`.
+/// Ask it first, and do the work only where it can't.
+pub fn can_play(mime: &str) -> bool {
+    web_sys::window()
+        .and_then(|w| w.document())
+        .and_then(|d| d.create_element("video").ok())
+        .and_then(|e| wasm_bindgen::JsCast::dyn_into::<web_sys::HtmlMediaElement>(e).ok())
+        .is_some_and(|v| !v.can_play_type(mime).is_empty())
+}
+
+/// Whether this browser plays HLS by itself (Safari always has, and recent Chrome does too). For a
+/// stream that needs nothing from us (H.264 and AAC, honest timestamps) that is the leanest way to
+/// play it: no wasm, no transmuxing, hardware decoding. What it can't do is what this crate is for:
+/// sound the browser can't decode (AC-3, MP2), timelines that jump without a tag, and fetching
+/// through your own proxy. Whether to try native first is the app's call.
+pub fn plays_hls_natively() -> bool {
+    can_play("application/vnd.apple.mpegurl")
+}
+
 /// Resolves after `d`, via the browser's timer.
 pub async fn sleep(d: Duration) {
     let p = js_sys::Promise::new(&mut |resolve, _| {
@@ -215,11 +247,7 @@ pub struct Direct;
 impl Fetch for Direct {
     async fn get(&self, url: &str, range: Option<Range<u64>>) -> Result<Response, FetchError> {
         let failed = |e: JsValue| {
-            FetchError::Temporary(format!(
-                "request to {} failed: {}",
-                url::host(url).unwrap_or("the server"),
-                js_err(e)
-            ))
+            FetchError::Temporary(format!("request to {} failed: {}", host_of(url), js_err(e)))
         };
         let headers = Headers::new().map_err(failed)?;
         if let Some(r) = range {
@@ -364,7 +392,7 @@ async fn with_retries<T, F: Future<Output = Result<T, Fail>>>(
 }
 
 async fn fetch_once(http: &impl Fetch, url: &str, limit: usize) -> Result<Fetched, Fail> {
-    let host = url::host(url).unwrap_or("the server");
+    let host = host_of(url);
     let r = http.get(url, None).await?;
     if !(200..300).contains(&r.status) {
         return Err(Fail::Retry(format!("{host} answered HTTP {}", r.status)));
@@ -378,7 +406,7 @@ async fn fetch_once(http: &impl Fetch, url: &str, limit: usize) -> Result<Fetche
         }
     }
     if r.content_length.is_some_and(|n| n > limit as u64) {
-        return Err(Fail::Final(too_big(host, limit)));
+        return Err(Fail::Final(too_big(&host, limit)));
     }
     // The length may be missing or wrong (chunked, or a stream dressed up as a file): count as it arrives.
     let expected = r.content_length.map_or(0, |n| n as usize);
@@ -386,7 +414,7 @@ async fn fetch_once(http: &impl Fetch, url: &str, limit: usize) -> Result<Fetche
         .await
         .map_err(|e| match e {
             // Reading it again would only read it all again.
-            Capped::TooBig => Fail::Final(too_big(host, limit)),
+            Capped::TooBig => Fail::Final(too_big(&host, limit)),
             Capped::Failed(why) => Fail::Retry(format!("download from {host} failed: {why}")),
         })?;
     Ok(Fetched {
@@ -527,7 +555,7 @@ async fn run(
         hls::Parsed::Media(_) => (playlist, first),
         hls::Parsed::Master(variants) => {
             let v = hls::pick_variant(&variants).ok_or("the playlist lists no streams")?;
-            let url = url::join(&first.url, &v.uri)?;
+            let url = resolve(&first.url, &v.uri)?;
             let f = fetch(http, &url, PLAYLIST_LIMIT, stop).await?;
             (url, f)
         }
@@ -572,7 +600,7 @@ async fn run(
             if stop.get() {
                 return Ok(());
             }
-            let url = url::join(&latest.url, &seg.uri)?;
+            let url = resolve(&latest.url, &seg.uri)?;
             let data = fetch(http, &url, SEGMENT_LIMIT, stop).await?;
             if stop.get() {
                 return Ok(());
@@ -646,7 +674,7 @@ async fn run(
 }
 
 #[cfg(feature = "vod")]
-pub use movie::{can_play, play_movie, probe};
+pub use movie::{play_movie, probe};
 
 /// Movies and episodes: the `vod` feature.
 #[cfg(feature = "vod")]
@@ -655,15 +683,6 @@ mod movie {
     use crate::{mkv, mp4, vod};
 
     // ---- Movies and episodes: plain files read by byte range ----
-
-    /// Ask the browser whether it can play a MIME type with codecs, e.g. `video/mp4; codecs="avc1.64001f"`.
-    pub fn can_play(mime: &str) -> bool {
-        web_sys::window()
-            .and_then(|w| w.document())
-            .and_then(|d| d.create_element("video").ok())
-            .and_then(|e| wasm_bindgen::JsCast::dyn_into::<web_sys::HtmlMediaElement>(e).ok())
-            .is_some_and(|v| !v.can_play_type(mime).is_empty())
-    }
 
     struct Part {
         bytes: Vec<u8>,
@@ -688,7 +707,7 @@ mod movie {
         start: u64,
         len: u64,
     ) -> Result<Part, Fail> {
-        let host = url::host(url).unwrap_or("the server");
+        let host = host_of(url);
         let no_ranges = || Fail::Final(format!("{host} does not serve byte ranges"));
         let r = http.get(url, Some(start..start + len.max(1))).await?;
         if r.status != 206 {

@@ -35,8 +35,9 @@ In the browser, `mse::start(video, playlist_url, fetcher, partial, decode_sound,
 ranges), and an app that goes through a proxy implements the small `mse::Fetch` trait for it.
 rstreamkit knows nothing about proxies or headers; it asks for real addresses (and, for movie files read
 with `mse::probe` and `mse::play_movie`, byte ranges) and resolves playlist entries against each
-response's final address. It depends on no HTTP or URL crate: the browser already has `fetch`, and
-`url::join` resolves references as RFC 3986 says.
+response's final address. It depends on no HTTP or URL crate: the browser already has `fetch` and
+`URL`, and does the resolving. Ask the browser first where it can do the job itself:
+`mse::plays_hls_natively()` (Safari, and recent Chrome, play HLS on their own) and `mse::can_play(mime)`.
 
 `cargo run --example transmux -- out.mp4 seg1.ts seg2.ts` writes a playable file from local segments.
 
