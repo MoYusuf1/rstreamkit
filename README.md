@@ -13,7 +13,7 @@ decoding the sound browsers can't (AC-3, E-AC-3, MP2) on the way.
 | `body` | Reads a response body with a size cap, so an endless stream can't fill memory |
 | `fmp4` | fMP4 init segment and fragments (`avc1` + `mp4a` or `fLaC`) |
 | `Transmuxer` (crate root) | Feeds segments in, gets an init segment and fragments out |
-| `mse` (wasm only) | Fetches the playlist and segments and appends them to a `<video>` |
+| `mse` (wasm only) | Fetches the playlist and segments (through a `Fetch` you supply) and appends them to a `<video>` |
 
 ```rust
 let mut t = rffmpeg::Transmuxer::default();
@@ -23,6 +23,13 @@ let out = t.push(&segment_bytes)?;      // out.init (once), out.fragment, out.sk
 `Transmuxer::default().decode_sound(false)` turns the sound decoding off: AC-3, E-AC-3 and MP2 are then
 dropped and named in `skipped_audio` (in the browser glue, `mse::start(.., decode_sound, ..)` reports
 `NeedsConversion`), for a caller that has real ffmpeg do it instead.
+
+In the browser, `mse::start(video, playlist_url, fetcher, partial, decode_sound, report)` plays a stream.
+`fetcher` is how bytes reach the page: `mse::Direct::default()` uses the browser's own `fetch` (the server
+must allow it, CORS), and an app that goes through a proxy implements the small `mse::Fetch` trait for it.
+rffmpeg knows nothing about proxies or headers; it asks for real URLs (and, for movie files read with
+`mse::probe` and `mse::play_movie`, byte ranges) and resolves playlist entries against each response's
+final URL.
 
 `cargo run --example transmux -- out.mp4 seg1.ts seg2.ts` writes a playable file from local segments.
 
