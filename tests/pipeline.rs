@@ -335,6 +335,15 @@ fn ac3_eac3_and_mp2_sound_is_decoded_to_flac_that_matches_ffmpeg() {
                 corr > 0.85 && level_db.abs() < 6.0,
                 "{name}: {corr:.3} {level_db:+.1} dB"
             );
+        } else if name.contains("51") {
+            // Our decoder folds AC-3 5.1 to stereo with the spec's downmix (§7.8, the mix levels the
+            // stream carries). Recent ffmpeg does the same and matches to 40+ dB; an older one uses
+            // fixed levels, and on CI that matched to 17 dB: the same sound at the same level
+            // (correlation 0.991, +0.2 dB). Stereo AC-3 and MP2 have no downmix and stay strict.
+            assert!(
+                corr > 0.98 && level_db.abs() < 1.5,
+                "{name}: {corr:.3} {level_db:+.1} dB"
+            );
         } else {
             assert!(db > 40.0, "{name}: {db:.1} dB against ffmpeg's decode");
         }
