@@ -202,7 +202,8 @@ fn sound_frames(es: &[u8], pts: u64, kind: crate::sound::Kind, out: &mut Demuxed
 }
 
 fn video_sample(es: &[u8], pts: u64, dts: u64, out: &mut Demuxed) {
-    let (mut data, mut key) = (vec![], false);
+    // AVCC is the same size as Annex B give or take a byte per NAL unit: allocate it once.
+    let (mut data, mut key) = (Vec::with_capacity(es.len() + 8), false);
     for nal in nal_units(es) {
         match nal[0] & 0x1F {
             7 => drop(out.sps.get_or_insert_with(|| nal.to_vec())),
@@ -254,12 +255,12 @@ pub fn demux(data: &[u8]) -> Result<Demuxed, Error> {
     // Emit a finished PES packet for the given PID.
     fn flush(
         pid: u16,
-        buf: Vec<u8>,
+        buf: &[u8],
         video_pid: Option<u16>,
         sound: Option<(u16, crate::sound::Kind)>,
         out: &mut Demuxed,
     ) {
-        let Some((pts, dts, es)) = parse_pes(&buf) else {
+        let Some((pts, dts, es)) = parse_pes(buf) else {
             return;
         };
         if Some(pid) == video_pid {
@@ -340,16 +341,19 @@ pub fn demux(data: &[u8]) -> Result<Demuxed, Error> {
             || sound.is_some_and(|(p, _)| p == pid)
         {
             if pusi {
-                if let Some(prev) = pes.insert(pid, payload.to_vec()) {
-                    flush(pid, prev, video_pid, sound, &mut out);
-                }
+                // One buffer per stream, reused for every packet of it: after the largest frame
+                // there is nothing left to allocate.
+                let buf = pes.entry(pid).or_default();
+                flush(pid, buf, video_pid, sound, &mut out);
+                buf.clear();
+                buf.extend(payload);
             } else if let Some(buf) = pes.get_mut(&pid) {
                 buf.extend(payload);
             }
         }
     }
-    for (pid, buf) in pes {
-        flush(pid, buf, video_pid, sound, &mut out);
+    for (pid, buf) in &pes {
+        flush(*pid, buf, video_pid, sound, &mut out);
     }
 
     if pmt_pid.is_none() {

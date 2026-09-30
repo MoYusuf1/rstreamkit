@@ -154,7 +154,20 @@ impl Transmuxer {
     }
 
     pub fn push(&mut self, segment: &[u8]) -> Result<Output, Error> {
-        let mut d = ts::demux(segment)?;
+        let d = ts::demux(segment)?;
+        self.assemble(d)
+    }
+
+    /// [`push`](Self::push) for a segment you are done with: it is freed before the fragment is
+    /// put together, so the two are never in memory at once (for a big segment that is a third of
+    /// the peak).
+    pub fn push_owned(&mut self, segment: Vec<u8>) -> Result<Output, Error> {
+        let d = ts::demux(&segment)?;
+        drop(segment);
+        self.assemble(d)
+    }
+
+    fn assemble(&mut self, mut d: ts::Demuxed) -> Result<Output, Error> {
         if self.skip_sound {
             d.sound.clear();
             d.sound_kind = None;

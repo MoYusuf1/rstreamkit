@@ -18,8 +18,11 @@ pub enum Capped<E> {
 pub async fn read_capped<B: AsRef<[u8]>, E>(
     mut chunks: impl Stream<Item = Result<B, E>> + Unpin,
     limit: usize,
+    expected: usize,
 ) -> Result<Vec<u8>, Capped<E>> {
-    let mut body = vec![];
+    // `expected` is what the server says it will send: allocate that once instead of doubling
+    // (which leaves the freed halves behind). Never trusted beyond the limit.
+    let mut body = Vec::with_capacity(expected.min(limit));
     while let Some(chunk) = poll_fn(|cx| Pin::new(&mut chunks).poll_next(cx)).await {
         let chunk = chunk.map_err(Capped::Failed)?;
         let chunk = chunk.as_ref();
@@ -72,7 +75,10 @@ mod tests {
             })
             .take(64),
         );
-        assert_eq!(block_on(read_capped(endless, 4 << 20)), Err(Capped::TooBig));
+        assert_eq!(
+            block_on(read_capped(endless, 4 << 20, 0)),
+            Err(Capped::TooBig)
+        );
         assert_eq!(
             pulled, 5,
             "four MB fit, the fifth chunk is where it stopped"
@@ -90,20 +96,20 @@ mod tests {
                     .into_iter(),
             )
         };
-        let body = block_on(read_capped(chunks(&[6, 4]), 10)).unwrap();
+        let body = block_on(read_capped(chunks(&[6, 4]), 10, 10)).unwrap();
         assert_eq!(body, [7; 10]);
         assert_eq!(
-            block_on(read_capped(chunks(&[6, 5]), 10)),
+            block_on(read_capped(chunks(&[6, 5]), 10, 11)),
             Err(Capped::TooBig)
         );
-        assert_eq!(block_on(read_capped(chunks(&[]), 10)), Ok(vec![]));
+        assert_eq!(block_on(read_capped(chunks(&[]), 10, 0)), Ok(vec![]));
     }
 
     #[test]
     fn a_failing_download_is_reported_as_that() {
         let broken = Chunks(vec![Ok(vec![1u8]), Err("connection reset")].into_iter());
         assert_eq!(
-            block_on(read_capped(broken, 10)),
+            block_on(read_capped(broken, 10, 0)),
             Err(Capped::Failed("connection reset"))
         );
     }

@@ -365,7 +365,9 @@ pub fn fragment(sequence: u32, runs: &[TrackRun]) -> Vec<u8> {
     }
     let moof = build(&offsets);
     let payload_len = (at - moof_len - 8) as u32;
-    let mut out = moof;
+    // The whole fragment is known by now: allocate it once, not by doubling.
+    let mut out = Vec::with_capacity(moof.len() + 8 + payload_len as usize);
+    out.extend(moof);
     out.extend((8 + payload_len).to_be_bytes());
     out.extend(b"mdat");
     for r in runs {

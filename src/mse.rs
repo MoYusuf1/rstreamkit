@@ -381,7 +381,8 @@ async fn fetch_once(http: &impl Fetch, url: &str, limit: usize) -> Result<Fetche
         return Err(Fail::Final(too_big(host, limit)));
     }
     // The length may be missing or wrong (chunked, or a stream dressed up as a file): count as it arrives.
-    let body = body::read_capped(r.body, limit)
+    let expected = r.content_length.map_or(0, |n| n as usize);
+    let body = body::read_capped(r.body, limit, expected)
         .await
         .map_err(|e| match e {
             // Reading it again would only read it all again.
@@ -563,7 +564,7 @@ async fn run(
             if stop.get() {
                 return Ok(());
             }
-            let out = tx.push(&data.body)?;
+            let out = tx.push_owned(data.body)?;
             if let Some(codec) = &out.skipped_audio {
                 if !partial {
                     return Err(Unsupported::Sound(codec.clone()).into());
@@ -688,7 +689,7 @@ mod movie {
         let total = r.range_total.ok_or_else(no_ranges)?;
         // A range answers with at most what was asked for; anything more is not a range.
         let limit = usize::try_from(len).unwrap_or(usize::MAX >> 1) + 1024;
-        let bytes = body::read_capped(r.body, limit)
+        let bytes = body::read_capped(r.body, limit, len as usize)
             .await
             .map_err(|e| match e {
                 Capped::TooBig => Fail::Final(format!("{host} sent more than the range asked for")),
