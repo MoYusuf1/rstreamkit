@@ -1,0 +1,29 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Rust toolchain
+        run: |
+          rustup update stable
+          rustup default stable
+          rustup component add rustfmt clippy
+          rustup target add wasm32-unknown-unknown
+      # The integration tests have ffmpeg decode our output; without it they skip themselves.
+      - name: ffmpeg
+        run: sudo apt-get update && sudo apt-get install -y ffmpeg
+      - run: cargo fmt --check
+      - run: cargo clippy --all-targets -- -D warnings
+      # `mse` only exists on wasm, so nothing else compiles it.
+      - run: cargo clippy --target wasm32-unknown-unknown -- -D warnings
+      - run: cargo test
