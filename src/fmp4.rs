@@ -89,8 +89,9 @@ fn minf(media_header: Vec<u8>, sample_entry: Vec<u8>) -> Vec<u8> {
     bx(b"minf", &[&media_header, &dinf, &stbl])
 }
 
-fn avc1(sps: &[u8], pps: &[u8], w: u16, h: u16, (hs, vs): (u32, u32)) -> Vec<u8> {
-    let avcc = bx(
+/// The `avcC` box for one SPS and one PPS (what a transport stream gives us).
+fn avcc_box(sps: &[u8], pps: &[u8]) -> Vec<u8> {
+    bx(
         b"avcC",
         &[
             &[1, sps[1], sps[2], sps[3], 0xFF, 0xE1],
@@ -100,7 +101,10 @@ fn avc1(sps: &[u8], pps: &[u8], w: u16, h: u16, (hs, vs): (u32, u32)) -> Vec<u8>
             &(pps.len() as u16).to_be_bytes(),
             pps,
         ],
-    );
+    )
+}
+
+fn avc1(avcc: &[u8], w: u16, h: u16, (hs, vs): (u32, u32)) -> Vec<u8> {
     let mut name = [0u8; 32];
     name[0] = 0; // empty compressor name
     let pasp = if hs == vs {
@@ -123,39 +127,38 @@ fn avc1(sps: &[u8], pps: &[u8], w: u16, h: u16, (hs, vs): (u32, u32)) -> Vec<u8>
             &name,
             &0x0018u16.to_be_bytes(), // depth
             &0xFFFFu16.to_be_bytes(),
-            &avcc,
+            avcc,
             &pasp,
         ],
     )
 }
 
-fn mp4a(cfg: &AacConfig) -> Vec<u8> {
-    let asc = cfg.asc();
-    // ES_Descriptor > DecoderConfigDescriptor > DecoderSpecificInfo, then SLConfig. All lengths < 128.
-    let esds = full(
-        b"esds",
-        0,
-        0,
-        &[&[
-            0x03, 0x19, 0, 0, 0, // ES_Descriptor, ES_ID 0, no flags
-            0x04, 0x11, 0x40, 0x15, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-            0, // DecoderConfig: AAC, audio stream, buffer/bitrates unknown
-            0x05, 0x02, asc[0], asc[1], // DecoderSpecificInfo
-            0x06, 0x01, 0x02, // SLConfig
-        ]],
-    );
+/// ES_Descriptor > DecoderConfigDescriptor > DecoderSpecificInfo (the AudioSpecificConfig), then
+/// SLConfig. Every length here stays under 128, so each is one byte.
+fn esds(asc: &[u8]) -> Vec<u8> {
+    let mut config = vec![0x04, (13 + 2 + asc.len()) as u8, 0x40, 0x15];
+    config.extend([0; 11]); // buffer size, maximum and average bit rate: unknown
+    config.extend([0x05, asc.len() as u8]);
+    config.extend(asc);
+    let mut body = vec![0x03, (3 + config.len() + 3) as u8, 0, 0, 0]; // ES_ID 0, no flags
+    body.extend(config);
+    body.extend([0x06, 0x01, 0x02]);
+    full(b"esds", 0, 0, &[&body])
+}
+
+fn mp4a(asc: &[u8], channels: u16, rate: u32) -> Vec<u8> {
     bx(
         b"mp4a",
         &[
             &[0; 6],
             &1u16.to_be_bytes(),
             &[0; 8],
-            &(cfg.channels as u16).to_be_bytes(),
+            &channels.to_be_bytes(),
             &16u16.to_be_bytes(), // sample size
             &[0; 4],
             // 16.16 fixed point: rates above 65535 Hz don't fit (the real rate lives in the ASC).
-            &(cfg.sample_rate().min(65535) << 16).to_be_bytes(),
-            &esds,
+            &(rate.min(65535) << 16).to_be_bytes(),
+            &esds(asc),
         ],
     )
 }
@@ -186,21 +189,35 @@ fn flac_entry(rate: u32) -> Vec<u8> {
 
 /// The audio of an fMP4 stream: AAC as it arrives, or FLAC made from sound we decoded.
 pub enum AudioTrack<'a> {
+    /// AAC from a transport stream, which only tells us its basic parameters.
     Aac(&'a AacConfig),
-    Flac { rate: u32 },
+    /// AAC from a file, which brings its whole AudioSpecificConfig (HE-AAC needs the extra bytes).
+    AacFile {
+        asc: &'a [u8],
+        channels: u16,
+        rate: u32,
+    },
+    Flac {
+        rate: u32,
+    },
 }
 
 impl AudioTrack<'_> {
     fn timescale(&self) -> u32 {
         match self {
             AudioTrack::Aac(cfg) => cfg.sample_rate(),
-            AudioTrack::Flac { rate } => *rate,
+            AudioTrack::AacFile { rate, .. } | AudioTrack::Flac { rate } => *rate,
         }
     }
 
     fn entry(&self) -> Vec<u8> {
         match self {
-            AudioTrack::Aac(cfg) => mp4a(cfg),
+            AudioTrack::Aac(cfg) => mp4a(&cfg.asc(), u16::from(cfg.channels), cfg.sample_rate()),
+            AudioTrack::AacFile {
+                asc,
+                channels,
+                rate,
+            } => mp4a(asc, *channels, *rate),
             AudioTrack::Flac { rate } => flac_entry(*rate),
         }
     }
@@ -209,6 +226,9 @@ impl AudioTrack<'_> {
 pub struct VideoParams<'a> {
     pub sps: &'a [u8],
     pub pps: &'a [u8],
+    /// The whole `avcC` payload when a file has one (more than one SPS, the High-profile bytes);
+    /// without it a minimal one is built from `sps` and `pps`.
+    pub avcc: Option<&'a [u8]>,
     pub width: u32,
     pub height: u32,
     /// Pixel shape (horizontal, vertical spacing); equal numbers mean square.
@@ -252,8 +272,9 @@ pub fn init_segment(video: &VideoParams, audio: Option<&AudioTrack>) -> Vec<u8> 
                 minf(
                     full(b"vmhd", 0, 1, &[&[0; 8]]),
                     avc1(
-                        video.sps,
-                        video.pps,
+                        &video
+                            .avcc
+                            .map_or_else(|| avcc_box(video.sps, video.pps), |a| bx(b"avcC", &[a])),
                         video.width as u16,
                         video.height as u16,
                         video.pixel_aspect,
@@ -431,6 +452,7 @@ mod tests {
         let v = VideoParams {
             sps: &sps,
             pps: &[0x68, 0xee],
+            avcc: None,
             width: 848,
             height: 480,
             pixel_aspect: (1, 1),
