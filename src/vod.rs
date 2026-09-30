@@ -168,6 +168,11 @@ impl Movie {
         }
     }
 
+    /// The file's average size per second of movie, to size pieces to read by time.
+    pub fn bytes_per_second(&self) -> f64 {
+        self.size as f64 / self.duration.max(1.0)
+    }
+
     /// Seconds to subtract from the source buffer's timestamps (`timestampOffset`).
     pub fn shift(&self) -> f64 {
         -(self.shift as f64) / 1e6
