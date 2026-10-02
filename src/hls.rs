@@ -192,7 +192,12 @@ pub fn parse(bytes: &[u8]) -> Result<Parsed, Error> {
         } else if let Some(rest) = line.strip_prefix("#EXT-X-PROGRAM-DATE-TIME:") {
             date = Some(rest.to_owned());
         } else if let Some(rest) = line.strip_prefix("#EXT-X-TARGETDURATION:") {
-            target_duration = rest.trim().parse().unwrap_or(0.0);
+            target_duration = rest
+                .trim()
+                .parse::<f64>()
+                .ok()
+                .filter(|v| v.is_finite() && *v > 0.0)
+                .ok_or_else(|| Error::Playlist("invalid target duration".into()))?;
         } else if let Some(rest) = line.strip_prefix("#EXT-X-MEDIA-SEQUENCE:") {
             first_seq = rest.trim().parse().unwrap_or(0);
         } else if line == "#EXT-X-ENDLIST" {
@@ -372,6 +377,19 @@ pub fn describe_non_playlist(body: &[u8], content_type: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn invalid_target_durations_are_errors_before_the_playback_timer() {
+        for value in ["NaN", "inf", "-inf", "0", "-1", "garbage"] {
+            let text = format!("#EXTM3U\n#EXT-X-TARGETDURATION:{value}\n");
+            assert!(
+                matches!(
+                    super::parse(text.as_bytes()),
+                    Err(crate::Error::Playlist(_))
+                ),
+                "{value}"
+            );
+        }
+    }
     use super::*;
 
     const MASTER: &str = "#EXTM3U\n\

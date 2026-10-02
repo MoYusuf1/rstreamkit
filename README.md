@@ -14,7 +14,8 @@ browser playback is optional and uses a small JavaScript bridge.
 | Format coverage | Focused streaming formats | Broader coverage | FFmpeg still handles more kinds of media |
 
 Speed: median of eight native command-line runs on a Ryzen 7 5700, Linux,
-Rust 1.98.1, FFmpeg 9.0.2. Includes startup and file I/O; no re-encoding.
+Rust 1.98.1, FFmpeg 9.0.2. Includes startup and file reading/writing;
+the picture and sound are copied without conversion.
 This test does not prove rstreamkit is faster at every job.
 
 [Benchmark details and commands](docs/performance.md) ·
