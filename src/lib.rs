@@ -3,16 +3,41 @@
 //! files (MP4 and Matroska, `vod`), plus the MediaSource glue that feeds a `<video>` element (wasm
 //! only, `mse`).
 
+//!
+//! The media core runs on native Rust targets and WebAssembly. `mse` adds browser playback
+//! on wasm; [`net::Fetch`] and [`net::Sink`] let other hosts supply their own I/O.
+//!
+//! ```no_run
+//! # fn main() -> Result<(), Box<dyn std::error::Error>> {
+//! use std::io::Write;
+//! let input = std::fs::read("stream.ts")?;
+//! let out = rstreamkit::Transmuxer::default().push(&input)?;
+//! let mut file = std::fs::File::create("output.mp4")?;
+//! if let Some(init) = &out.init { file.write_all(&init.bytes)?; }
+//! for fragment in &out.fragments {
+//!     file.write_all(&fragment.moof)?;
+//!     file.write_all(&fragment.mdat)?;
+//! }
+//! # Ok(())
+//! # }
+//! ```
+
 pub mod avc;
 pub mod body;
+#[cfg(any(target_arch = "wasm32", test))]
+mod cancel;
+pub mod cmaf;
 pub mod fmp4;
 pub mod hls;
+#[cfg(any(target_arch = "wasm32", test))]
+mod live;
 #[cfg(feature = "vod")]
 pub mod mkv;
 #[cfg(feature = "vod")]
 pub mod mp4;
 #[cfg(target_arch = "wasm32")]
 pub mod mse;
+pub mod net;
 pub mod sound;
 pub mod ts;
 #[cfg(feature = "vod")]
@@ -27,6 +52,8 @@ pub enum Error {
     Playlist(String),
     #[error("{0}")]
     Unsupported(String),
+    #[error("{0}")]
+    Capability(Unsupported),
 }
 
 impl Error {
@@ -35,6 +62,7 @@ impl Error {
     /// app.
     pub fn unsupported(&self) -> Option<Unsupported> {
         match self {
+            Error::Capability(why) => Some(why.clone()),
             Error::Ts(ts::Error::NoVideo(codec)) => Some(Unsupported::Video(codec.clone())),
             _ => None,
         }
@@ -61,7 +89,7 @@ impl std::fmt::Display for Unsupported {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Unsupported::Video(Some(codec)) => write!(f, "the video isn't H.264 (it is {codec})"),
-            Unsupported::Video(None) => f.write_str("the video isn't H.264 (probably HEVC)"),
+            Unsupported::Video(None) => f.write_str("no supported audio or video was found"),
             Unsupported::Sound(codec) => write!(f, "{codec} sound can't be played by this browser"),
             Unsupported::Interlaced => f.write_str("interlaced video"),
             Unsupported::RawStream => f.write_str(hls::RAW_STREAM),
@@ -85,7 +113,7 @@ pub struct Init {
 #[derive(Debug)]
 #[non_exhaustive]
 pub struct Output {
-    /// Present for the first segment only.
+    /// Present at startup and whenever codec parameters or track layout change.
     pub init: Option<Init>,
     /// What to append, in this order: a `moof` and `mdat` for each track that has samples in the
     /// segment, the pictures first. (Empty if it held none.) Tracks get their own, which a browser
@@ -122,7 +150,7 @@ const WRAP: u64 = 1 << 33; // PES timestamps are 33 bits
 /// new timeline (stream restart, ad splice, missing tag) and gets glued on instead of leaving a gap.
 const JUMP: u64 = 2 * 90_000;
 
-/// What a stream's audio track is, settled by its first segment.
+/// The current representation and sample rate of a stream's audio track.
 #[derive(Default, Clone, Copy, PartialEq)]
 enum Audio {
     #[default]
@@ -131,6 +159,7 @@ enum Audio {
     Aac,
     /// Sound we decode ourselves (AC-3, E-AC-3, MP2) and write as FLAC: its kind and sample rate.
     Sound(sound::Kind, u32),
+    Dolby(u32),
 }
 
 /// Turns consecutive HLS TS segments into a continuous fMP4 stream.
@@ -149,12 +178,20 @@ pub struct Transmuxer {
     aend: u64,
     seq: u32,
     sent_init: bool,
+    reset_clock: bool,
+    sps: Vec<u8>,
+    pps: Vec<u8>,
+    aac: Option<ts::AacConfig>,
     audio: Audio,
     audio_next: Option<u64>,
     decoder: sound::Decoder,
     /// FLAC frames written so far; each frame carries its number.
     flac_frames: u32,
     skip_sound: bool,
+    passthrough_ac3: bool,
+    audio_language: Option<String>,
+    dolby: Option<sound::DolbyConfig>,
+    prepared_flac: Option<Vec<(Vec<u8>, u32)>>,
 }
 
 impl Transmuxer {
@@ -163,6 +200,26 @@ impl Transmuxer {
     pub fn decode_sound(mut self, on: bool) -> Self {
         self.skip_sound = !on;
         self
+    }
+
+    pub fn audio_language(mut self, language: Option<&str>) -> Self {
+        self.audio_language = language.map(str::to_owned);
+        self
+    }
+    /// Begin a streamed segment using this transmuxer's track selection.
+    pub fn segment(&self, expected: usize) -> Segment {
+        Segment::new(expected).audio_language(self.audio_language.as_deref())
+    }
+
+    /// Opt in to AC-3 passthrough after verifying platform support. E-AC-3 remains decoded.
+    pub fn passthrough_ac3(mut self, on: bool) -> Self {
+        self.passthrough_ac3 = on;
+        self
+    }
+
+    /// Glue the next segment onto the previous track ends (explicit discontinuity or loss).
+    pub fn discontinuity(&mut self) {
+        self.reset_clock = true;
     }
 
     /// Picks the representation of a 33-bit timestamp nearest to the last one seen.
@@ -179,7 +236,7 @@ impl Transmuxer {
 
     /// A whole segment at once. See [`segment`](Self::segment) for one that arrives in pieces.
     pub fn push(&mut self, segment: &[u8]) -> Result<Output, Error> {
-        let mut s = Segment::new(segment.len());
+        let mut s = self.segment(segment.len());
         s.feed(segment);
         self.finish(s)
     }
@@ -190,56 +247,174 @@ impl Transmuxer {
         self.assemble(d)
     }
 
+    /// Browser-friendly decoding: yield between small batches of audio frames.
+    #[cfg(target_arch = "wasm32")]
+    pub async fn finish_yielded(&mut self, segment: Segment) -> Result<Output, Error> {
+        let d = segment.demuxer.finish()?;
+        if cfg!(feature = "sound")
+            && !self.skip_sound
+            && !d.sound.is_empty()
+            && !(self.passthrough_ac3
+                && sound::dolby_config(&d.sound[0].data)
+                    .is_some_and(|c| !c.enhanced || d.simple_eac3))
+            && let Some(kind) = d.sound_kind
+        {
+            let next = Audio::Sound(kind, d.sound[0].rate);
+            if self.audio != next {
+                self.decoder = sound::Decoder::new();
+            }
+            let mut frames = Vec::with_capacity(d.sound.len());
+            for (i, f) in d.sound.iter().enumerate() {
+                let coded = sound::Coded {
+                    data: &f.data,
+                    samples: f.samples,
+                    rate: f.rate,
+                    channels: f.channels,
+                };
+                let pcm = self.decoder.decode(kind, &coded);
+                frames.push((
+                    sound::flac_frame(&pcm, self.flac_frames),
+                    (pcm.len() / 2) as u32,
+                ));
+                self.flac_frames += 1;
+                if i % 8 == 7 {
+                    crate::mse::sleep(std::time::Duration::ZERO).await;
+                }
+            }
+            self.prepared_flac = Some(frames);
+        }
+        self.assemble(d)
+    }
+
     /// `d`'s pictures must begin after room for the `mdat` header (see `segment`).
-    fn assemble(&mut self, mut d: ts::Demuxed) -> Result<Output, Error> {
-        if self.skip_sound {
+    pub(crate) fn assemble(&mut self, mut d: ts::Demuxed) -> Result<Output, Error> {
+        let dolby = if self.passthrough_ac3 {
+            d.sound
+                .first()
+                .and_then(|f| sound::dolby_config(&f.data))
+                .filter(|c| !c.enhanced || d.simple_eac3)
+        } else {
+            None
+        };
+        if (self.skip_sound || !cfg!(feature = "sound")) && dolby.is_none() {
             d.sound.clear();
             d.sound_kind = None;
         } else if !d.sound.is_empty() {
             d.skipped_audio = None; // we decode it
         }
 
-        let init = if self.sent_init {
+        if d.video.is_empty()
+            && d.audio.is_empty()
+            && d.sound.is_empty()
+            && let Some(codec) = &d.skipped_audio
+        {
+            return Err(Error::Capability(Unsupported::Sound(codec.clone())));
+        }
+        let mut changed = false;
+        if let Some(sps) = d.sps.as_ref()
+            && *sps != self.sps
+        {
+            self.sps = sps.clone();
+            changed = true;
+        }
+        if let Some(pps) = d.pps.as_ref()
+            && *pps != self.pps
+        {
+            self.pps = pps.clone();
+            changed = true;
+        }
+        if dolby != self.dolby && dolby.is_some() {
+            changed = true;
+        }
+        if dolby.is_some() {
+            self.dolby = dolby.clone();
+        }
+        let next_audio = match (&d.aac, d.sound_kind, d.sound.first()) {
+            (Some(_), _, _) => Audio::Aac,
+            (None, Some(_), Some(_)) if dolby.is_some() => {
+                Audio::Dolby(dolby.as_ref().unwrap().rate)
+            }
+            (None, Some(kind), Some(first)) => Audio::Sound(kind, first.rate),
+            _ => self.audio, // A video-only segment doesn't remove an established sound track.
+        };
+        if d.aac.is_some() && d.aac != self.aac {
+            self.aac = d.aac;
+            changed = true;
+        }
+        if next_audio != self.audio || changed && next_audio == Audio::Aac {
+            let rate = match next_audio {
+                Audio::Aac => self.aac.as_ref().map_or(48_000, |c| c.sample_rate()),
+                Audio::Sound(_, rate) | Audio::Dolby(rate) => rate,
+                Audio::None => 90_000,
+            };
+            self.audio_next = self
+                .sent_init
+                .then_some(self.aend * u64::from(rate) / 90_000);
+            if next_audio != self.audio && self.prepared_flac.is_none() {
+                self.decoder = sound::Decoder::new();
+            }
+            self.audio = next_audio;
+            changed = true;
+        }
+        let init = if self.sent_init && !changed {
             None
         } else {
-            let sps = d
-                .sps
-                .as_deref()
-                .filter(|s| s.len() >= 4)
-                .ok_or(ts::Error::NoVideoParams)?;
-            let pps = d.pps.as_deref().ok_or(ts::Error::NoVideoParams)?;
-            let (width, height) = avc::dimensions(sps)
-                .ok_or_else(|| ts::Error::BadSps("cannot read the picture size".into()))?;
-            self.audio = match (&d.aac, d.sound_kind, d.sound.first()) {
-                (Some(_), _, _) => Audio::Aac,
-                (None, Some(kind), Some(first)) => Audio::Sound(kind, first.rate),
-                _ => Audio::None,
+            let sps = self.sps.as_slice();
+            if !d.video.is_empty() && (sps.len() < 4 || self.pps.is_empty()) {
+                return Err(ts::Error::NoVideoParams.into());
+            }
+            let pps = self.pps.as_slice();
+            let (width, height) = if sps.is_empty() {
+                (0, 0)
+            } else {
+                avc::dimensions(sps)
+                    .ok_or_else(|| ts::Error::BadSps("cannot read the picture size".into()))?
             };
             let (track, audio) = match self.audio {
                 // Browsers only accept `mp4a.40.2` (AAC-LC) here, and decode Main and the rest of
                 // the family fine when told so; declaring the real type (Main is `.1`) is refused.
-                Audio::Aac => (d.aac.as_ref().map(fmp4::AudioTrack::Aac), ",mp4a.40.2"),
+                Audio::Aac => (self.aac.as_ref().map(fmp4::AudioTrack::Aac), ",mp4a.40.2"),
                 Audio::Sound(_, rate) => (Some(fmp4::AudioTrack::Flac { rate }), ",flac"),
+                Audio::Dolby(rate) => {
+                    let cfg = self.dolby.as_ref().unwrap();
+                    (
+                        Some(fmp4::AudioTrack::Dolby {
+                            rate,
+                            channels: cfg.channels,
+                            enhanced: cfg.enhanced,
+                            config: &cfg.bytes,
+                        }),
+                        if cfg.enhanced { ",ec-3" } else { ",ac-3" },
+                    )
+                }
                 Audio::None => (None, ""),
             };
             self.sent_init = true;
             Some(Init {
-                bytes: fmp4::init_segment(
-                    &fmp4::VideoParams {
-                        sps,
-                        pps,
-                        avcc: None,
-                        width,
-                        height,
-                        pixel_aspect: avc::pixel_aspect(sps).unwrap_or((1, 1)),
-                    },
-                    track.as_ref(),
-                ),
+                bytes: if sps.is_empty() {
+                    fmp4::audio_init_segment(track.as_ref().ok_or(ts::Error::NoVideo(None))?)
+                } else {
+                    fmp4::init_segment(
+                        &fmp4::VideoParams {
+                            sps,
+                            pps,
+                            avcc: None,
+                            width,
+                            height,
+                            pixel_aspect: avc::pixel_aspect(sps).unwrap_or((1, 1)),
+                        },
+                        track.as_ref(),
+                    )
+                },
                 interlaced: avc::interlaced(sps).unwrap_or(false),
-                mime: format!(
-                    "video/mp4; codecs=\"avc1.{:02x}{:02x}{:02x}{audio}\"",
-                    sps[1], sps[2], sps[3]
-                ),
+                mime: if sps.is_empty() {
+                    format!("audio/mp4; codecs=\"{}\"", audio.trim_start_matches(','))
+                } else {
+                    format!(
+                        "video/mp4; codecs=\"avc1.{:02x}{:02x}{:02x}{audio}\"",
+                        sps[1], sps[2], sps[3]
+                    )
+                },
             })
         };
 
@@ -264,6 +439,7 @@ impl Transmuxer {
         // tag) is re-based so that each track carries on exactly where it stopped: a hole of even a
         // few milliseconds in either one stalls playback in a browser. The price is that the tracks
         // keep the offset between them that they had before the jump.
+        let reset_clock = std::mem::take(&mut self.reset_clock);
         let (vbase, abase, jumped) = match self.vbase {
             None => (first as i64, first as i64, false),
             Some(vbase) => {
@@ -276,7 +452,7 @@ impl Transmuxer {
                 .flatten()
                 .min()
                 .unwrap_or(0);
-                if (first as i64).abs_diff(expected) <= JUMP {
+                if !reset_clock && (first as i64).abs_diff(expected) <= JUMP {
                     (vbase, self.abase, false)
                 } else {
                     (
@@ -314,7 +490,14 @@ impl Transmuxer {
                     }
                 })
                 .collect();
-            let start = relv(video[0].0);
+            let derived = relv(video[0].0);
+            // Snap sub-frame duration estimates at ordinary boundaries, keeping larger
+            // source gaps visible to recovery rather than accumulating jitter.
+            let start = if self.seq > 0 && derived.abs_diff(self.vend) <= u64::from(last_dur) {
+                self.vend
+            } else {
+                derived
+            };
             self.vend = start + samples.iter().map(|s| s.duration as u64).sum::<u64>();
             runs.push(fmp4::TrackRun {
                 track: fmp4::VIDEO_TRACK,
@@ -349,22 +532,53 @@ impl Transmuxer {
                 samples,
             });
         }
+        if let Audio::Dolby(rate) = self.audio
+            && !d.sound.is_empty()
+        {
+            let rate = u64::from(rate);
+            let derived = rela(sound_pts[0]) * rate / 90_000;
+            let start = match self.audio_next {
+                Some(next) if jumped || derived.abs_diff(next) <= 1536 => next,
+                _ => derived,
+            };
+            let duration: u64 = d.sound.iter().map(|f| u64::from(f.samples)).sum();
+            self.audio_next = Some(start + duration);
+            self.aend = (start + duration) * 90_000 / rate;
+            runs.push(fmp4::TrackRun {
+                track: fmp4::AUDIO_TRACK,
+                base_time: start,
+                samples: d
+                    .sound
+                    .iter()
+                    .map(|f| fmp4::Sample {
+                        duration: f.samples,
+                        key: true,
+                        cts: 0,
+                        data: &f.data,
+                    })
+                    .collect(),
+            });
+        }
         // Sound we decode: each frame becomes PCM, then one FLAC frame, one sample in the track.
         let mut flac = vec![];
         if let (Audio::Sound(kind, rate), false) = (self.audio, d.sound.is_empty()) {
-            for f in &d.sound {
-                let coded = sound::Coded {
-                    data: &f.data,
-                    samples: f.samples,
-                    rate: f.rate,
-                    channels: f.channels,
-                };
-                let pcm = self.decoder.decode(kind, &coded);
-                flac.push((
-                    sound::flac_frame(&pcm, self.flac_frames),
-                    (pcm.len() / 2) as u32,
-                ));
-                self.flac_frames += 1;
+            if let Some(prepared) = self.prepared_flac.take() {
+                flac = prepared;
+            } else {
+                for f in &d.sound {
+                    let coded = sound::Coded {
+                        data: &f.data,
+                        samples: f.samples,
+                        rate: f.rate,
+                        channels: f.channels,
+                    };
+                    let pcm = self.decoder.decode(kind, &coded);
+                    flac.push((
+                        sound::flac_frame(&pcm, self.flac_frames),
+                        (pcm.len() / 2) as u32,
+                    ));
+                    self.flac_frames += 1;
+                }
             }
             let rate = u64::from(rate);
             let derived = rela(sound_pts[0]) * rate / 90_000;
@@ -390,6 +604,30 @@ impl Transmuxer {
                     })
                     .collect(),
             });
+        }
+        // Independent gapless splices can accumulate skew. Move the video clock toward
+        // the audio clock by distributing a bounded (2%) timing correction across a run.
+        // Track starts remain contiguous; changing the base keeps the following source
+        // timestamps on the corrected clock instead of opening a hole at the next boundary.
+        if runs.iter().any(|r| r.track == fmp4::AUDIO_TRACK)
+            && let Some(run) = runs.iter_mut().find(|r| r.track == fmp4::VIDEO_TRACK)
+        {
+            let skew = vbase - self.abase;
+            if skew.unsigned_abs() > 1800 {
+                let total: i64 = run.samples.iter().map(|s| i64::from(s.duration)).sum();
+                let correction = skew.clamp(-total / 50, total / 50);
+                let count = run.samples.len() as i64;
+                let mut applied = 0i64;
+                for (i, sample) in run.samples.iter_mut().enumerate() {
+                    let cumulative = correction * (i as i64 + 1) / count;
+                    let delta = cumulative - applied;
+                    let duration = (i64::from(sample.duration) + delta).clamp(1, u32::MAX as i64);
+                    applied += duration - i64::from(sample.duration);
+                    sample.duration = duration as u32;
+                }
+                self.vend = (self.vend as i64 + applied).max(0) as u64;
+                self.vbase = Some(vbase - applied);
+            }
         }
         // One `moof` and `mdat` for each track: nothing is copied into anything bigger.
         let moofs: Vec<Vec<u8>> = runs
@@ -434,6 +672,53 @@ impl Transmuxer {
     }
 }
 
+/// Bounded continuous MPEG-TS input, cut into output fragments at keyframes.
+/// Unlike `Segment`, program tables and incomplete PES packets survive between feeds.
+pub struct Continuous {
+    demuxer: ts::Demuxer,
+    transmuxer: Transmuxer,
+    limit: usize,
+}
+impl Default for Continuous {
+    fn default() -> Self {
+        Self::new(64 << 20)
+    }
+}
+impl Continuous {
+    pub fn new(limit: usize) -> Self {
+        Self {
+            demuxer: ts::Demuxer::new(vec![0; MDAT_HEADER]),
+            transmuxer: Transmuxer::default(),
+            limit,
+        }
+    }
+    pub fn decode_sound(mut self, on: bool) -> Self {
+        self.transmuxer = self.transmuxer.decode_sound(on);
+        self
+    }
+    pub fn feed(&mut self, bytes: &[u8]) -> Result<Vec<Output>, Error> {
+        let mut out = vec![];
+        // Even a caller handing over a giant chunk cannot allocate it all before checking the cap.
+        for bytes in bytes.chunks(16 << 10) {
+            self.demuxer.feed(bytes);
+            while let Some(d) = self.demuxer.take_fragment()? {
+                out.push(self.transmuxer.assemble(d)?);
+            }
+            if self.demuxer.buffered_bytes() > self.limit {
+                return Err(Error::Unsupported(
+                    "continuous TS exceeded its keyframe buffer limit".into(),
+                ));
+            }
+        }
+        Ok(out)
+    }
+    pub fn finish(mut self) -> Result<Output, Error> {
+        self.transmuxer.finish(Segment {
+            demuxer: self.demuxer,
+        })
+    }
+}
+
 /// One segment as it arrives, as a download delivers it: [`feed`](Self::feed) it what comes, then
 /// hand it to [`Transmuxer::finish`]. Nothing holds the whole segment, and the pictures are written
 /// straight into the buffer they leave in, so it takes about its own size in memory, not several
@@ -455,6 +740,11 @@ impl Segment {
     }
 
     /// The next piece of the segment; pieces can be cut anywhere.
+    pub fn audio_language(mut self, language: Option<&str>) -> Self {
+        self.demuxer = self.demuxer.audio_language(language);
+        self
+    }
+
     pub fn feed(&mut self, chunk: &[u8]) {
         self.demuxer.feed(chunk);
     }
@@ -568,6 +858,87 @@ mod tests {
         }
     }
 
+    #[test]
+    fn configuration_changes_and_audio_appearing_emit_new_init() {
+        let clip = include_bytes!("../tests/fixtures/bbb_480p.ts");
+        let mut silent = ts::demux(clip).unwrap();
+        silent.audio.clear();
+        silent.aac = None;
+        silent.video_data.splice(0..0, [0; MDAT_HEADER]);
+        let mut t = Transmuxer::default();
+        let first = t.assemble(silent).unwrap();
+        assert!(!first.init.unwrap().mime.contains("mp4a"));
+        let with_audio = t.push(clip).unwrap();
+        assert!(with_audio.init.unwrap().mime.contains("mp4a"));
+        assert!(t.push(clip).unwrap().init.is_none());
+        let changed = t
+            .push(include_bytes!("../tests/fixtures/pal_anamorphic.ts"))
+            .unwrap();
+        assert!(changed.init.is_some());
+    }
+
+    #[test]
+    fn radio_produces_an_audio_only_init_and_fragments() {
+        let mut d = ts::demux(include_bytes!("../tests/fixtures/bbb_480p.ts")).unwrap();
+        d.video.clear();
+        d.video_data.clear();
+        d.sps = None;
+        d.pps = None;
+        let out = Transmuxer::default().assemble(d).unwrap();
+        assert!(out.init.unwrap().mime.starts_with("audio/mp4"));
+        assert_eq!(out.fragments.len(), 1);
+    }
+
+    #[test]
+    fn discontinuity_skew_measurement() {
+        let clip = include_bytes!("../tests/fixtures/bbb_480p.ts");
+        let mut t = Transmuxer::default();
+        t.push(clip).unwrap();
+        let initial = t.vend as i64 - t.aend as i64;
+        let mut maximum = 0i64;
+        for i in 0..20 {
+            let mut d = ts::demux(&shifted(clip, (i + 1) * 9_000_000)).unwrap();
+            for audio in &mut d.audio {
+                audio.pts = (audio.pts as i64 + if i % 2 == 0 { 9000 } else { -9000 }) as u64;
+            }
+            d.video_data.splice(0..0, [0; MDAT_HEADER]);
+            t.assemble(d).unwrap();
+            maximum = maximum.max((t.vend as i64 - t.aend as i64).abs());
+        }
+        assert!(
+            maximum < 18_000,
+            "repeated splice skew exceeded 200 ms: {maximum}"
+        );
+        eprintln!(
+            "splice skew initial={} ms max={} ms",
+            initial as f64 / 90.0,
+            maximum as f64 / 90.0
+        );
+    }
+
+    #[test]
+    fn thousands_of_restarts_stay_monotonic_with_bounded_output() {
+        let clip = include_bytes!("../tests/fixtures/bbb_480p.ts");
+        let mut t = Transmuxer::default();
+        let mut previous = [0, 0];
+        let mut max_bytes = 0;
+        for i in 0..2000 {
+            let out = t.push(clip).unwrap();
+            let bases = base_times(&out.fragment());
+            assert!(bases.iter().zip(previous).all(|(at, prev)| *at >= prev));
+            previous.copy_from_slice(&bases);
+            let size: usize = out
+                .fragments
+                .iter()
+                .map(|f| f.moof.len() + f.mdat.len())
+                .sum();
+            max_bytes = max_bytes.max(size);
+            assert!(size < clip.len() * 2);
+            assert_eq!(out.init.is_some(), i == 0);
+        }
+        assert!(max_bytes > 0);
+    }
+
     /// A segment that arrives in pieces comes out exactly as the same segment all at once.
     #[test]
     fn a_segment_fed_in_pieces_is_the_same_as_one_pushed_whole() {
@@ -627,7 +998,11 @@ mod tests {
             Unsupported::Video(Some("HEVC".into())).to_string(),
             "the video isn't H.264 (it is HEVC)"
         );
-        assert!(Unsupported::Video(None).to_string().contains("H.264"));
+        assert!(
+            Unsupported::Video(None)
+                .to_string()
+                .contains("no supported audio or video")
+        );
         assert_eq!(Unsupported::RawStream.to_string(), hls::RAW_STREAM);
         let refused = Unsupported::MediaType {
             mime: "video/mp4".into(),

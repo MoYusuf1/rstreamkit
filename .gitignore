@@ -1,2 +1,10 @@
 /target/
 Cargo.lock
+
+/tools/harness/target/
+/tools/harness/Cargo.lock
+/tools/web/pkg/
+/tools/node/pkg/
+/tools/media/
+/tools/results/
+/tools/__pycache__/

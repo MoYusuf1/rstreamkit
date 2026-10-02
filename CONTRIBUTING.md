@@ -1,6 +1,7 @@
 # Contributing
 
-rstreamkit is a standalone, open-source toolkit for playing streams and files in the browser.
+rstreamkit is a standalone, open-source Rust toolkit for processing streams and files in native apps
+and browsers. Browser playback is a platform adapter around the shared media core.
 Apps are its clients; RIPTV is the first. Apps conform to rstreamkit, not the reverse.
 
 ## Rules

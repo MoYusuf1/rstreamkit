@@ -1,0 +1,21 @@
+[package]
+name = "rstreamkit-harness"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+rstreamkit = { path = "../.." }
+wasm-bindgen = "=0.2.128"
+wasm-bindgen-futures = "=0.4.78"
+js-sys = "=0.3.105"
+web-sys = { version = "=0.3.105", features = ["Window", "Document", "HtmlVideoElement", "HtmlMediaElement", "Element", "console"] }
+
+[profile.release]
+opt-level = "s"
+lto = true
+codegen-units = 1
+panic = "abort"

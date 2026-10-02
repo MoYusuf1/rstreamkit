@@ -1,10 +1,11 @@
 //! Sound browsers can't decode: AC-3, E-AC-3 and MPEG audio (MP2). It is decoded here, in Rust, to
 //! PCM and written back as FLAC frames, which every browser plays inside the same fragmented MP4
-//! as the picture, so the two stay in step with no extra machinery. (FLAC because it needs no
-//! encoder: a frame can carry the samples as they are.)
+//! as the picture, so the two stay in step. A small fixed-predictor FLAC encoder reduces buffer
+//! use, retaining verbatim subframes when compression would lose.
 //!
 //! The decoders are the `sound` feature (AC-3 and MP2 are a good quarter of what a browser page
-//! built from this crate weighs). Without it `split` finds no frames, so a stream's sound is reported
+//! built from this crate weighs). Without it compressed AC-3 frames can still pass through on
+//! capable platforms; otherwise a stream's sound is reported
 //! as unsupported instead of played, and everything else, FLAC writing included, is unchanged.
 //!
 //! ponytail: the result is always stereo, 16-bit. Surround is folded down with the usual -3 dB
@@ -12,11 +13,147 @@
 //! channels of 7.1) are skipped.
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum Kind {
     /// AC-3 and E-AC-3; which one is told apart frame by frame.
     Ac3,
     /// MPEG audio layer II (what broadcasters send as "MP2").
     Mpeg,
+}
+
+/// ISO BMFF Dolby configuration derived from an independent AC-3 syncframe.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DolbyConfig {
+    pub enhanced: bool,
+    pub rate: u32,
+    pub channels: u16,
+    pub bytes: Vec<u8>,
+}
+
+/// AC-3 dac3 fields, specified by ETSI TS 102 366 Annex F.
+/// E-AC-3 accepts one independent, six-block substream without mixing metadata; other
+/// layouts retain the PCM fallback. ETSI TS 102 366 Annexes E and F define these fields.
+pub fn dolby_config(frame: &[u8]) -> Option<DolbyConfig> {
+    if frame.len() < 8 || frame[..2] != [0x0b, 0x77] {
+        return None;
+    }
+    let (fscod, frmsizecod, bsid) = (frame[4] >> 6, frame[4] & 63, frame[5] >> 3);
+    if bsid == 16 {
+        return eac3_config(frame);
+    }
+    if fscod == 3 || frmsizecod > 37 || bsid > 10 {
+        return None;
+    }
+    let bsmod = frame[5] & 7;
+    let acmod = frame[6] >> 5;
+    let mut at = 51;
+    if acmod & 1 != 0 && acmod != 1 {
+        at += 2;
+    }
+    if acmod & 4 != 0 {
+        at += 2;
+    }
+    if acmod == 2 {
+        at += 2;
+    }
+    let lfe = (frame.get(at / 8)? >> (7 - at % 8)) & 1;
+    let value = (u32::from(fscod) << 22)
+        | (u32::from(bsid) << 17)
+        | (u32::from(bsmod) << 14)
+        | (u32::from(acmod) << 11)
+        | (u32::from(lfe) << 10)
+        | (u32::from(frmsizecod / 2) << 5);
+    let rate = [48000, 44100, 32000][fscod as usize] >> bsid.saturating_sub(8);
+    Some(DolbyConfig {
+        enhanced: false,
+        rate,
+        channels: u16::from([2, 1, 2, 3, 3, 4, 4, 5][acmod as usize] + lfe),
+        bytes: value.to_be_bytes()[1..].to_vec(),
+    })
+}
+
+fn eac3_config(frame: &[u8]) -> Option<DolbyConfig> {
+    let fscod = frame[4] >> 6;
+    // Dependent substreams, multiple programmes and short syncframes need sample grouping.
+    if frame[2] >> 3 != 0 || fscod == 3 || (frame[4] >> 4) & 3 != 3 {
+        return None;
+    }
+    let acmod = (frame[4] >> 1) & 7;
+    let lfe = frame[4] & 1;
+    let len = ((((frame[2] & 7) as usize) << 8 | frame[3] as usize) + 1) * 2;
+    if frame.len() < len {
+        return None;
+    }
+    let mut at = 45usize; // after the five-bit bsid
+    let mut read = |n: usize| -> Option<u32> {
+        let mut v = 0;
+        for _ in 0..n {
+            v = (v << 1) | u32::from((frame.get(at / 8)? >> (7 - at % 8)) & 1);
+            at += 1;
+        }
+        Some(v)
+    };
+    read(5)?;
+    if read(1)? != 0 {
+        read(8)?;
+    }
+    if acmod == 0 {
+        read(5)?;
+        if read(1)? != 0 {
+            read(8)?;
+        }
+    }
+    if read(1)? != 0 {
+        return None;
+    } // mixing metadata is not parsed by this compact path
+    let bsmod = if read(1)? != 0 { read(3)? } else { 0 };
+    let asvc = u32::from((2..=6).contains(&bsmod) || (bsmod == 7 && acmod == 1));
+    let rate = [48000, 44100, 32000][fscod as usize];
+    let bitrate = (len as u64 * 8 * u64::from(rate) / 1536).div_ceil(1000);
+    if bitrate > 8191 {
+        return None;
+    }
+    let mut bytes = ((bitrate as u16) << 3).to_be_bytes().to_vec();
+    let fields = (u32::from(fscod) << 22)
+        | (16 << 17)
+        | (asvc << 15)
+        | (bsmod << 12)
+        | (u32::from(acmod) << 9)
+        | (u32::from(lfe) << 8);
+    bytes.extend(&fields.to_be_bytes()[1..]);
+    Some(DolbyConfig {
+        enhanced: true,
+        rate,
+        channels: u16::from([2, 1, 2, 3, 3, 4, 4, 5][acmod as usize] + lfe),
+        bytes,
+    })
+}
+
+/// Validate every E-AC-3 syncframe, including dependent substreams omitted by the decoder.
+pub(crate) fn simple_eac3(es: &[u8]) -> bool {
+    let mut at = 0;
+    let mut config = None;
+    while at < es.len() {
+        let Some(header) = es.get(at..at + 8) else {
+            return false;
+        };
+        if header[..2] != [0x0b, 0x77] || header[5] >> 3 != 16 {
+            return false;
+        }
+        let len = ((((header[2] & 7) as usize) << 8 | header[3] as usize) + 1) * 2;
+        let Some(frame) = es.get(at..at + len) else {
+            return false;
+        };
+        let Some(next) = dolby_config(frame) else {
+            return false;
+        };
+        if config.as_ref().is_some_and(|c| c != &next) {
+            return false;
+        }
+        config = Some(next);
+        at += len;
+    }
+    config.is_some()
 }
 
 /// One compressed frame and what it decodes to.
@@ -27,6 +164,65 @@ pub struct Coded<'a> {
     pub samples: u32,
     pub rate: u32,
     pub channels: u8,
+}
+
+fn split_ac3(es: &[u8]) -> Vec<Coded<'_>> {
+    let mut out = vec![];
+    let mut i = 0;
+    while i + 8 <= es.len() {
+        if es[i] != 0x0B || es[i + 1] != 0x77 {
+            i += 1;
+            continue;
+        }
+        let bsid = es[i + 5] >> 3;
+        // (frame bytes, samples per channel, rate, worth decoding)
+        let frame = if bsid <= 10 {
+            dolby_config(&es[i..]).map(|cfg| {
+                let code = es[i + 4] & 63;
+                let kbps = [
+                    32, 40, 48, 56, 64, 80, 96, 112, 128, 160, 192, 224, 256, 320, 384, 448, 512,
+                    576, 640,
+                ][usize::from(code / 2)];
+                let len = match es[i + 4] >> 6 {
+                    0 => kbps * 4,
+                    1 => 2 * (kbps * 96000 / 44100 + usize::from(code & 1)),
+                    _ => kbps * 6,
+                };
+                (len, 1536, cfg.rate, true)
+            })
+        } else {
+            // E-AC-3: strmtyp(2) substreamid(3) frmsiz(11), then fscod(2) and numblkscod(2).
+            let len = ((((es[i + 2] & 7) as usize) << 8 | es[i + 3] as usize) + 1) * 2;
+            let (fscod, second) = (es[i + 4] >> 6, (es[i + 4] >> 4) & 3);
+            let (rate, blocks) = if fscod == 3 {
+                ([24_000, 22_050, 16_000, 0][second as usize], 6)
+            } else {
+                (
+                    [48_000, 44_100, 32_000][fscod as usize],
+                    [1, 2, 3, 6][second as usize],
+                )
+            };
+            // Stream type 1 is a dependent substream: extra channels for a 7.1 decoder.
+            Some((len, 256 * blocks, rate, es[i + 2] >> 6 != 1 && rate != 0))
+        };
+        let Some((len, samples, rate, decode)) = frame else {
+            i += 1;
+            continue;
+        };
+        if len < 8 || i + len > es.len() {
+            break;
+        }
+        if decode {
+            out.push(Coded {
+                data: &es[i..i + len],
+                samples,
+                rate,
+                channels: 2,
+            });
+        }
+        i += len;
+    }
+    out
 }
 
 #[cfg(feature = "sound")]
@@ -40,59 +236,9 @@ mod decode {
     /// Cuts a PES payload into frames. Anything that isn't a frame is stepped over.
     pub fn split(kind: Kind, es: &[u8]) -> Vec<Coded<'_>> {
         match kind {
-            Kind::Ac3 => split_ac3(es),
+            Kind::Ac3 => super::split_ac3(es),
             Kind::Mpeg => split_mpeg(es),
         }
-    }
-
-    fn split_ac3(es: &[u8]) -> Vec<Coded<'_>> {
-        let mut out = vec![];
-        let mut i = 0;
-        while i + 8 <= es.len() {
-            if es[i] != 0x0B || es[i + 1] != 0x77 {
-                i += 1;
-                continue;
-            }
-            let bsid = es[i + 5] >> 3;
-            // (frame bytes, samples per channel, rate, worth decoding)
-            let frame = if bsid <= 10 {
-                match oxideav_ac3::syncinfo::parse(&es[i..]) {
-                    Ok(si) => Some((si.frame_length as usize, 1536, si.sample_rate, true)),
-                    Err(_) => None,
-                }
-            } else {
-                // E-AC-3: strmtyp(2) substreamid(3) frmsiz(11), then fscod(2) and numblkscod(2).
-                let len = ((((es[i + 2] & 7) as usize) << 8 | es[i + 3] as usize) + 1) * 2;
-                let (fscod, second) = (es[i + 4] >> 6, (es[i + 4] >> 4) & 3);
-                let (rate, blocks) = if fscod == 3 {
-                    ([24_000, 22_050, 16_000, 0][second as usize], 6)
-                } else {
-                    (
-                        [48_000, 44_100, 32_000][fscod as usize],
-                        [1, 2, 3, 6][second as usize],
-                    )
-                };
-                // Stream type 1 is a dependent substream: extra channels for a 7.1 decoder.
-                Some((len, 256 * blocks, rate, es[i + 2] >> 6 != 1 && rate != 0))
-            };
-            let Some((len, samples, rate, decode)) = frame else {
-                i += 1;
-                continue;
-            };
-            if len < 8 || i + len > es.len() {
-                break;
-            }
-            if decode {
-                out.push(Coded {
-                    data: &es[i..i + len],
-                    samples,
-                    rate,
-                    channels: 2,
-                });
-            }
-            i += len;
-        }
-        out
     }
 
     fn split_mpeg(es: &[u8]) -> Vec<Coded<'_>> {
@@ -253,7 +399,14 @@ mod decode {
     }
 }
 
-pub use decode::{Decoder, split};
+pub use decode::Decoder;
+/// Split compressed frames independently of the optional PCM decoders.
+pub fn split(kind: Kind, es: &[u8]) -> Vec<Coded<'_>> {
+    match kind {
+        Kind::Ac3 => split_ac3(es),
+        Kind::Mpeg => decode::split(kind, es),
+    }
+}
 
 /// CRC-8 (polynomial 0x07) as FLAC frame headers use it.
 fn crc8(data: &[u8]) -> u8 {
@@ -323,8 +476,8 @@ fn coded_number(n: u32) -> Vec<u8> {
     out
 }
 
-/// One FLAC frame holding stereo 16-bit samples as they are ("verbatim" subframes). `number` counts
-/// the frames of the stream.
+/// One lossless stereo FLAC frame. Fixed predictors and Rice coding are selected by exact bit
+/// cost; incompressible channels fall back to verbatim. See RFC 9639 sections 9.2.5–9.2.7.
 pub fn flac_frame(pcm: &[i16], number: u32) -> Vec<u8> {
     let samples = pcm.len() / 2;
     let block_code: u8 = match samples {
@@ -359,15 +512,108 @@ pub fn flac_frame(pcm: &[i16], number: u32) -> Vec<u8> {
         _ => {}
     }
     frame.push(crc8(&frame));
+    let mut bits = FlacBits {
+        bytes: frame,
+        used: 0,
+    };
     for channel in 0..2 {
-        frame.push(0x02); // subframe header: verbatim, no wasted bits
-        for pair in pcm.as_chunks::<2>().0 {
-            frame.extend(pair[channel].to_be_bytes());
-        }
+        flac_channel(&mut bits, pcm, channel);
     }
+    let mut frame = bits.bytes;
     let crc = crc16(&frame);
     frame.extend(crc.to_be_bytes());
     frame
+}
+
+// MSB-first writer. Channels share the bitstream; only the complete frame is byte padded.
+struct FlacBits {
+    bytes: Vec<u8>,
+    used: u8,
+}
+impl FlacBits {
+    fn put(&mut self, value: u32, mut width: u32) {
+        while width > 0 {
+            if self.used == 0 {
+                self.bytes.push(0);
+            }
+            let n = width.min(u32::from(8 - self.used));
+            width -= n;
+            *self.bytes.last_mut().unwrap() |=
+                (((value >> width) & ((1 << n) - 1)) as u8) << (8 - self.used - n as u8);
+            self.used = (self.used + n as u8) % 8;
+        }
+    }
+    fn zeros(&mut self, mut n: u32) {
+        if self.used != 0 {
+            let take = n.min(u32::from(8 - self.used));
+            self.put(0, take);
+            n -= take;
+        }
+        self.bytes.resize(self.bytes.len() + (n / 8) as usize, 0);
+        self.put(0, n % 8);
+    }
+}
+fn folded(n: i32) -> u32 {
+    ((n as u32) << 1) ^ ((n >> 31) as u32)
+}
+fn flac_channel(bits: &mut FlacBits, pcm: &[i16], channel: usize) {
+    let samples: Vec<i32> = pcm
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .map(|p| i32::from(p[channel]))
+        .collect();
+    if samples.iter().all(|&n| n == samples[0]) {
+        bits.put(0, 8);
+        bits.put(samples[0] as u32, 16);
+        return;
+    }
+    let mut best = (8 + samples.len() * 16, 0, 0, vec![]);
+    for order in 0..=2usize.min(samples.len() - 1) {
+        let residual: Vec<u32> = (order..samples.len())
+            .map(|i| {
+                folded(match order {
+                    0 => samples[i],
+                    1 => samples[i] - samples[i - 1],
+                    _ => samples[i] - 2 * samples[i - 1] + samples[i - 2],
+                })
+            })
+            .collect();
+        // A mean-based estimate limits the search to adjacent parameters. Exact cost still
+        // decides against verbatim, bounding the output even on noise and pathological audio.
+        let mean = residual.iter().map(|&n| u64::from(n)).sum::<u64>() / residual.len() as u64;
+        let estimate = (63 - mean.max(1).leading_zeros()).min(14);
+        for k in estimate.saturating_sub(1)..=(estimate + 1).min(14) {
+            let cost = 8
+                + order * 16
+                + 10
+                + residual
+                    .iter()
+                    .map(|&n| (n >> k) as usize + 1 + k as usize)
+                    .sum::<usize>();
+            if cost < best.0 {
+                best = (cost, order, k, residual.clone());
+            }
+        }
+    }
+    if best.3.is_empty() {
+        bits.put(2, 8);
+        for n in samples {
+            bits.put(n as u32, 16);
+        }
+    } else {
+        bits.put(((8 + best.1) << 1) as u32, 8);
+        for &n in &samples[..best.1] {
+            bits.put(n as u32, 16);
+        }
+        bits.put(0, 6); // Rice method 0, one partition.
+        bits.put(best.2, 4);
+        for n in best.3 {
+            bits.zeros(n >> best.2);
+            bits.put(1, 1);
+            bits.put(n, best.2);
+        }
+    }
 }
 
 /// The FLAC STREAMINFO block (what `dfLa` carries): stereo, 16-bit, any block size.
@@ -413,7 +659,7 @@ mod tests {
         );
         assert_eq!(f[4], 5, "frame number");
         assert_eq!(f[5], crc8(&f[..5]), "header CRC");
-        assert_eq!(f.len(), 6 + 2 * (1 + 1152 * 2) + 2);
+        assert!(f.len() < 6 + 2 * (1 + 1152 * 2) + 2);
         let body = f.len() - 2;
         assert_eq!(
             u16::from_be_bytes([f[body], f[body + 1]]),

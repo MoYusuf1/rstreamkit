@@ -68,7 +68,10 @@ fn ffmpeg_ok() -> bool {
 /// What ffprobe says about the decoded file: complaints from ffmpeg decoding it, then for each
 /// stream (video, audio) its codec, frames read, first timestamp and end timestamp.
 fn decoded(bytes: &[u8], name: &str) -> (String, Vec<(String, u32, f64, f64)>) {
-    let path = std::env::temp_dir().join(format!("rstreamkit-{name}-{}.mp4", std::process::id()));
+    static NEXT_FILE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let id = NEXT_FILE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let path =
+        std::env::temp_dir().join(format!("rstreamkit-{name}-{}-{id}.mp4", std::process::id()));
     std::fs::write(&path, bytes).unwrap();
     let decode = Command::new("ffmpeg")
         .args(["-v", "error", "-i"])

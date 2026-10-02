@@ -1,8 +1,7 @@
 //! Browser side: fetch HLS playlists and segments (through a [`Fetch`]), transmux them, and feed a
 //! `<video>` element through MediaSource. Live playlists are refreshed until stopped.
 //!
-//! ponytail: `SourceBuffer.updating` is polled every few ms instead of awaiting events, and
-//! failed downloads are retried a fixed number of times. Both are simple and good enough.
+//! Buffer updates await browser events; dropping a player cancels its pending work.
 
 use std::{
     cell::{Cell, RefCell},
@@ -21,18 +20,14 @@ use web_sys::{
     Request, RequestInit, Response as WebResponse, SourceBuffer,
 };
 
+use crate::cancel::cancellable;
+
 use crate::{
     Segment, Transmuxer, Unsupported,
     body::{self, Capped},
     hls,
 };
 
-/// Start a live stream this many segments back from the newest one.
-const LIVE_BACKLOG: usize = 3;
-/// Don't download more than this many seconds ahead of the playhead.
-const AHEAD: f64 = 30.0;
-/// Free buffered media older than this many seconds behind the playhead.
-const KEEP_BEHIND: f64 = 30.0;
 /// A playlist is a few kilobytes. Anything bigger is a stream that isn't a playlist at all, and is
 /// refused once it passes this.
 const PLAYLIST_LIMIT: usize = 2 << 20;
@@ -43,6 +38,10 @@ const SEGMENT_LIMIT: usize = 64 << 20;
 #[non_exhaustive]
 pub enum Status {
     Playing,
+    Buffering,
+    Reconnecting {
+        attempt: u32,
+    },
     /// Something the viewer should know but playback continues (e.g. audio codec unsupported).
     Note(String),
     /// The stream can't be played as it is, and why. What to do about it (say so, play without the
@@ -106,12 +105,100 @@ impl From<Failure> for String {
 
 /// Stops playback when dropped.
 pub struct Player {
+    video: HtmlVideoElement,
+    stats: Rc<RefCell<Stats>>,
+    go_live: Rc<Cell<bool>>,
+    variant: Rc<RefCell<Option<String>>>,
+    audio: Rc<RefCell<Option<String>>>,
     stop: Rc<Cell<bool>>,
+    wake: Rc<RefCell<Option<std::task::Waker>>>,
+    paused_at: Cell<Option<f64>>,
+}
+
+/// Snapshot of playback measurements. Buffer memory is an estimate from appended bytes.
+#[derive(Clone, Debug, Default)]
+pub struct Stats {
+    pub buffered_seconds: f64,
+    pub latency_seconds: f64,
+    pub bitrate: f64,
+    pub dropped_segments: u64,
+    pub current_variant: Option<String>,
+    pub variants: Vec<String>,
+    /// Current server playlist span; zero for finite media.
+    pub live_window_seconds: f64,
+}
+
+impl Player {
+    pub fn stop(&self) {
+        self.stop.set(true);
+        if let Some(wake) = self.wake.borrow_mut().take() {
+            wake.wake();
+        }
+    }
+    pub fn pause(&self) {
+        if !self.stop.get() {
+            if self.paused_at.get().is_none() {
+                self.paused_at.set(Some(js_sys::Date::now() / 1000.0));
+            }
+            let _ = self.video.pause();
+        }
+    }
+    pub fn resume(&self) {
+        if !self.stop.get() {
+            if let Some(paused) = self.paused_at.take() {
+                let window = self.stats.borrow().live_window_seconds;
+                if window > 0.0 && js_sys::Date::now() / 1000.0 - paused > window {
+                    self.go_live.set(true);
+                }
+            }
+            let _ = self.video.play();
+        }
+    }
+    pub fn seek(&self, seconds: f64) {
+        if !self.stop.get() && seconds.is_finite() && seconds >= 0.0 {
+            self.video.set_current_time(seconds);
+        }
+    }
+    /// Ask the downloader to refresh before jumping to the newest buffered media.
+    pub fn go_live(&self) {
+        if !self.stop.get() {
+            self.go_live.set(true);
+        }
+    }
+    /// Lock a variant by its master-playlist URI; `None` restores adaptation.
+    pub fn set_variant(&self, uri: Option<&str>) -> Result<(), String> {
+        if self.stop.get() {
+            return Err("player stopped".into());
+        }
+        if let Some(uri) = uri
+            && !self.stats.borrow().variants.iter().any(|v| v == uri)
+        {
+            return Err("variant is not in the master playlist".into());
+        }
+        *self.variant.borrow_mut() = uri.map(str::to_owned);
+        Ok(())
+    }
+    /// Select an ISO 639 PMT audio language on the next segment.
+    pub fn set_audio_track(&self, language: &str) -> Result<(), String> {
+        if language.len() != 3 || !language.bytes().all(|b| b.is_ascii_alphabetic()) {
+            return Err("expected a three-letter ISO 639 language".into());
+        }
+        if self.stop.get() {
+            return Err("player stopped".into());
+        }
+        *self.audio.borrow_mut() = Some(language.to_ascii_lowercase());
+        Ok(())
+    }
+    pub fn stats(&self) -> Stats {
+        let mut stats = self.stats.borrow().clone();
+        stats.buffered_seconds = buffered_ahead(&self.video);
+        stats
+    }
 }
 
 impl Drop for Player {
     fn drop(&mut self) {
-        self.stop.set(true);
+        self.stop();
     }
 }
 
@@ -128,27 +215,55 @@ pub fn start(
     decode_sound: bool,
     report: impl FnMut(Status) + 'static,
 ) -> Player {
+    let player_video = video.clone();
+    let stats = Rc::new(RefCell::new(Stats::default()));
+    let shared_stats = stats.clone();
+    let go_live = Rc::new(Cell::new(false));
+    let live_request = go_live.clone();
+    let variant = Rc::new(RefCell::new(None));
+    let variant_request = variant.clone();
+    let audio = Rc::new(RefCell::new(None));
+    let audio_request = audio.clone();
     let stop = Rc::new(Cell::new(false));
     let stopped = stop.clone();
+    let wake = Rc::new(RefCell::new(None));
+    let waking = wake.clone();
     let mut report = report;
     wasm_bindgen_futures::spawn_local(async move {
-        match run(
-            &video,
-            playlist,
-            &http,
-            partial,
-            decode_sound,
+        match cancellable(
             &stopped,
-            &mut report,
+            &waking,
+            run(
+                &video,
+                playlist,
+                &http,
+                partial,
+                decode_sound,
+                &stopped,
+                &shared_stats,
+                &live_request,
+                &variant_request,
+                &audio_request,
+                &mut report,
+            ),
         )
         .await
         {
-            Ok(()) if !stopped.get() => report(Status::Ended),
-            Err(e) if !stopped.get() => report(e.into()),
+            Some(Ok(())) if !stopped.get() => report(Status::Ended),
+            Some(Err(e)) if !stopped.get() => report(e.into()),
             _ => {}
         }
     });
-    Player { stop }
+    Player {
+        video: player_video,
+        stats,
+        go_live,
+        variant,
+        audio,
+        stop,
+        wake,
+        paused_at: Cell::new(None),
+    }
 }
 
 fn js_err(e: JsValue) -> String {
@@ -192,51 +307,25 @@ pub fn plays_hls_natively() -> bool {
 
 /// Resolves after `d`, via the browser's timer.
 pub async fn sleep(d: Duration) {
-    let p = js_sys::Promise::new(&mut |resolve, _| {
-        if let Some(w) = web_sys::window() {
-            let _ = w.set_timeout_with_callback_and_timeout_and_arguments_0(
-                &resolve,
-                d.as_millis() as i32,
-            );
+    let p = js_sys::Promise::new(&mut |resolve, reject| {
+        let global = js_sys::global();
+        let result = js_sys::Reflect::get(&global, &"setTimeout".into())
+            .and_then(|f| f.dyn_into::<js_sys::Function>())
+            .and_then(|f| {
+                f.call2(
+                    &global,
+                    &resolve,
+                    &(d.as_millis().min(i32::MAX as u128) as i32).into(),
+                )
+            });
+        if let Err(e) = result {
+            let _ = reject.call1(&JsValue::UNDEFINED, &e);
         }
     });
     let _ = JsFuture::from(p).await;
 }
 
-/// How the player reaches the network. The app supplies it, so rstreamkit knows nothing about proxies,
-/// credentials or headers: [`Direct`] is the plain case, and an app that has to go through a proxy
-/// implements this for it. Dropping the future or the [`Response::body`] cancels the request.
-// Not `Send` on purpose: this only ever runs on the browser's one thread.
-#[allow(async_fn_in_trait)]
-pub trait Fetch {
-    /// GETs `url`, which is always the real address; with a `range` (never empty), only those bytes
-    /// of it, as an HTTP `Range` request. `Ok` means a response came back, whatever its status;
-    /// `Err` is for when it didn't, or when the app itself refuses or can't make the request.
-    async fn get(&self, url: &str, range: Option<Range<u64>>) -> Result<Response, FetchError>;
-}
-
-pub struct Response {
-    pub status: u16,
-    /// Where the request ended up after redirects: relative playlist entries resolve against it.
-    pub url: String,
-    pub content_type: String,
-    pub content_length: Option<u64>,
-    /// For a range request the server answered with 206: the whole file's length, from `Content-Range`.
-    pub range_total: Option<u64>,
-    pub body: Body,
-}
-
-/// A response body, chunk by chunk (the player stops reading one that grows past its limit).
-pub type Body = Pin<Box<dyn Stream<Item = Result<Vec<u8>, String>>>>;
-
-#[derive(Debug, Clone, PartialEq)]
-#[non_exhaustive]
-pub enum FetchError {
-    /// Might go away: a network error, a server that is down.
-    Temporary(String),
-    /// Won't get better by asking again: a refusal, or a proxy that doesn't answer as expected.
-    Permanent(String),
-}
+pub use crate::net::{Body, Fetch, FetchError, Response};
 
 /// Fetches with the browser's own `fetch`, straight from the server, which therefore has to allow it
 /// (CORS; and for byte ranges, `Access-Control-Expose-Headers: Content-Range`). Good for a server you
@@ -255,7 +344,9 @@ impl Fetch for Direct {
                 .set("Range", &format!("bytes={}-{}", r.start, r.end - 1))
                 .map_err(failed)?;
         }
+        let abort = RequestAbort(web_sys::AbortController::new().map_err(failed)?);
         let init = RequestInit::new();
+        init.set_signal(Some(&abort.0.signal()));
         init.set_headers(&headers);
         let request = Request::new_with_str_and_init(url, &init).map_err(failed)?;
         // `fetch` is on the global object, in a page or in a worker alike.
@@ -287,6 +378,7 @@ impl Fetch for Direct {
             range_total: header("content-range")
                 .and_then(|v| v.rsplit('/').next().and_then(|t| t.parse().ok())),
             body: Box::pin(Chunks {
+                _abort: abort,
                 reader: response.body().map(|b| {
                     b.get_reader()
                         .unchecked_into::<ReadableStreamDefaultReader>()
@@ -297,8 +389,17 @@ impl Fetch for Direct {
     }
 }
 
+// Aborts a fetch if its future is dropped before response headers arrive.
+struct RequestAbort(web_sys::AbortController);
+impl Drop for RequestAbort {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
 /// The body of a `fetch` response, read chunk by chunk. Dropping it cancels the download.
 struct Chunks {
+    _abort: RequestAbort,
     reader: Option<ReadableStreamDefaultReader>,
     pending: Option<JsFuture>,
 }
@@ -367,15 +468,19 @@ impl From<FetchError> for Fail {
     }
 }
 
-/// Runs `once` up to three times, a second apart, until it works or fails for good.
+/// Retries transient failures with bounded exponential backoff.
 async fn with_retries<T, F: Future<Output = Result<T, Fail>>>(
     stop: &Cell<bool>,
     mut once: impl FnMut() -> F,
+    report: &mut dyn FnMut(Status),
 ) -> Result<T, Failure> {
     let mut last = String::new();
-    for attempt in 0..3 {
-        if attempt > 0 {
-            sleep(Duration::from_secs(1)).await;
+    for attempt in 0..7 {
+        if attempt > 0 && !stop.get() {
+            report(Status::Reconnecting { attempt });
+        }
+        if let Some(delay) = crate::live::retry_delay(attempt) {
+            sleep(Duration::from_secs(delay)).await;
         }
         if stop.get() {
             break;
@@ -392,8 +497,22 @@ async fn with_retries<T, F: Future<Output = Result<T, Fail>>>(
 }
 
 async fn fetch_once(http: &impl Fetch, url: &str, limit: usize) -> Result<Fetched, Fail> {
+    fetch_resource(http, url, None, limit).await
+}
+async fn fetch_resource(
+    http: &impl Fetch,
+    url: &str,
+    range: Option<Range<u64>>,
+    limit: usize,
+) -> Result<Fetched, Fail> {
     let host = host_of(url);
-    let r = http.get(url, None).await?;
+    let r = http.get(url, range.clone()).await?;
+    if range.is_some() && r.status != 206 {
+        return Err(Fail::Final("server did not honor HLS byte range".into()));
+    }
+    if matches!(r.status, 404 | 410) {
+        return Err(Fail::Final(format!("{host} answered HTTP {}", r.status)));
+    }
     if !(200..300).contains(&r.status) {
         return Err(Fail::Retry(format!("{host} answered HTTP {}", r.status)));
     }
@@ -429,51 +548,223 @@ async fn fetch(
     url: &str,
     limit: usize,
     stop: &Cell<bool>,
+    report: &mut dyn FnMut(Status),
 ) -> Result<Fetched, Failure> {
-    with_retries(stop, || fetch_once(http, url, limit)).await
+    with_retries(stop, || fetch_once(http, url, limit), report).await
+}
+
+#[derive(Default)]
+struct Format {
+    cmaf: crate::cmaf::Rebaser,
+    map: Option<(String, hls::Map, Option<hls::Key>)>,
+}
+
+async fn decrypt(bytes: &[u8], key: &[u8], iv: &[u8; 16]) -> Result<Vec<u8>, Fail> {
+    if key.len() != 16 {
+        return Err(Fail::Final("AES-128 key must contain 16 bytes".into()));
+    }
+    let inner = async {
+        let global = js_sys::global();
+        let crypto = js_sys::Reflect::get(&global, &"crypto".into())?;
+        let subtle = js_sys::Reflect::get(&crypto, &"subtle".into())?;
+        let import =
+            js_sys::Reflect::get(&subtle, &"importKey".into())?.dyn_into::<js_sys::Function>()?;
+        let usages = js_sys::Array::new();
+        usages.push(&"decrypt".into());
+        let key = JsFuture::from(
+            import
+                .call5(
+                    &subtle,
+                    &"raw".into(),
+                    &js_sys::Uint8Array::from(key),
+                    &"AES-CBC".into(),
+                    &false.into(),
+                    &usages,
+                )?
+                .dyn_into::<js_sys::Promise>()?,
+        )
+        .await?;
+        let algorithm = js_sys::Object::new();
+        js_sys::Reflect::set(&algorithm, &"name".into(), &"AES-CBC".into())?;
+        js_sys::Reflect::set(&algorithm, &"iv".into(), &js_sys::Uint8Array::from(&iv[..]))?;
+        let decrypt =
+            js_sys::Reflect::get(&subtle, &"decrypt".into())?.dyn_into::<js_sys::Function>()?;
+        let plain = JsFuture::from(
+            decrypt
+                .call3(&subtle, &algorithm, &key, &js_sys::Uint8Array::from(bytes))?
+                .dyn_into::<js_sys::Promise>()?,
+        )
+        .await?;
+        Ok::<_, JsValue>(js_sys::Uint8Array::new(&plain).to_vec())
+    };
+    inner
+        .await
+        .map_err(|e| Fail::Final(format!("HLS AES-CBC decryption failed: {}", js_err(e))))
 }
 
 /// A segment, downloaded straight into the transmuxer as it arrives, so no copy of it is ever held
 /// whole. A download that fails part way is tried again from the start, into a fresh segment.
+#[allow(clippy::too_many_arguments)]
 async fn fetch_segment(
     http: &impl Fetch,
     url: &str,
     limit: usize,
     stop: &Cell<bool>,
     tx: &RefCell<Transmuxer>,
+    info: &hls::Segment,
+    base: &str,
+    format: &RefCell<Format>,
+    report: &mut dyn FnMut(Status),
 ) -> Result<crate::Output, Failure> {
-    with_retries(stop, || fetch_segment_once(http, url, limit, tx)).await
+    with_retries(
+        stop,
+        || fetch_segment_once(http, url, limit, tx, info, base, format),
+        report,
+    )
+    .await
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn fetch_segment_once(
     http: &impl Fetch,
     url: &str,
     limit: usize,
     tx: &RefCell<Transmuxer>,
+    info: &hls::Segment,
+    base: &str,
+    format: &RefCell<Format>,
 ) -> Result<crate::Output, Fail> {
-    let host = host_of(url);
-    let r = http.get(url, None).await?;
-    if !(200..300).contains(&r.status) {
-        return Err(Fail::Retry(format!("{host} answered HTTP {}", r.status)));
+    if info.key.is_some() || info.byte_range.is_some() || info.map.is_some() {
+        let mut fetched = fetch_resource(http, url, info.byte_range.clone(), limit).await?;
+        if let Some(key) = &info.key {
+            let key_url = resolve(base, &key.uri).map_err(Fail::Final)?;
+            let key_bytes = fetch_resource(http, &key_url, None, 16).await?.body;
+            fetched.body = decrypt(&fetched.body, &key_bytes, &key.iv_for(info.seq)).await?;
+        }
+        if let Some(map) = &info.map {
+            let mut init = None;
+            let map_url = resolve(base, &map.uri).map_err(Fail::Final)?;
+            let identity = (map_url.clone(), map.clone(), info.key.clone());
+            if format.borrow().map.as_ref() != Some(&identity) {
+                let mut bytes = fetch_resource(http, &map_url, map.byte_range.clone(), 4 << 20)
+                    .await?
+                    .body;
+                if let Some(key) = &info.key {
+                    let iv = key.iv.ok_or_else(|| {
+                        Fail::Final("encrypted initialization needs explicit IV".into())
+                    })?;
+                    let key_url = resolve(base, &key.uri).map_err(Fail::Final)?;
+                    let key_bytes = fetch_resource(http, &key_url, None, 16).await?.body;
+                    bytes = decrypt(&bytes, &key_bytes, &iv).await?;
+                }
+                let mime = format
+                    .borrow_mut()
+                    .cmaf
+                    .init(&bytes)
+                    .map_err(|e| Fail::Final(e.to_string()))?;
+                format.borrow_mut().map = Some(identity);
+                init = Some(crate::Init {
+                    bytes,
+                    mime,
+                    interlaced: false,
+                });
+            }
+            format
+                .borrow_mut()
+                .cmaf
+                .fragment(&mut fetched.body, info.duration)
+                .map_err(|e| Fail::Final(e.to_string()))?;
+            return Ok(crate::Output {
+                init,
+                fragments: vec![crate::Fragment {
+                    moof: vec![],
+                    mdat: fetched.body,
+                }],
+                skipped_audio: None,
+            });
+        }
+        let mut segment = tx.borrow().segment(fetched.body.len());
+        segment.feed(&fetched.body);
+        return finish_segment(tx, segment).await.map_err(|e| match e {
+            Failure::Unsupported(why) => Fail::Unsupported(why),
+            Failure::Other(why) => Fail::Final(why),
+        });
     }
-    if r.content_length.is_some_and(|n| n > limit as u64) {
-        return Err(Fail::Final(too_big(&host, limit)));
-    }
-    // What the server says it will send, never trusted beyond the limit, is allocated once.
-    let mut segment = Segment::new(r.content_length.map_or(0, |n| (n as usize).min(limit)));
-    body::read_each(r.body, limit, |chunk| segment.feed(chunk))
+    let language = tx.borrow().audio_language.clone();
+    let segment = download_segment(http, url, limit, language).await?;
+    finish_segment(tx, segment).await.map_err(|e| match e {
+        Failure::Unsupported(why) => Fail::Unsupported(why),
+        Failure::Other(e) => Fail::Final(e),
+    })
+}
+
+async fn finish_segment(
+    tx: &RefCell<Transmuxer>,
+    segment: Segment,
+) -> Result<crate::Output, Failure> {
+    let mut transmuxer = std::mem::take(&mut *tx.borrow_mut());
+    let result = transmuxer
+        .finish_yielded(segment)
         .await
-        .map_err(|e| match e {
-            // Reading it again would only read it all again.
-            Capped::TooBig => Fail::Final(too_big(&host, limit)),
-            Capped::Failed(why) => Fail::Retry(format!("download from {host} failed: {why}")),
-        })?;
-    tx.borrow_mut()
-        .finish(segment)
-        .map_err(|e| match e.unsupported() {
-            Some(why) => Fail::Unsupported(why),
-            None => Fail::Final(e.to_string()),
-        })
+        .map_err(Failure::from);
+    *tx.borrow_mut() = transmuxer;
+    result
+}
+
+async fn download_segment(
+    http: &impl Fetch,
+    url: &str,
+    limit: usize,
+    language: Option<String>,
+) -> Result<Segment, Fail> {
+    crate::net::download_segment(http, url, limit, language.as_deref())
+        .await
+        .map_err(Fail::from)
+}
+
+// One speculative download, polled alongside browser appends. No decoded state is changed
+// until the caller consumes it, and dropping it cancels the reader/request.
+type DownloadFuture<'a> = Pin<Box<dyn Future<Output = Result<Segment, Fail>> + 'a>>;
+struct Prefetch<'a> {
+    uri: String,
+    future: Option<DownloadFuture<'a>>,
+    ready: Option<Result<Segment, Fail>>,
+    started: f64,
+    seconds: Option<f64>,
+}
+async fn with_prefetch<T>(
+    future: impl Future<Output = T>,
+    prefetch: &mut Option<Prefetch<'_>>,
+) -> T {
+    let mut future = std::pin::pin!(future);
+    std::future::poll_fn(|cx| {
+        if let Some(p) = prefetch
+            && let Some(f) = p.future.as_mut()
+            && let Poll::Ready(value) = f.as_mut().poll(cx)
+        {
+            p.future = None;
+            p.ready = Some(value);
+            p.seconds = Some((js_sys::Date::now() / 1000.0 - p.started).max(0.001));
+        }
+        future.as_mut().poll(cx)
+    })
+    .await
+}
+
+struct BrowserSink<'a, 'b, 'c> {
+    video: &'a HtmlVideoElement,
+    buffer: &'a SourceBuffer,
+    ms: &'a MediaSource,
+    prefetch: &'b mut Option<Prefetch<'c>>,
+}
+impl crate::net::Sink for BrowserSink<'_, '_, '_> {
+    async fn append(&mut self, bytes: &mut [u8]) -> Result<(), String> {
+        with_prefetch(
+            append(self.video, self.buffer, self.ms, bytes),
+            self.prefetch,
+        )
+        .await
+    }
 }
 
 fn too_big(host: &str, limit: usize) -> String {
@@ -520,34 +811,90 @@ fn buffered_ahead(video: &HtmlVideoElement) -> f64 {
     }
 }
 
-/// Resolves when the buffer has finished what it was doing: the browser says so (`updateend`, which
-/// follows success, error and abort alike), so nothing has to ask every few milliseconds.
-async fn wait_idle(sb: &SourceBuffer) {
-    if !sb.updating() {
+fn cross_live_gap(video: &HtmlVideoElement, target: f64) {
+    if video.paused() {
         return;
     }
-    let done = js_sys::Promise::new(&mut |resolve, _| {
-        let resolve_once = Closure::once_into_js(move || {
-            let _ = resolve.call0(&JsValue::UNDEFINED);
+    let b = video.buffered();
+    let ranges: Vec<_> = (0..b.length())
+        .filter_map(|i| Some((b.start(i).ok()?, b.end(i).ok()?)))
+        .collect();
+    if let Some(start) =
+        crate::live::gap_target(&ranges, video.current_time(), target.max(1.0) * 2.0)
+    {
+        video.set_current_time(start);
+    }
+}
+
+/// Resolves when the buffer has finished what it was doing: the browser says so (`updateend`, which
+/// follows success, error and abort alike), so nothing has to ask every few milliseconds.
+async fn wait_idle(sb: &SourceBuffer, ms: &MediaSource) -> Result<(), String> {
+    loop {
+        if ms.ready_state() == MediaSourceReadyState::Closed {
+            return Err("the media source closed".into());
+        }
+        sb.buffered().map_err(js_err)?;
+        if !sb.updating() {
+            return Ok(());
+        }
+        let mut listener = None;
+        let done = js_sys::Promise::new(&mut |resolve, _| {
+            let callback = Closure::<dyn FnMut()>::new(move || {
+                let _ = resolve.call0(&JsValue::UNDEFINED);
+            });
+            sb.set_onupdateend(Some(callback.as_ref().unchecked_ref()));
+            ms.set_onsourceclose(Some(callback.as_ref().unchecked_ref()));
+            ms.set_onsourceended(Some(callback.as_ref().unchecked_ref()));
+            ms.source_buffers()
+                .set_onremovesourcebuffer(Some(callback.as_ref().unchecked_ref()));
+            listener = Some(callback);
         });
-        sb.set_onupdateend(Some(resolve_once.unchecked_ref()));
-    });
-    let _ = JsFuture::from(done).await;
+        // Clear handlers even when the player is dropped during the await.
+        struct Listener<'a>(
+            &'a SourceBuffer,
+            &'a MediaSource,
+            Option<Closure<dyn FnMut()>>,
+        );
+        impl Drop for Listener<'_> {
+            fn drop(&mut self) {
+                self.0.set_onupdateend(None);
+                self.1.set_onsourceclose(None);
+                self.1.set_onsourceended(None);
+                self.1.source_buffers().set_onremovesourcebuffer(None);
+                self.2.take();
+            }
+        }
+        let _listener = Listener(sb, ms, listener);
+        let _ = JsFuture::from(done).await;
+        if ms.ready_state() != MediaSourceReadyState::Open {
+            return Err("the media source closed".into());
+        }
+        sb.buffered().map_err(js_err)?; // Removed buffers throw even if the source is open.
+        if !sb.updating() {
+            return Ok(());
+        }
+    }
 }
 
 /// Drops buffered media far behind the playhead so a long live session doesn't fill memory.
-async fn trim(video: &HtmlVideoElement, sb: &SourceBuffer, keep: f64) {
-    wait_idle(sb).await;
-    let Ok(b) = sb.buffered() else { return };
+async fn trim(
+    video: &HtmlVideoElement,
+    sb: &SourceBuffer,
+    ms: &MediaSource,
+    keep: f64,
+) -> Result<(), String> {
+    wait_idle(sb, ms).await?;
+    let b = sb.buffered().map_err(js_err)?;
     if b.length() == 0 {
-        return;
+        return Ok(());
     }
-    let Ok(start) = b.start(0) else { return };
+    let start = b.start(0).map_err(js_err)?;
     let cut = video.current_time() - keep;
     if cut - start > 1.0 {
         let _ = sb.remove(start, cut);
-        wait_idle(sb).await;
+        wait_idle(sb, ms).await?;
     }
+    Ok(())
 }
 
 /// Hands `bytes` to the browser, which copies what it needs before returning: they are lent as a
@@ -555,16 +902,17 @@ async fn trim(video: &HtmlVideoElement, sb: &SourceBuffer, keep: f64) {
 async fn append(
     video: &HtmlVideoElement,
     sb: &SourceBuffer,
+    ms: &MediaSource,
     bytes: &mut [u8],
 ) -> Result<(), String> {
-    wait_idle(sb).await;
+    wait_idle(sb, ms).await?;
     if let Err(e) = sb.append_buffer_with_u8_array(bytes) {
         // Out of room: free everything old and try once more.
-        trim(video, sb, 5.0).await;
+        trim(video, sb, ms, 5.0).await?;
         sb.append_buffer_with_u8_array(bytes)
             .map_err(|_| js_err(e))?;
     }
-    wait_idle(sb).await;
+    wait_idle(sb, ms).await?;
     Ok(())
 }
 
@@ -576,6 +924,7 @@ impl Drop for ObjectUrl {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run(
     video: &HtmlVideoElement,
     playlist: String,
@@ -583,30 +932,60 @@ async fn run(
     partial: bool,
     decode_sound: bool,
     stop: &Cell<bool>,
+    stats: &RefCell<Stats>,
+    go_live: &Cell<bool>,
+    variant_request: &RefCell<Option<String>>,
+    audio_request: &RefCell<Option<String>>,
     report: &mut dyn FnMut(Status),
 ) -> Result<(), Failure> {
     // Never report after the viewer left: the UI state behind the callback may be gone.
+    let mut last_state = None;
     let mut say = |s: Status| {
         if !stop.get() {
+            if !matches!(s, Status::Note(_)) {
+                if last_state.as_ref() == Some(&s) {
+                    return;
+                }
+                last_state = Some(s.clone());
+            }
             report(s)
         }
     };
 
     // A master playlist points at variants; pick one and follow it. `media_url` is what we refresh.
-    let first = fetch(http, &playlist, PLAYLIST_LIMIT, stop).await?;
-    let (media_url, mut latest) = match hls::parse(&first.body).map_err(|e| describe(&first, e))? {
-        hls::Parsed::Media(_) => (playlist, first),
-        hls::Parsed::Master(variants) => {
-            let v = hls::pick_variant(&variants).ok_or("the playlist lists no streams")?;
-            let url = resolve(&first.url, &v.uri)?;
-            let f = fetch(http, &url, PLAYLIST_LIMIT, stop).await?;
-            (url, f)
+    say(Status::Buffering);
+    let first = match fetch(http, &playlist, PLAYLIST_LIMIT, stop, &mut say).await {
+        Err(Failure::Unsupported(Unsupported::RawStream)) => {
+            return run_ts(video, &playlist, http, partial, decode_sound, stop, report).await;
         }
+        result => result?,
     };
+    let (mut media_url, mut latest, master_base, variants, mut variant_uri, mut audio_url) =
+        match hls::parse(&first.body).map_err(|e| describe(&first, e))? {
+            hls::Parsed::Media(_) => (playlist, first, None, vec![], String::new(), None),
+            hls::Parsed::Master(variants) => {
+                let v = hls::pick_variant(&variants).ok_or("the playlist lists no streams")?;
+                let variant_uri = v.uri.clone();
+                let audio_url = v
+                    .renditions
+                    .iter()
+                    .filter(|r| r.uri.is_some())
+                    .max_by_key(|r| r.default)
+                    .and_then(|r| r.uri.as_deref())
+                    .map(|uri| resolve(&first.url, uri))
+                    .transpose()?;
+                let url = resolve(&first.url, &v.uri)?;
+                let f = fetch(http, &url, PLAYLIST_LIMIT, stop, &mut say).await?;
+                (url, f, Some(first.url), variants, variant_uri, audio_url)
+            }
+        };
+    stats.borrow_mut().variants = variants.iter().map(|v| v.uri.clone()).collect();
+    let mut abr = crate::live::Abr::default();
     let mut media = parse_media(&latest)?;
 
-    let ms = MediaSource::new().map_err(js_err)?;
-    let object_url = ObjectUrl(web_sys::Url::create_object_url_with_source(&ms).map_err(js_err)?);
+    let mut ms = MediaSource::new().map_err(js_err)?;
+    let mut object_url =
+        ObjectUrl(web_sys::Url::create_object_url_with_source(&ms).map_err(js_err)?);
     video.set_src(&object_url.0);
     for _ in 0..500 {
         if ms.ready_state() == MediaSourceReadyState::Open {
@@ -619,35 +998,156 @@ async fn run(
     }
 
     let tx = RefCell::new(Transmuxer::default().decode_sound(decode_sound));
+    let format = RefCell::new(Format::default());
     let mut sb: Option<SourceBuffer> = None;
-    let mut next_seq: Option<u64> = None;
+    let mut window = crate::live::Window::default();
+    let mut bytes_per_second = 0.0;
     let mut started = false;
     let mut warned_audio = false;
+    let mut frontier = 0.0;
+    let mut jump_requested = false;
+    let mut prefetch: Option<Prefetch<'_>> = None;
+    let mut selected_audio = None;
+    let mut audio_state = RenditionState::default();
+    let mut video_init: Option<crate::Init> = None;
 
     loop {
-        if next_seq.is_none_or(|n| media.segments.last().is_some_and(|l| l.seq + 1 < n)) {
-            // First pass, or the server restarted its numbering: (re)start near the live edge.
-            let from = if media.ended {
-                0
-            } else {
-                media.segments.len().saturating_sub(LIVE_BACKLOG)
-            };
-            next_seq = media.segments.get(from).map(|s| s.seq);
+        let wanted_audio = audio_request.borrow().clone();
+        if selected_audio != wanted_audio {
+            prefetch = None;
+            selected_audio = wanted_audio;
+            let mut current = tx.borrow_mut();
+            current.audio_language = selected_audio.clone();
+            if let (Some(base), Some(language)) = (&master_base, &selected_audio)
+                && let Some(r) = variants
+                    .iter()
+                    .find(|v| v.uri == variant_uri)
+                    .and_then(|v| {
+                        v.renditions
+                            .iter()
+                            .find(|r| r.language.as_deref() == Some(language))
+                    })
+                && let Some(uri) = &r.uri
+            {
+                audio_url = Some(resolve(base, uri)?);
+                audio_state = RenditionState::default();
+            }
         }
-
-        let from_seq = next_seq.unwrap_or(0);
-        for seg in media.segments.iter().filter(|s| s.seq >= from_seq) {
-            while buffered_ahead(video) > AHEAD && !stop.get() {
-                sleep(Duration::from_millis(500)).await;
+        if go_live.replace(false) {
+            latest = fetch(http, &media_url, PLAYLIST_LIMIT, stop, &mut say).await?;
+            media = parse_media(&latest)?;
+            window = crate::live::Window::default();
+            jump_requested = true;
+        }
+        // Refresh after throttling: old playlist entries may have expired during a pause.
+        let (ahead, _) = crate::live::buffer_limits(bytes_per_second, media.target_duration);
+        let mut throttled = false;
+        while buffered_ahead(video) > ahead {
+            if go_live.get() {
+                throttled = true;
+                break;
             }
-            if stop.get() {
-                return Ok(());
+            cross_live_gap(video, media.target_duration);
+            throttled = true;
+            sleep(Duration::from_millis(250)).await;
+        }
+        if throttled && !media.ended {
+            prefetch = None;
+            latest = fetch(http, &media_url, PLAYLIST_LIMIT, stop, &mut say).await?;
+            media = parse_media(&latest)?;
+            if go_live.replace(false) {
+                window = crate::live::Window::default();
+                jump_requested = true;
             }
+        }
+        while let Some(seg) = window.next(&media) {
             let url = resolve(&latest.url, &seg.uri)?;
-            let mut out = fetch_segment(http, &url, SEGMENT_LIMIT, stop, &tx).await?;
+            let fetch_started = js_sys::Date::now() / 1000.0;
+            if seg.discontinuity || window.discontinuous(seg) {
+                tx.borrow_mut().discontinuity();
+            }
+            let mut download_seconds = None;
+            let speculative = prefetch.as_ref().is_some_and(|p| p.uri == seg.uri);
+            let fetched = if prefetch.as_ref().is_some_and(|p| p.uri == seg.uri) {
+                let mut pending = prefetch.take().unwrap();
+                let downloaded = match pending.ready.take() {
+                    Some(value) => value,
+                    None => pending.future.take().unwrap().await,
+                };
+                download_seconds = pending
+                    .seconds
+                    .or_else(|| Some((js_sys::Date::now() / 1000.0 - pending.started).max(0.001)));
+                match downloaded {
+                    Ok(segment) => finish_segment(&tx, segment).await,
+                    Err(_) => {
+                        fetch_segment(
+                            http,
+                            &url,
+                            SEGMENT_LIMIT,
+                            stop,
+                            &tx,
+                            seg,
+                            &latest.url,
+                            &format,
+                            &mut say,
+                        )
+                        .await
+                    }
+                }
+            } else {
+                prefetch = None;
+                fetch_segment(
+                    http,
+                    &url,
+                    SEGMENT_LIMIT,
+                    stop,
+                    &tx,
+                    seg,
+                    &latest.url,
+                    &format,
+                    &mut say,
+                )
+                .await
+            };
+            let mut out = match fetched {
+                Ok(out) => out,
+                Err(Failure::Other(why)) if !media.ended => {
+                    window.consumed(seg);
+                    stats.borrow_mut().dropped_segments += 1;
+                    tx.borrow_mut().discontinuity();
+                    say(Status::Note(format!("skipping unavailable segment: {why}")));
+                    continue;
+                }
+                Err(e) => return Err(e),
+            };
             if stop.get() {
                 return Ok(());
             }
+            let appended: usize = out
+                .fragments
+                .iter()
+                .map(|f| f.moof.len() + f.mdat.len())
+                .sum();
+            let seconds = if seg.duration > 0.0 {
+                seg.duration
+            } else {
+                media.target_duration.max(1.0)
+            };
+            let measured = appended as f64 / seconds;
+            if !speculative {
+                abr.observe(
+                    appended,
+                    (js_sys::Date::now() / 1000.0 - fetch_started).max(0.001),
+                );
+            }
+            if let Some(seconds) = download_seconds {
+                abr.observe(appended, seconds);
+            }
+            bytes_per_second = if bytes_per_second == 0.0 {
+                measured
+            } else {
+                0.8 * bytes_per_second + 0.2 * measured
+            };
             if let Some(codec) = &out.skipped_audio {
                 if !partial {
                     return Err(Unsupported::Sound(codec.clone()).into());
@@ -659,9 +1159,102 @@ async fn run(
                     )));
                 }
             }
+            if !video.paused()
+                && prefetch.is_none()
+                && let Some(next) = media
+                    .segments
+                    .iter()
+                    .position(|s| {
+                        s.seq == seg.seq && s.uri == seg.uri && s.byte_range == seg.byte_range
+                    })
+                    .and_then(|i| media.segments.get(i + 1))
+                && next.key.is_none()
+                && next.map.is_none()
+                && next.byte_range.is_none()
+            {
+                let next_url = resolve(&latest.url, &next.uri)?;
+                let language = selected_audio.clone();
+                prefetch = Some(Prefetch {
+                    uri: next.uri.clone(),
+                    future: Some(Box::pin(async move {
+                        download_segment(http, &next_url, SEGMENT_LIMIT, language).await
+                    })),
+                    ready: None,
+                    started: js_sys::Date::now() / 1000.0,
+                    seconds: None,
+                });
+            }
+            if let Some(url) = &audio_url {
+                let mut audio = get_rendition(
+                    http,
+                    url,
+                    stop,
+                    &mut audio_state,
+                    frontier + seconds,
+                    decode_sound,
+                    partial,
+                    &mut say,
+                )
+                .await?;
+                let video_changed = out.init.is_some();
+                if let Some(init) = out.init.take() {
+                    video_init = Some(init);
+                }
+                if (video_changed || audio.init.is_some())
+                    && let (Some(video_init), Some(audio_init)) = (&video_init, &audio_state.init)
+                {
+                    let (bytes, mime) =
+                        crate::cmaf::merge_init(&video_init.bytes, &audio_init.bytes)?;
+                    out.init = Some(crate::Init {
+                        bytes,
+                        mime,
+                        interlaced: video_init.interlaced,
+                    });
+                }
+                let offset = match (audio_state.tx.borrow().vbase, tx.borrow().vbase) {
+                    (Some(a), Some(v)) => (a - v) * i64::from(audio_state.rate) / 90_000,
+                    _ => 0,
+                };
+                for f in &mut audio.fragments {
+                    if f.moof.is_empty() {
+                        crate::cmaf::audio_fragment(&mut f.mdat, offset)?;
+                    } else {
+                        crate::cmaf::audio_fragment(&mut f.moof, offset)?;
+                    }
+                }
+                out.fragments.extend(audio.fragments);
+            }
             if let Some(mut init) = out.init {
                 if init.interlaced && !partial {
                     return Err(Unsupported::Interlaced.into());
+                }
+                if let Some(old_buffer) = &sb {
+                    // Track additions cannot be made by appending an init with a different
+                    // track count. Let previously buffered pictures play before reopening,
+                    // otherwise a fast download would discard the entire first segment.
+                    wait_idle(old_buffer, &ms).await?;
+                    ms.end_of_stream().map_err(js_err)?;
+                    while !video.ended() && buffered_ahead(video) > 0.05 {
+                        if ms.ready_state() == MediaSourceReadyState::Closed {
+                            return Err("media source closed during a track change".into());
+                        }
+                        sleep(Duration::from_millis(20)).await;
+                    }
+                    ms = MediaSource::new().map_err(js_err)?;
+                    object_url = ObjectUrl(
+                        web_sys::Url::create_object_url_with_source(&ms).map_err(js_err)?,
+                    );
+                    video.set_src(&object_url.0);
+                    for _ in 0..500 {
+                        if ms.ready_state() == MediaSourceReadyState::Open {
+                            break;
+                        }
+                        sleep(Duration::from_millis(10)).await;
+                    }
+                    if ms.ready_state() != MediaSourceReadyState::Open {
+                        return Err("the browser did not reopen the media source".into());
+                    }
+                    started = false;
                 }
                 let buffer =
                     ms.add_source_buffer(&init.mime)
@@ -669,16 +1262,58 @@ async fn run(
                             mime: init.mime.clone(),
                             why: js_err(e),
                         })?;
-                append(video, &buffer, &mut init.bytes).await?;
+                with_prefetch(append(video, &buffer, &ms, &mut init.bytes), &mut prefetch).await?;
                 sb = Some(buffer);
             }
             let buffer = sb.as_ref().ok_or("no media buffer")?;
-            for fragment in &mut out.fragments {
-                append(video, buffer, &mut fragment.moof).await?;
-                append(video, buffer, &mut fragment.mdat).await?;
+            crate::net::append_fragments(
+                &mut out.fragments,
+                &mut BrowserSink {
+                    video,
+                    buffer,
+                    ms: &ms,
+                    prefetch: &mut prefetch,
+                },
+            )
+            .await?;
+            window.consumed(seg);
+            frontier += seconds;
+            let remaining: f64 = media
+                .segments
+                .iter()
+                .skip_while(|s| {
+                    s.seq != seg.seq || s.uri != seg.uri || s.byte_range != seg.byte_range
+                })
+                .skip(1)
+                .map(|s| s.duration)
+                .sum();
+            let ranges = video.buffered();
+            let end = ranges
+                .length()
+                .checked_sub(1)
+                .and_then(|i| ranges.end(i).ok())
+                .unwrap_or(frontier);
+            let latency = end + remaining - video.current_time();
+            {
+                let mut state = stats.borrow_mut();
+                state.bitrate = bytes_per_second * 8.0;
+                state.buffered_seconds = buffered_ahead(video);
+                state.latency_seconds = latency.max(0.0);
+                state.current_variant = Some(variant_uri.clone());
+                state.live_window_seconds = if media.ended { 0.0 } else { media.duration() };
             }
-            next_seq = Some(seg.seq + 1);
-
+            if !media.ended {
+                let target = (media.target_duration * 3.0).max(3.0);
+                // A modest catch-up rate after stalls; don't change a paused viewer's position.
+                if !video.paused() {
+                    video.set_playback_rate(if latency > target + 2.0 { 1.05 } else { 1.0 });
+                }
+                let _ = ms.set_live_seekable_range((end - media.duration()).max(0.0), end);
+            }
+            if jump_requested && !media.ended {
+                video.set_current_time((end - media.target_duration.max(1.0)).max(0.0));
+                jump_requested = false;
+            }
             if !started {
                 started = true;
                 if let Some(start) = buffer.buffered().ok().and_then(|b| b.start(0).ok())
@@ -689,17 +1324,69 @@ async fn run(
                 let _ = video.play();
                 say(Status::Playing);
             }
-            trim(video, buffer, KEEP_BEHIND).await;
+            if buffered_ahead(video) >= 0.5 {
+                say(Status::Playing);
+            }
+            let (ahead, behind) =
+                crate::live::buffer_limits(bytes_per_second, media.target_duration);
+            trim(video, buffer, &ms, behind).await?;
+            if let Some(base) = &master_base {
+                let requested = variant_request.borrow().clone();
+                let candidate = if let Some(uri) = requested {
+                    variants
+                        .iter()
+                        .find(|v| v.uri == uri && v.uri != variant_uri)
+                } else {
+                    abr.choose(
+                        &variants,
+                        &variant_uri,
+                        buffered_ahead(video),
+                        media.target_duration,
+                    )
+                };
+                if let Some(candidate) = candidate {
+                    prefetch = None;
+                    variant_uri = candidate.uri.clone();
+                    let selected = candidate
+                        .renditions
+                        .iter()
+                        .filter(|r| r.uri.is_some())
+                        .max_by_key(|r| r.default)
+                        .and_then(|r| r.uri.as_deref())
+                        .map(|uri| resolve(base, uri))
+                        .transpose()?;
+                    if selected != audio_url {
+                        audio_state = RenditionState::default();
+                        audio_url = selected;
+                    }
+                    media_url = resolve(base, &variant_uri)?;
+                    say(Status::Note(format!(
+                        "switching variant to {}",
+                        candidate.bandwidth
+                    )));
+                    latest = fetch(http, &media_url, PLAYLIST_LIMIT, stop, &mut say).await?;
+                    media = parse_media(&latest)?;
+                    break;
+                }
+            }
+            if buffered_ahead(video) > ahead {
+                break;
+            }
         }
 
         if media.ended {
-            while buffered_ahead(video) > 0.5 && !stop.get() {
+            if let Some(b) = &sb {
+                wait_idle(b, &ms).await?;
+            }
+            ms.end_of_stream().map_err(js_err)?;
+            // End-of-input is different from end-of-playback, especially after a source rebuild.
+            // The element can publish its buffered ranges after the SourceBuffer update event.
+            while !video.ended() && !stop.get() {
+                if ms.ready_state() == MediaSourceReadyState::Closed {
+                    return Err("the media source closed".into());
+                }
                 sleep(Duration::from_millis(250)).await;
             }
-            if let Some(b) = &sb {
-                wait_idle(b).await;
-            }
-            let _ = ms.end_of_stream();
             return Ok(());
         }
 
@@ -711,9 +1398,177 @@ async fn run(
         if stop.get() {
             return Ok(());
         }
-        latest = fetch(http, &media_url, PLAYLIST_LIMIT, stop).await?;
+        if window.next(&media).is_none()
+            && window.frozen(js_sys::Date::now() / 1000.0, media.target_duration)
+        {
+            say(Status::Reconnecting { attempt: 1 });
+        } else if buffered_ahead(video) < 0.5 {
+            say(Status::Buffering);
+        }
+        latest = fetch(http, &media_url, PLAYLIST_LIMIT, stop, &mut say).await?;
         media = parse_media(&latest)?;
+        cross_live_gap(video, media.target_duration);
     }
+}
+
+#[derive(Default)]
+struct RenditionState {
+    window: crate::live::Window,
+    tx: RefCell<Transmuxer>,
+    format: RefCell<Format>,
+    init: Option<crate::Init>,
+    frontier: f64,
+    rate: u32,
+}
+#[allow(clippy::too_many_arguments)]
+async fn get_rendition(
+    http: &impl Fetch,
+    url: &str,
+    stop: &Cell<bool>,
+    state: &mut RenditionState,
+    horizon: f64,
+    decode_sound: bool,
+    partial: bool,
+    report: &mut dyn FnMut(Status),
+) -> Result<crate::Output, Failure> {
+    let latest = fetch(http, url, PLAYLIST_LIMIT, stop, report).await?;
+    let media = parse_media(&latest)?;
+    state.tx.borrow_mut().skip_sound = !decode_sound;
+    let mut result = crate::Output {
+        init: None,
+        fragments: vec![],
+        skipped_audio: None,
+    };
+    while state.frontier < horizon {
+        let Some(segment) = state.window.next(&media) else {
+            break;
+        };
+        let source = resolve(&latest.url, &segment.uri)?;
+        let mut out = fetch_segment(
+            http,
+            &source,
+            SEGMENT_LIMIT,
+            stop,
+            &state.tx,
+            segment,
+            &latest.url,
+            &state.format,
+            report,
+        )
+        .await?;
+        if let Some(codec) = out.skipped_audio
+            && !partial
+        {
+            return Err(Unsupported::Sound(codec).into());
+        }
+        if let Some(init) = out.init.take() {
+            result.init = Some(crate::Init {
+                bytes: vec![],
+                mime: init.mime.clone(),
+                interlaced: false,
+            });
+            state.init = Some(init);
+            let tx = state.tx.borrow();
+            state.rate = match tx.audio {
+                crate::Audio::Aac => tx.aac.as_ref().map_or(48000, |c| c.sample_rate()),
+                crate::Audio::Sound(_, r) | crate::Audio::Dolby(r) => r,
+                crate::Audio::None => 48000,
+            };
+        }
+        result.fragments.extend(out.fragments);
+        state.window.consumed(segment);
+        state.frontier += if segment.duration > 0.0 {
+            segment.duration
+        } else {
+            media.target_duration.max(1.0)
+        };
+    }
+    Ok(result)
+}
+
+async fn run_ts(
+    video: &HtmlVideoElement,
+    url: &str,
+    http: &impl Fetch,
+    partial: bool,
+    decode_sound: bool,
+    stop: &Cell<bool>,
+    report: &mut dyn FnMut(Status),
+) -> Result<(), Failure> {
+    let response = http.get(url, None).await.map_err(|e| match e {
+        FetchError::Temporary(e) | FetchError::Permanent(e) => Failure::Other(e),
+    })?;
+    if !(200..300).contains(&response.status) {
+        return Err(format!("TS source answered HTTP {}", response.status).into());
+    }
+    let ms = MediaSource::new().map_err(js_err)?;
+    let object_url = ObjectUrl(web_sys::Url::create_object_url_with_source(&ms).map_err(js_err)?);
+    video.set_src(&object_url.0);
+    for _ in 0..500 {
+        if ms.ready_state() == MediaSourceReadyState::Open {
+            break;
+        }
+        sleep(Duration::from_millis(10)).await;
+    }
+    if ms.ready_state() != MediaSourceReadyState::Open {
+        return Err("the browser did not open the media source".into());
+    }
+    let mut continuous = crate::Continuous::default().decode_sound(decode_sound);
+    let mut body = response.body;
+    let mut sb = None;
+    let mut started = false;
+    while let Some(chunk) = std::future::poll_fn(|cx| body.as_mut().poll_next(cx)).await {
+        let chunk = chunk?;
+        for mut out in continuous.feed(&chunk)? {
+            if let Some(codec) = out.skipped_audio
+                && !partial
+            {
+                return Err(Unsupported::Sound(codec).into());
+            }
+            if let Some(mut init) = out.init {
+                if init.interlaced && !partial {
+                    return Err(Unsupported::Interlaced.into());
+                }
+                if let Some(old) = sb.take() {
+                    ms.remove_source_buffer(&old).map_err(js_err)?;
+                }
+                let buffer =
+                    ms.add_source_buffer(&init.mime)
+                        .map_err(|e| Unsupported::MediaType {
+                            mime: init.mime.clone(),
+                            why: js_err(e),
+                        })?;
+                append(video, &buffer, &ms, &mut init.bytes).await?;
+                sb = Some(buffer);
+            }
+            let buffer = sb.as_ref().ok_or("no TS media buffer")?;
+            for f in &mut out.fragments {
+                append(video, buffer, &ms, &mut f.moof).await?;
+                append(video, buffer, &ms, &mut f.mdat).await?;
+            }
+            if !started {
+                started = true;
+                let _ = video.play();
+                if !stop.get() {
+                    report(Status::Playing);
+                }
+            }
+            trim(video, buffer, &ms, 5.0).await?;
+            while buffered_ahead(video) > 15.0 {
+                sleep(Duration::from_millis(250)).await;
+            }
+        }
+    }
+    if let Some(buffer) = sb {
+        let mut out = continuous.finish()?;
+        for f in &mut out.fragments {
+            append(video, &buffer, &ms, &mut f.moof).await?;
+            append(video, &buffer, &ms, &mut f.mdat).await?;
+        }
+        wait_idle(&buffer, &ms).await?;
+        let _ = ms.end_of_stream();
+    }
+    Ok(())
 }
 
 #[cfg(feature = "vod")]
@@ -741,7 +1596,7 @@ mod movie {
         len: u64,
         stop: &Cell<bool>,
     ) -> Result<Part, Failure> {
-        with_retries(stop, || get_range_once(http, url, start, len)).await
+        with_retries(stop, || get_range_once(http, url, start, len), &mut |_| {}).await
     }
 
     async fn get_range_once(
@@ -843,18 +1698,38 @@ mod movie {
         start: f64,
         report: impl FnMut(Status) + 'static,
     ) -> Player {
+        let player_video = video.clone();
+        let stats = Rc::new(RefCell::new(Stats::default()));
+        let go_live = Rc::new(Cell::new(false));
+        let variant = Rc::new(RefCell::new(None));
+        let audio = Rc::new(RefCell::new(None));
         let stop = Rc::new(Cell::new(false));
         let stopped = stop.clone();
+        let wake = Rc::new(RefCell::new(None));
+        let waking = wake.clone();
         let mut report = report;
         wasm_bindgen_futures::spawn_local(async move {
-            if let Err(e) =
-                run_movie(&video, &movie, &url, &http, start, &stopped, &mut report).await
+            if let Some(Err(e)) = cancellable(
+                &stopped,
+                &waking,
+                run_movie(&video, &movie, &url, &http, start, &stopped, &mut report),
+            )
+            .await
                 && !stopped.get()
             {
                 report(e.into());
             }
         });
-        Player { stop }
+        Player {
+            video: player_video,
+            stats,
+            go_live,
+            variant,
+            audio,
+            stop,
+            wake,
+            paused_at: Cell::new(None),
+        }
     }
 
     /// How much of the movie to hold: seconds ahead of the playhead and behind it, and how much each
@@ -875,9 +1750,13 @@ mod movie {
     }
 
     /// Frees what is buffered far behind the playhead, and far beyond where a seek left it.
-    async fn evict(video: &HtmlVideoElement, sb: &SourceBuffer) {
-        wait_idle(sb).await;
-        let Ok(b) = sb.buffered() else { return };
+    async fn evict(
+        video: &HtmlVideoElement,
+        sb: &SourceBuffer,
+        ms: &MediaSource,
+    ) -> Result<(), String> {
+        wait_idle(sb, ms).await?;
+        let b = sb.buffered().map_err(js_err)?;
         let t = video.current_time();
         let ranges: Vec<(f64, f64)> = (0..b.length())
             .filter_map(|i| Some((b.start(i).ok()?, b.end(i).ok()?)))
@@ -893,8 +1772,9 @@ mod movie {
                 continue;
             };
             let _ = sb.remove(from, to);
-            wait_idle(sb).await;
+            wait_idle(sb, ms).await?;
         }
+        Ok(())
     }
 
     async fn run_movie(
@@ -934,7 +1814,7 @@ mod movie {
             })?;
         sb.set_timestamp_offset(movie.shift());
         ms.set_duration(movie.duration);
-        append(video, &sb, &mut init.bytes).await?;
+        append(video, &sb, &ms, &mut init.bytes).await?;
         if start > 0.0 {
             video.set_current_time(start);
         }
@@ -961,7 +1841,7 @@ mod movie {
             }
             if session.done() {
                 if !ended {
-                    wait_idle(&sb).await;
+                    wait_idle(&sb, &ms).await?;
                     let _ = ms.end_of_stream();
                     ended = true;
                 }
@@ -990,9 +1870,9 @@ mod movie {
                 continue;
             }
             let mut fragment = session.push(&part.bytes).map_err(|e| e.to_string())?;
-            evict(video, &sb).await;
+            evict(video, &sb, &ms).await?;
             if !fragment.is_empty() {
-                append(video, &sb, &mut fragment).await?;
+                append(video, &sb, &ms, &mut fragment).await?;
             }
             frontier = session.reached();
             if !started && buffered_at(video, video.current_time().max(start)) {

@@ -582,7 +582,7 @@ impl Index {
 
     /// Cuts the frames out of the bytes of a range (which begin at file offset `start`). Samples
     /// the bytes don't fully cover wait for the next range.
-    pub fn frames(&self, c: &mut Cursor, start: u64, bytes: &[u8]) -> Vec<Frame> {
+    pub fn frames<'a>(&self, c: &mut Cursor, start: u64, bytes: &'a [u8]) -> Vec<Frame<'a>> {
         let mut out = vec![];
         let end = start + bytes.len() as u64;
         while let Some((sound, i)) = self.next(c.v, c.a) {
@@ -590,7 +590,9 @@ impl Index {
             if s.offset < start || s.offset + u64::from(s.size()) > end {
                 break;
             }
-            let data = bytes[(s.offset - start) as usize..][..s.size() as usize].to_vec();
+            let data = std::borrow::Cow::Borrowed(
+                &bytes[(s.offset - start) as usize..][..s.size() as usize],
+            );
             let dur = us(s.dts + trak.dur(i), trak.scale) - us(s.dts, trak.scale);
             if sound {
                 c.a += 1;
