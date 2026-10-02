@@ -1,8 +1,11 @@
 # Issue acceptance and playback validation
 
-Local results as of 2026-10-01. An implementation is not the same as a closed issue.
-The rows below record evidence and the acceptance work still needed. No GitHub
-issue has been closed by this change. Timing details are in [performance.md](performance.md).
+Results as of 2026-10-01. Completed work is linked from the GitHub issues to
+draft PR #41; issues stay open until the work lands. The table records evidence
+and further checks. Timing details are in [performance.md](performance.md).
+
+Local acceptance is complete for #4, #6, #7, #10, #15, #18, #33, #35, #36,
+#38, #39 and #40. Extra checks listed below remain useful follow-up work.
 
 | Issue | Local work and evidence | Remaining acceptance |
 | --- | --- | --- |
@@ -18,24 +21,24 @@ issue has been closed by this change. Timing details are in [performance.md](per
 | #12 HEVC/interlacing | Capability probes and documented decision to defer a universal canvas backend. Clear unsupported reports; no FFmpeg runtime fallback. | Desktop target hardware support and decode/deinterlace CPU measurements. |
 | #13 Prefetch | One bounded speculative download overlaps append work. | Equivalent throttled before/after startup and stall measurements. |
 | #14 Live edge | Latency stats, modest rate catch-up and explicit go-live. | Induced ten-second stall must recover to target latency within a measured bound. |
-| #15 Timing tags | EXTINF, date/discontinuity/range metadata and total duration; parser tests. | Review API documentation against the issue. |
+| #15 Timing tags | EXTINF, date/discontinuity/range metadata and total duration; parser tests. | Implemented; parser tests cover per-segment duration, timing tags and total span. |
 | #16 Gapless video | Small boundary snapping and monotonic repeated-segment tests. | Real multi-segment stream boundary jitter, beyond generated fixtures. |
-| #18 Worker timer and CPU | Global timer works in a worker: 11 ms for a requested 10 ms. Measured wasm AC-3 processing and transfer overhead. | Broader realistic programme corpus; worker placement remains host policy. |
+| #18 Worker timer and CPU | Global timer works in a worker: 11 ms for a requested 10 ms. Measured wasm AC-3 processing and transfer overhead. | Implemented: six-second wasm processing is about 82× realtime in the measured run. Broader corpus and worker placement remain host policy. |
 | #22 Controls and stats | Pause/resume/seek/go-live, variant/language controls, typed states and stats. | Adoption in the client app is outside this repository. |
 | #23 Native fake provider | Portable Fetch/Sink, actual incremental download/append helpers, native missing-segment and clock tests; shared scheduling policy. | Extract the complete control loop, including throttle/trim/retry orchestration, and script every required scenario natively. |
-| #24 CI and matrix | All four feature combinations checked natively and for wasm; CI and MSRV jobs added. | Green main CI after landing; Edge/Safari matrix still needs target machines. |
+| #24 CI and matrix | All four feature combinations checked natively and for wasm; CI and MSRV jobs added. | PR CI is green, including checks, MSRV and profiling. Main CI after landing and Edge/Safari playback still need verification. |
 | #25 Multi-segment/soak | Thousands of restarts; 10,000 wasm pushes keep committed memory at 1,900,544 bytes. Existing independent multi-push decode tests pass. | Generated resolution/discontinuity sequences and a true real-time browser soak. |
 | #26 Roadmap | Shared native/wasm core and measured performance direction documented. | Update the tracking issue after individual acceptance. |
 | #29 API/release | API contracts, non-exhaustive enums, migration notes and Rust 1.88 native/wasm checks. Version prepared as 0.2.0. | Reviewed tagged commit; no tag or release has been made. |
 | #30 Adoption | Local demo, wasm documentation, changelog and successful publish dry run. Clean source copy builds/generates/profiles with one command. | Release publication after review; no package uploaded. |
 | #32 Dolby passthrough | Opt-in AC-3/simple E-AC-3; configuration bytes match FFmpeg and independent decode succeeds. | Actual playback on a desktop platform with Dolby support. Linux test browser reports unsupported. |
-| #33 Native-first | Host-owned native-HLS/fallback recipe in [api.md](api.md). | Recipe review; no automatic policy helper is added. |
+| #33 Native-first | Host-owned native-HLS/fallback recipe in [api.md](api.md). | Decision implemented: use the documented host-owned recipe rather than automatic library policy. |
 | #34 Main-thread audio | Synchronous cold run 84.2 ms; yielded six-second AC-3 run has no long tasks and starts in about 195 ms. | Comparable repeated dropped-frame measurements; movies/encrypted/raw paths still need yielding evaluation. |
 | #35 Movie copies | MP4 sample data borrowed; Matroska cross-piece samples remain owned. Decode tests and CPU/memory profiles pass. Browser MP4 reaches 40.8 seconds; Matroska reaches 68.2 seconds. Both runs report zero dropped frames. | Review measurement scope; CPU remains dominated by compressed audio decoding. |
 | #36 Live buffer | Documented 32 MiB policy based on appended bitrate. About 28.58 MB buffered after 19 minutes at 8.899 Mbps. | Investigate dropped 1080p frames separately; this is a compressed-byte estimate. |
 | #37 Closed source wait | Wait races update completion, source closure/end and buffer removal; cancellation drops the waiter. Browser hooks confirm updating=true at closure/removal and both settle with Failed rather than hanging. | Mid-remove closure and removal of an unrelated buffer. |
-| #38 Harness | Build/demo/profile commands, generated media, Node/browser probes and clean-source reproduction. Generator cache includes arguments/source hashes; historical low-resolution and fresh 1080p movie results are distinguished. | CI profiling report and broader hardware repetition. |
-| #39 FLAC | Real programme sample: 29.7% of PCM size at about 12.4 ms encoder CPU; trade taken. Lossless noise/extreme/ramp checks pass. | Broader corpus improves confidence; issue needs the measured decision recorded. |
+| #38 Harness | Build/demo/profile commands, generated media, Node/browser probes and clean-source reproduction. Generator cache includes arguments/source hashes; historical low-resolution and fresh 1080p movie results are distinguished. | Clean-source profiling and CI report pass. Broader hardware repetition is follow-up work. |
+| #39 FLAC | Real programme sample: 29.7% of PCM size at about 12.4 ms encoder CPU; trade taken. Lossless noise/extreme/ramp checks pass. | Decision implemented and recorded: take the compression trade. A broader corpus would improve confidence. |
 | #40 Discontinuity skew | Twenty alternating ±100 ms splices: maximum reduced from 316.811 to 105.467 ms with correction capped at 2%; regression test. | Real broadcast splice measurements. |
 
 ## Desktop browser matrix

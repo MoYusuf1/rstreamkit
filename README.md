@@ -1,22 +1,20 @@
 # rstreamkit
 
-**A Rust toolkit for streaming video and audio in apps, servers, and browsers.**
-It handles HLS, MPEG-TS, MP4, and Matroska. The media engine is all Rust;
-browser playback is optional and uses a small JavaScript bridge.
+**rstreamkit helps developers play live streams and video files in apps and browsers.**
+Its Rust engine reads HLS, MPEG-TS, MP4, and Matroska and prepares video and audio
+for playback, with no FFmpeg needed. Browser playback uses a small JavaScript bridge.
 
-| Comparison | rstreamkit | FFmpeg | What this means |
-| --- | --- | --- | --- |
-| Put a six-second H.264/AAC stream into an MP4 file | **14.5 ms** | **60.5 ms** | **4.2× faster in this measured test** |
-| Picture and sound from that test | 180 video frames; identical audio | 180 video frames; identical audio | The speed gain preserves the picture and sound |
-| Media engine | Rust | [Mainly C](https://ffmpeg.org/developer.html) | Fits a Rust-only media stack |
-| FFmpeg runtime dependencies | **0** | Uses the FFmpeg engine | No FFmpeg library or installation needed by rstreamkit |
-| Where it runs | Native apps and browsers | [Many platforms](https://ffmpeg.org/about.html) | Both work outside browsers |
-| Format coverage | Focused streaming formats | Broader coverage | FFmpeg still handles more kinds of media |
+| Comparison | rstreamkit | FFmpeg |
+| --- | --- | --- |
+| Put a six-second H.264/AAC stream into MP4 | **14.5 ms — 4.2× faster** | 60.5 ms |
+| Output from that test | Same 180 video frames and audio | Same 180 video frames and audio |
+| Engine language | Rust | [Mainly C](https://ffmpeg.org/developer.html) |
+| Where it works | Apps, servers, and browsers | [Many platforms](https://ffmpeg.org/about.html), including apps and servers |
+| Media support | Focused on streaming and playback | More formats, plus general video conversion |
 
-Speed: median of eight native command-line runs on a Ryzen 7 5700, Linux,
-Rust 1.98.1, FFmpeg 9.0.2. Includes startup and file reading/writing;
-the picture and sound are copied without conversion.
-This test does not prove rstreamkit is faster at every job.
+Speed is the median of eight command-line runs on a Ryzen 7 5700 running Linux.
+It includes startup and file reading/writing, with video and audio copied unchanged.
+The speed advantage applies to this test; it does not prove every task is faster.
 
 [Benchmark details and commands](docs/performance.md) ·
 [Developer guide](docs/api.md) · [Demo and tests](tools/README.md)
