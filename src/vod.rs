@@ -15,6 +15,7 @@ use crate::{Error, Init, Unsupported, avc, fmp4, mkv, mp4, sound};
 
 /// Every frame time on these types is microseconds.
 #[derive(Clone, Copy, Debug, PartialEq)]
+#[non_exhaustive]
 pub enum Track {
     Video,
     Audio,
@@ -23,14 +24,27 @@ pub enum Track {
 /// One coded picture or block of sound. Times are on the output timeline: what the browser is
 /// given, which is the movie's own clock moved forward by [`Movie::shift`].
 #[derive(Debug)]
-pub struct Frame {
+pub struct Frame<'a> {
     pub track: Track,
     pub pts: i64,
     /// When it is decoded; equals `pts` for sound.
     pub dts: i64,
     pub dur: i64,
     pub key: bool,
-    pub data: Vec<u8>,
+    pub data: Cow<'a, [u8]>,
+}
+
+impl Frame<'_> {
+    fn into_owned(self) -> Frame<'static> {
+        Frame {
+            track: self.track,
+            pts: self.pts,
+            dts: self.dts,
+            dur: self.dur,
+            key: self.key,
+            data: Cow::Owned(self.data.into_owned()),
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -64,6 +78,7 @@ pub struct VideoInfo {
 }
 
 #[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
 pub enum Audio {
     /// AAC, with its AudioSpecificConfig.
     Aac { asc: Vec<u8> },
@@ -363,7 +378,7 @@ struct Fragmenter {
     /// How far the pictures handed out so far reach.
     reach: i64,
     /// Sound waiting for the picture to catch up with it.
-    waiting: Vec<Frame>,
+    waiting: Vec<Frame<'static>>,
     audio_next: Option<u64>,
     flac_frames: u32,
 }
@@ -390,8 +405,9 @@ impl Fragmenter {
         }
     }
 
-    fn push(&mut self, frames: Vec<Frame>, last: bool) -> Vec<u8> {
+    fn push(&mut self, frames: Vec<Frame<'_>>, last: bool) -> Vec<u8> {
         let mut video = vec![];
+        let mut audio = std::mem::take(&mut self.waiting);
         for f in frames {
             match f.track {
                 Track::Video => match self.floor {
@@ -404,7 +420,7 @@ impl Fragmenter {
                     Some(floor) if f.pts < floor => {}
                     Some(_) => video.push(f),
                 },
-                Track::Audio => self.waiting.push(f),
+                Track::Audio => audio.push(f),
             }
         }
         if let Some(end) = video.iter().map(|f| f.pts + f.dur).max() {
@@ -415,12 +431,11 @@ impl Fragmenter {
         // nothing before the picture's start is kept.
         let horizon = if last { i64::MAX } else { self.reach };
         let floor = self.floor.unwrap_or(i64::MIN);
-        let (ready, later): (Vec<Frame>, Vec<Frame>) = std::mem::take(&mut self.waiting)
-            .into_iter()
-            .partition(|f| f.pts < horizon);
-        self.waiting = later;
+        let (ready, later): (Vec<Frame<'_>>, Vec<Frame<'_>>) =
+            audio.into_iter().partition(|f| f.pts < horizon);
+        self.waiting = later.into_iter().map(Frame::into_owned).collect();
         // (A frame that begins a little early still holds the start of the first moment.)
-        let sound: Vec<Frame> = ready
+        let sound: Vec<Frame<'_>> = ready
             .into_iter()
             .filter(|f| f.pts.saturating_add(SOUND_FRAME) >= floor)
             .collect();
@@ -484,7 +499,7 @@ impl Fragmenter {
 
     /// Sound as the samples of the audio track: (bytes, length in sample-rate ticks). AAC is
     /// lent as it is; only sound we decode is new bytes.
-    fn coded_sound<'a>(&mut self, frames: &'a [Frame]) -> Vec<(Cow<'a, [u8]>, u32)> {
+    fn coded_sound<'a>(&mut self, frames: &'a [Frame<'_>]) -> Vec<(Cow<'a, [u8]>, u32)> {
         let mut out = vec![];
         match self.audio.as_ref().map(|a| &a.0) {
             Some(Audio::Aac { .. }) => {

@@ -41,3 +41,28 @@ jobs:
       - run: cargo test --no-default-features
       # Movies without the sound decoders (they are reported as unsupported).
       - run: cargo test --no-default-features --features vod
+
+  msrv:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup toolchain install 1.88.0 --profile minimal --target wasm32-unknown-unknown
+      - run: cargo +1.88.0 check --all-features
+      - run: cargo +1.88.0 check --no-default-features
+      - run: cargo +1.88.0 check --target wasm32-unknown-unknown --all-features
+      - run: cargo +1.88.0 check --target wasm32-unknown-unknown --no-default-features
+
+  profile:
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup target add wasm32-unknown-unknown
+      - run: cargo install wasm-bindgen-cli --version 0.2.128 --locked
+      - run: sudo apt-get update && sudo apt-get install -y ffmpeg
+      - run: bash tools/profile.sh > profile.jsonl
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: wasm-profile
+          path: profile.jsonl

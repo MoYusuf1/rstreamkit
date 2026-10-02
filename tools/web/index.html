@@ -1,0 +1,57 @@
+<!doctype html><meta charset="utf-8"><title>rstreamkit test bed</title>
+<style>body{font:16px system-ui;background:#15191f;color:#edf1f7;max-width:960px;margin:40px auto}video{width:100%;max-height:60vh}input{width:65%}button,input{padding:10px;margin:4px}pre{white-space:pre-wrap;max-height:25vh;overflow:auto}</style>
+<h1>rstreamkit</h1><video id="video" controls muted playsinline></video>
+<p><input id="url" value="/media/live.m3u8"><button id="live">Live</button><button id="movie">Movie</button><button id="stop">Stop</button></p>
+<p>Try /media/live.m3u8, /media/ac3.m3u8, /media/movie.mp4, /media/movie.mkv, /fault/404.m3u8, /fault/garbage.m3u8, /fault/frozen.m3u8, /fault/no-sequence.m3u8.</p><p><button id="zap">Zap 30 times</button><button id="detach">Detach source</button><button id="sample">Sample metrics</button></p><p><button id="closeAppend">Close during append</button><button id="removeAppend">Remove updating buffer</button></p><p><button id="pause">Pause</button><button id="resume">Resume</button><button id="edge">Go live</button><button id="capabilities">Probe codecs</button><button id="benchmark">Audio benchmark</button></p><pre id="metrics"></pre><pre id="log"></pre>
+<script type="module">
+import init,* as kit from './pkg/rstreamkit_harness.js';
+await init();
+window.statuses=[]; window.metrics={longtasks:[],dropped:0};
+window.onStatus=s=>{statuses.push({time:performance.now(),status:s});document.querySelector('#log').textContent+=s+'\n'};
+try{new PerformanceObserver(l=>metrics.longtasks.push(...l.getEntries().map(e=>e.duration))).observe({type:'longtask',buffered:true})}catch{}
+window.live=url=>kit.live(new URL(url,location).href);
+window.movie=url=>kit.movie(new URL(url,location).href);
+window.stop=kit.stop;
+for(const name of ['live','movie','stop'])document.getElementById(name).onclick=()=>window[name](document.getElementById('url').value);
+window.zap=async(count=30)=>{for(let i=0;i<count;i++){live(document.getElementById('url').value);await new Promise(r=>setTimeout(r,200))}stop()};
+window.detach=()=>document.getElementById('video').src='';
+window.sample=()=>{const v=document.getElementById('video');return {current:v.currentTime,buffer:Array.from({length:v.buffered.length},(_,i)=>[v.buffered.start(i),v.buffered.end(i)]),quality:(()=>{const q=v.getVideoPlaybackQuality?.();return q?{totalVideoFrames:q.totalVideoFrames,droppedVideoFrames:q.droppedVideoFrames,corruptedVideoFrames:q.corruptedVideoFrames}:null})(),stats:kit.stats(),status_count:statuses.length,statuses:statuses.slice(-10),metrics}};
+document.querySelector('#zap').onclick=()=>zap();
+document.querySelector('#detach').onclick=()=>detach();
+// Diagnostic-only one-shot hooks; restore the prototype before invoking the real method.
+function interruptAppend(remove) {
+ const original=MediaSource.prototype.addSourceBuffer;
+ MediaSource.prototype.addSourceBuffer=function(...args) {
+  MediaSource.prototype.addSourceBuffer=original;
+  const buffer=original.apply(this,args);
+  buffer.addEventListener('updatestart',()=>{
+   document.querySelector('#log').textContent+='Interrupted while updating='+buffer.updating+'\n';
+   if(remove)this.removeSourceBuffer(buffer);else detach();
+  },{once:true});
+  return buffer;
+ };
+ live(document.querySelector('#url').value);
+}
+document.querySelector('#closeAppend').onclick=()=>interruptAppend(false);
+document.querySelector('#removeAppend').onclick=()=>interruptAppend(true);
+document.querySelector('#sample').onclick=()=>document.querySelector('#metrics').textContent=JSON.stringify(sample(),null,2);
+document.querySelector('#pause').onclick=kit.pause;
+document.querySelector('#resume').onclick=kit.resume;
+document.querySelector('#edge').onclick=kit.go_live;
+document.querySelector('#capabilities').onclick=async()=>{
+ const result={userAgent:navigator.userAgent,webCodecs:typeof VideoDecoder!=='undefined',mse:{},decoders:[]};
+ for(const codec of ['avc1.640028','hvc1.1.6.L93.B0','ac-3','ec-3','flac'])result.mse[codec]=MediaSource.isTypeSupported(`video/mp4; codecs="${codec}"`);
+ if(result.webCodecs)for(const codec of ['avc1.640028','hvc1.1.6.L93.B0'])for(const hardwareAcceleration of ['prefer-hardware','prefer-software']){
+  try{const r=await VideoDecoder.isConfigSupported({codec,codedWidth:1920,codedHeight:1080,hardwareAcceleration});result.decoders.push({codec,hardwareAcceleration,supported:r.supported})}catch(e){result.decoders.push({codec,hardwareAcceleration,error:String(e)})}
+ }
+ document.querySelector('#metrics').textContent=JSON.stringify(result,null,2);
+};
+document.querySelector('#benchmark').onclick=async()=>{
+ const data=await (await fetch('/media/ac3.ts')).arrayBuffer();
+ const before=performance.now();const size=kit.transmux(new Uint8Array(data),false,1);const synchronous=performance.now()-before;
+ const worker=new Worker('./worker.js',{type:'module'});const started=performance.now();
+ worker.onmessage=e=>{document.querySelector('#metrics').textContent=JSON.stringify({synchronous_ms:synchronous,output_bytes:size,worker_roundtrip_ms:performance.now()-started,...e.data},null,2);worker.terminate()};
+ worker.postMessage(data,[data]);
+};
+window.ready=true;
+</script>

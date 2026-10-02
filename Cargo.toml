@@ -1,7 +1,12 @@
 [package]
 name = "rstreamkit"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
+rust-version = "1.88"
+repository = "https://github.com/MoYusuf1/rstreamkit"
+readme = "README.md"
+keywords = ["streaming", "hls", "wasm", "media", "transmux"]
+categories = ["multimedia", "wasm"]
 license = "MIT OR Apache-2.0"
 description = "Pure-Rust streaming toolkit for the browser: HLS, MPEG-TS and movie files in, fragmented MP4 out for MediaSource, with AC-3, E-AC-3 and MP2 sound decoded in Rust."
 
@@ -37,4 +42,7 @@ required-features = ["vod"]
 js-sys = "0.3.105"
 wasm-bindgen = "0.2.128"
 wasm-bindgen-futures = "0.4.78"
-web-sys = { version = "0.3.105", features = ["Window", "Document", "Element", "Headers", "HtmlMediaElement", "HtmlVideoElement", "MediaSource", "MediaSourceReadyState", "ReadableStream", "ReadableStreamDefaultReader", "Request", "RequestInit", "Response", "SourceBuffer", "TimeRanges", "Url"] }
+web-sys = { version = "0.3.105", features = ["AbortController", "AbortSignal", "Window", "Document", "Element", "Headers", "HtmlMediaElement", "HtmlVideoElement", "MediaSource", "MediaSourceReadyState", "ReadableStream", "ReadableStreamDefaultReader", "Request", "RequestInit", "Response", "SourceBuffer", "SourceBufferList", "TimeRanges", "Url"] }
+
+[package.metadata.docs.rs]
+targets = ["wasm32-unknown-unknown"]

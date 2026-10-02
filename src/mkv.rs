@@ -518,7 +518,7 @@ impl Index {
         start: u64,
         bytes: &[u8],
         last: bool,
-    ) -> (Vec<Frame>, bool) {
+    ) -> (Vec<Frame<'static>>, bool) {
         let mut out = vec![];
         let mut i = 0;
         let mut jump = None;
@@ -568,7 +568,13 @@ impl Index {
         (out, last)
     }
 
-    fn block(&self, c: &mut Cursor, p: &[u8], group_key: Option<bool>, out: &mut Vec<Frame>) {
+    fn block(
+        &self,
+        c: &mut Cursor,
+        p: &[u8],
+        group_key: Option<bool>,
+        out: &mut Vec<Frame<'static>>,
+    ) {
         let Some((Some(track), n)) = read_size(p) else {
             return;
         };
@@ -599,14 +605,14 @@ impl Index {
                 dts: pts,
                 dur: 0,
                 key: true,
-                data: data.to_vec(),
+                data: data.to_vec().into(),
             });
         }
     }
 
     /// Gives the waiting group of pictures its decode times: the same times as the pictures'
     /// own, in ascending order (decode order is file order), never going backwards.
-    fn flush(&self, c: &mut Cursor, out: &mut Vec<Frame>) {
+    fn flush(&self, c: &mut Cursor, out: &mut Vec<Frame<'static>>) {
         let gop = std::mem::take(&mut c.gop);
         let mut order: Vec<i64> = gop.iter().map(|g| g.pts - SHIFT).collect();
         order.sort_unstable();
@@ -628,7 +634,7 @@ impl Index {
                 dts: dts[n],
                 dur,
                 key: held.key,
-                data: held.data,
+                data: held.data.into(),
             });
         }
     }

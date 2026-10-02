@@ -188,6 +188,7 @@ fn flac_entry(rate: u32) -> Vec<u8> {
 }
 
 /// The audio of an fMP4 stream: AAC as it arrives, or FLAC made from sound we decoded.
+#[non_exhaustive]
 pub enum AudioTrack<'a> {
     /// AAC from a transport stream, which only tells us its basic parameters.
     Aac(&'a AacConfig),
@@ -200,13 +201,21 @@ pub enum AudioTrack<'a> {
     Flac {
         rate: u32,
     },
+    Dolby {
+        rate: u32,
+        channels: u16,
+        enhanced: bool,
+        config: &'a [u8],
+    },
 }
 
 impl AudioTrack<'_> {
     fn timescale(&self) -> u32 {
         match self {
             AudioTrack::Aac(cfg) => cfg.sample_rate(),
-            AudioTrack::AacFile { rate, .. } | AudioTrack::Flac { rate } => *rate,
+            AudioTrack::AacFile { rate, .. }
+            | AudioTrack::Flac { rate }
+            | AudioTrack::Dolby { rate, .. } => *rate,
         }
     }
 
@@ -219,6 +228,24 @@ impl AudioTrack<'_> {
                 rate,
             } => mp4a(asc, *channels, *rate),
             AudioTrack::Flac { rate } => flac_entry(*rate),
+            AudioTrack::Dolby {
+                rate,
+                channels,
+                enhanced,
+                config,
+            } => bx(
+                if *enhanced { b"ec-3" } else { b"ac-3" },
+                &[
+                    &[0; 6],
+                    &1u16.to_be_bytes(),
+                    &[0; 8],
+                    &channels.to_be_bytes(),
+                    &16u16.to_be_bytes(),
+                    &[0; 4],
+                    &(rate.min(&65535) << 16).to_be_bytes(),
+                    &bx(if *enhanced { b"dec3" } else { b"dac3" }, &[config]),
+                ],
+            ),
         }
     }
 }
@@ -237,6 +264,15 @@ pub struct VideoParams<'a> {
 
 /// `ftyp` + `moov` for an fMP4 stream. Audio is optional.
 pub fn init_segment(video: &VideoParams, audio: Option<&AudioTrack>) -> Vec<u8> {
+    init_tracks(Some(video), audio)
+}
+
+/// Audio-only initialization for radio and external HLS audio renditions.
+pub fn audio_init_segment(audio: &AudioTrack) -> Vec<u8> {
+    init_tracks(None, Some(audio))
+}
+
+fn init_tracks(video: Option<&VideoParams>, audio: Option<&AudioTrack>) -> Vec<u8> {
     let ftyp = bx(
         b"ftyp",
         &[
@@ -262,29 +298,38 @@ pub fn init_segment(video: &VideoParams, audio: Option<&AudioTrack>) -> Vec<u8> 
         ],
     );
 
-    let vtrak = bx(
-        b"trak",
-        &[
-            &tkhd(VIDEO_TRACK, false, video.width, video.height),
-            &mdia(
-                VIDEO_TIMESCALE,
-                false,
-                minf(
-                    full(b"vmhd", 0, 1, &[&[0; 8]]),
-                    avc1(
-                        &video
-                            .avcc
-                            .map_or_else(|| avcc_box(video.sps, video.pps), |a| bx(b"avcC", &[a])),
-                        video.width as u16,
-                        video.height as u16,
-                        video.pixel_aspect,
+    let vtrak = video
+        .map(|video| {
+            bx(
+                b"trak",
+                &[
+                    &tkhd(VIDEO_TRACK, false, video.width, video.height),
+                    &mdia(
+                        VIDEO_TIMESCALE,
+                        false,
+                        minf(
+                            full(b"vmhd", 0, 1, &[&[0; 8]]),
+                            avc1(
+                                &video.avcc.map_or_else(
+                                    || avcc_box(video.sps, video.pps),
+                                    |a| bx(b"avcC", &[a]),
+                                ),
+                                video.width as u16,
+                                video.height as u16,
+                                video.pixel_aspect,
+                            ),
+                        ),
                     ),
-                ),
-            ),
-        ],
-    );
+                ],
+            )
+        })
+        .unwrap_or_default();
     let mut traks = vtrak;
-    let mut trexes = full(b"trex", 0, 0, &[&u32s(&[VIDEO_TRACK, 1, 0, 0, 0])]);
+    let mut trexes = if video.is_some() {
+        full(b"trex", 0, 0, &[&u32s(&[VIDEO_TRACK, 1, 0, 0, 0])])
+    } else {
+        vec![]
+    };
     if let Some(a) = audio {
         traks.extend(bx(
             b"trak",

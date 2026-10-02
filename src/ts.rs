@@ -11,6 +11,8 @@ use std::collections::HashMap;
 pub enum Error {
     #[error("not an MPEG-TS segment (no sync bytes)")]
     NoSync,
+    #[error("transport stream is scrambled; descrambling is required")]
+    Scrambled,
     #[error("segment has no program table")]
     NoPmt,
     #[error("no H.264 video in the segment{}", .0.as_ref().map(|c| format!(" (found {c}, which browsers can't play through MediaSource here)")).unwrap_or_default())]
@@ -91,6 +93,8 @@ pub struct Demuxed {
     /// Sound we have a decoder for, when there is no AAC.
     pub sound: Vec<SoundSample>,
     pub sound_kind: Option<crate::sound::Kind>,
+    /// Whether every E-AC-3 syncframe fits the simple independent passthrough layout.
+    pub simple_eac3: bool,
     /// Set when the segment has audio a browser can't play itself (AC-3, MP2, ...). It is dropped
     /// unless `sound` holds its decoded frames, which the transmuxer then plays instead.
     pub skipped_audio: Option<String>,
@@ -191,6 +195,12 @@ fn adts_frames(es: &[u8], pts: u64, out: &mut Demuxed) {
 }
 
 fn sound_frames(es: &[u8], pts: u64, kind: crate::sound::Kind, out: &mut Demuxed) {
+    let eligible = kind == crate::sound::Kind::Ac3 && crate::sound::simple_eac3(es);
+    out.simple_eac3 = if out.sound.is_empty() {
+        eligible
+    } else {
+        out.simple_eac3 && eligible
+    };
     let mut elapsed = 0u64; // samples since the PES packet's own timestamp
     for frame in crate::sound::split(kind, es) {
         out.sound.push(SoundSample {
@@ -280,11 +290,14 @@ pub struct Demuxer {
     /// that a chunk ended in the middle of.
     carry: Vec<u8>,
     synced: bool,
+    invalid_sync: bool,
+    scrambled: bool,
     /// What the pictures' buffer started with, so a rebuild keeps it.
     video_base: usize,
     pmt_pid: Option<u16>,
     video_pid: Option<u16>,
     audio_pid: Option<u16>,
+    preferred_language: Option<String>,
     sound: Option<(u16, crate::sound::Kind)>,
     undecodable_audio: Option<String>,
     foreign_video: Option<String>,
@@ -306,6 +319,13 @@ impl Demuxer {
         }
     }
 
+    /// Prefer a PMT audio PID tagged with this ISO 639 language (three letters).
+    /// If the program has no matching descriptor, retain the first usable track.
+    pub fn audio_language(mut self, language: Option<&str>) -> Self {
+        self.preferred_language = language.map(str::to_owned);
+        self
+    }
+
     pub fn feed(&mut self, data: &[u8]) {
         if self.synced {
             return self.packets(data);
@@ -323,6 +343,8 @@ impl Demuxer {
         if let Some(start) = find_sync(&seen) {
             self.synced = true;
             self.packets(&seen[start..]);
+        } else {
+            self.invalid_sync = true;
         }
     }
 
@@ -350,6 +372,13 @@ impl Demuxer {
         if pkt[0] != 0x47 {
             return;
         }
+        if pkt[3] & 0xc0 != 0 {
+            self.scrambled = true;
+            return;
+        }
+        if pkt[1] & 0x80 != 0 {
+            return;
+        } // transport error indicator
         let pusi = pkt[1] & 0x40 != 0;
         let pid = (((pkt[1] & 0x1F) as u16) << 8) | pkt[2] as u16;
         let afc = (pkt[3] >> 4) & 3;
@@ -361,7 +390,9 @@ impl Demuxer {
 
         if pid == 0 && pusi {
             // PAT: first real program's PMT PID.
-            let s = &payload[1 + payload[0] as usize..];
+            let Some(s) = payload.get(1 + payload[0] as usize..) else {
+                return;
+            };
             if s.len() >= 12 {
                 let end = (3 + (((s[1] & 0x0F) as usize) << 8 | s[2] as usize))
                     .min(s.len())
@@ -376,7 +407,9 @@ impl Demuxer {
                     .map(|e| ((e[2] & 0x1F) as u16) << 8 | e[3] as u16);
             }
         } else if Some(pid) == self.pmt_pid && pusi {
-            self.pmt(&payload[1 + payload[0] as usize..]);
+            if let Some(s) = payload.get(1 + payload[0] as usize..) {
+                self.pmt(s);
+            }
         } else if Some(pid) == self.video_pid
             || Some(pid) == self.audio_pid
             || self.sound.is_some_and(|(p, _)| p == pid)
@@ -403,12 +436,42 @@ impl Demuxer {
             .min(s.len())
             .saturating_sub(4);
         let mut i = 12 + (((s[10] & 0x0F) as usize) << 8 | s[11] as usize);
+        let mut preferred_pid = None;
         while i + 5 <= end {
             let (ty, es_pid) = (s[i], ((s[i + 1] & 0x1F) as u16) << 8 | s[i + 2] as u16);
             let info_len = ((s[i + 3] & 0x0F) as usize) << 8 | s[i + 4] as usize;
             // Descriptor tags of this stream: private data (0x06) is AC-3 only if one says so.
             let tags = descriptor_tags(s.get(i + 5..(i + 5 + info_len).min(s.len())));
             let ac3_tag = tags.iter().any(|t| matches!(t, 0x6A | 0x7A | 0x81));
+            let mut descriptors = s.get(i + 5..(i + 5 + info_len).min(s.len())).unwrap_or(&[]);
+            let mut language = None;
+            while descriptors.len() >= 2 {
+                let len = descriptors[1] as usize;
+                let Some(value) = descriptors.get(2..2 + len) else {
+                    break;
+                };
+                if descriptors[0] == 0x0a {
+                    language = value.get(..3).and_then(|v| std::str::from_utf8(v).ok());
+                }
+                descriptors = &descriptors[2 + len..];
+            }
+            if self
+                .preferred_language
+                .as_deref()
+                .is_some_and(|wanted| Some(wanted) == language)
+                && matches!(ty, 0x0f | 0x81 | 0x87 | 0x03 | 0x04 | 0x06)
+            {
+                self.audio_pid = None;
+                self.sound = None;
+                self.undecodable_audio = None;
+                preferred_pid = Some(es_pid);
+            }
+            if preferred_pid.is_some_and(|pid| pid != es_pid)
+                && matches!(ty, 0x0f | 0x81 | 0x87 | 0x03 | 0x04 | 0x06)
+            {
+                i += 5 + info_len;
+                continue;
+            }
             match ty {
                 0x1B if self.video_pid.is_none() => self.video_pid = Some(es_pid),
                 0x0F if self.audio_pid.is_none() => self.audio_pid = Some(es_pid),
@@ -432,7 +495,76 @@ impl Demuxer {
         }
     }
 
+    /// Completed pictures before the next keyframe, retaining PSI and partial PES state.
+    /// The output preserves the initial video prefix supplied to `new`.
+    pub fn take_fragment(&mut self) -> Result<Option<Demuxed>, Error> {
+        if self.invalid_sync {
+            return Err(Error::NoSync);
+        }
+        if let Some(codec) = &self.foreign_video {
+            return Err(Error::NoVideo(Some(codec.clone())));
+        }
+        if self.scrambled {
+            return Err(Error::Scrambled);
+        }
+        let Some(cut) = self
+            .out
+            .video
+            .iter()
+            .enumerate()
+            .skip(1)
+            .find(|(_, v)| v.key)
+            .map(|(i, _)| i)
+        else {
+            return Ok(None);
+        };
+        let cutoff = self.out.video[cut].pts;
+        let bytes: usize = self.out.video[..cut].iter().map(|v| v.len as usize).sum();
+        let remaining = self.out.video_data.split_off(self.video_base + bytes);
+        let prefix = self.out.video_data[..self.video_base].to_vec();
+        let video_data = std::mem::replace(&mut self.out.video_data, prefix);
+        self.out.video_data.extend(remaining);
+        let video = self.out.video.drain(..cut).collect();
+        let (audio, later) = std::mem::take(&mut self.out.audio)
+            .into_iter()
+            .partition(|s| s.pts < cutoff);
+        self.out.audio = later;
+        let (sound, later) = std::mem::take(&mut self.out.sound)
+            .into_iter()
+            .partition(|s| s.pts < cutoff);
+        self.out.sound = later;
+        let mut out = Demuxed {
+            video,
+            video_data,
+            audio,
+            sound,
+            sps: self.out.sps.clone(),
+            pps: self.out.pps.clone(),
+            aac: self.out.aac,
+            sound_kind: self.sound.map(|(_, k)| k),
+            simple_eac3: self.out.simple_eac3,
+            skipped_audio: self.undecodable_audio.clone(),
+        };
+        if self.audio_pid.is_some() {
+            out.sound.clear();
+            out.sound_kind = None;
+        }
+        sort_video(&mut out, self.video_base);
+        Ok(Some(out))
+    }
+
+    pub(crate) fn buffered_bytes(&self) -> usize {
+        self.out.video_data.len()
+            + self.carry.len()
+            + self.pes.values().map(Vec::len).sum::<usize>()
+            + self.out.audio.iter().map(|s| s.data.len()).sum::<usize>()
+            + self.out.sound.iter().map(|s| s.data.len()).sum::<usize>()
+    }
+
     pub fn finish(mut self) -> Result<Demuxed, Error> {
+        if self.scrambled {
+            return Err(Error::Scrambled);
+        }
         if !self.synced {
             self.sync();
             if !self.synced {
@@ -447,7 +579,9 @@ impl Demuxer {
         if self.pmt_pid.is_none() {
             return Err(Error::NoPmt);
         }
-        if self.video_pid.is_none() {
+        if self.video_pid.is_none()
+            && (self.foreign_video.is_some() || self.audio_pid.is_none() && self.sound.is_none())
+        {
             return Err(Error::NoVideo(self.foreign_video));
         }
         let mut out = self.out;
@@ -507,6 +641,42 @@ pub fn demux(data: &[u8]) -> Result<Demuxed, Error> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn audio_language_selects_the_matching_program_descriptor() {
+        let mut pmt = vec![0u8; 12];
+        for (pid, language) in [(0x101u16, b"eng"), (0x102, b"spa")] {
+            pmt.extend([0x0f, 0xe0 | ((pid >> 8) as u8), pid as u8, 0xf0, 6, 0x0a, 4]);
+            pmt.extend(language);
+            pmt.push(0);
+        }
+        pmt.extend([0; 4]);
+        let len = pmt.len() - 3;
+        pmt[1] = 0xb0 | ((len >> 8) as u8);
+        pmt[2] = len as u8;
+        let mut d = Demuxer::default().audio_language(Some("spa"));
+        d.pmt(&pmt);
+        assert_eq!(d.audio_pid, Some(0x102));
+        let mut d = Demuxer::default().audio_language(Some("fra"));
+        d.pmt(&pmt);
+        assert_eq!(d.audio_pid, Some(0x101));
+    }
+
+    #[test]
+    fn malformed_psi_and_scrambling_are_rejected_without_panics() {
+        let mut packets = vec![0u8; 188 * 4];
+        for p in packets.chunks_mut(188) {
+            p[0] = 0x47;
+            p[1] = 0x40;
+            p[3] = 0x10;
+            p[4] = 255;
+        }
+        assert!(demux(&packets).is_err());
+        for p in packets.chunks_mut(188) {
+            p[3] = 0x90;
+        }
+        assert_eq!(demux(&packets).unwrap_err(), Error::Scrambled);
+    }
 
     #[test]
     fn splits_annexb_with_both_start_code_lengths() {
