@@ -53,11 +53,22 @@ fn ac3_configuration_matches_specification_and_ffmpeg() {
             String::from_utf8_lossy(&mux.stderr)
         );
         let reference_bytes = std::fs::read(&reference).unwrap();
-        assert_eq!(
-            box_bytes(&init.bytes, config),
-            box_bytes(&reference_bytes, config),
-            "{name}"
-        );
+        let actual = box_bytes(&init.bytes, config);
+        let expected = box_bytes(&reference_bytes, config);
+        if enhanced {
+            // ETSI TS 102 366 Annex F has five bytes for this single independent stream.
+            // Some muxers append the optional zero Atmos-extension flag defined by Dolby:
+            // https://ott.dolby.com/OnDelKits/DDP/Dolby_Digital_Plus_Online_Delivery_Kit_v1.5/Documentation/Playback/SDM/help_files/topics/c_id_ddp_atmos_isobmff_2.html
+            assert_eq!(actual, [4, 0, 32, 15, 0], "fixture's core dec3 fields");
+            assert!(matches!(expected.len(), 5 | 6), "{name}: {expected:?}");
+            assert_eq!(actual, &expected[..5], "{name}");
+            assert!(
+                expected.get(5).is_none_or(|flag| *flag == 0),
+                "unsupported extension: {expected:?}"
+            );
+        } else {
+            assert_eq!(actual, expected, "{name}");
+        }
         let mut output = init.bytes.clone();
         output.extend(out.fragment());
         std::fs::write(&ours, output).unwrap();

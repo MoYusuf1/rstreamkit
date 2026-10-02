@@ -175,3 +175,9 @@ MP4/Matroska movie runs reach 40.8/68.2 seconds with zero dropped/corrupted fram
 Resolution and AAC-rate changes (320×180/48 kHz → 640×360/44.1 kHz → original) reach
 6.097 seconds; draining each old source prevents the first segment being discarded.
 The final source's 60 frames report no drops; frame counters reset with source rebuilds.
+
+Dolby configuration comparison: AC-3 `dac3` bytes match exactly. The E-AC-3 fixture's
+five core `dec3` bytes match exactly. Older FFmpeg muxers append a zero extension byte;
+the test accepts that disabled flag while rejecting a nonzero extension. The optional
+extension is documented by [Dolby](https://ott.dolby.com/OnDelKits/DDP/Dolby_Digital_Plus_Online_Delivery_Kit_v1.5/Documentation/Playback/SDM/help_files/topics/c_id_ddp_atmos_isobmff_2.html).
+Both reference layouts must still decode our complete output without errors.
