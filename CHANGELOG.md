@@ -28,6 +28,7 @@ Changes:
 - Adaptive throughput-based variant selection and one-segment bounded prefetch.
 - Reproducible browser/demo and Node profiling tools; multi-segment soak tests.
 - Isolate temporary FFmpeg test files to avoid parallel test races.
+- Plain-language README; `docs/technical-breakdown.md`, a handoff for contributors and AI agents.
 
 ## 0.1.0
 

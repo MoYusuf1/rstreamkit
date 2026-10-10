@@ -32,7 +32,7 @@ can run inside apps, so a command-line startup win is not an in-process win.
 
 Methods and output checks are in [performance.md](performance.md). Detailed
 issue acceptance and the desktop browser matrix are in [issues.md](issues.md).
-Most new work is in draft PR #41 and has not landed on main.
+The work from PR #41 landed on main on 2026-10-09.
 
 ## Weak layers and tradeoffs
 
@@ -127,7 +127,7 @@ remain research or later projects. No fallback should quietly invoke FFmpeg.
 ## GitHub work queue
 
 Use [#26](https://github.com/MoYusuf1/rstreamkit/issues/26) as the index.
-The existing implementation remains in [PR #41](https://github.com/MoYusuf1/rstreamkit/pull/41).
+The implementation landed through [PR #41](https://github.com/MoYusuf1/rstreamkit/pull/41).
 New work has separate issues with acceptance checks:
 
 - [#42: fair FFmpeg baselines and visible playback checks](https://github.com/MoYusuf1/rstreamkit/issues/42).

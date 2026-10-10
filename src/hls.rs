@@ -1,7 +1,9 @@
-//! HLS playlist parsing: the handful of tags a player needs, nothing more.
+//! HLS playlist parsing: the handful of tags a player needs, nothing more. Master playlists give
+//! variants and their demuxed audio renditions; media playlists give segments with durations,
+//! discontinuities, AES-128 keys, fMP4 maps and byte ranges. Choosing a variant by bandwidth is
+//! here; deciding what to fetch next and when to switch is `live`'s job.
 //!
-//! ponytail: no ABR (one variant is picked once), no AES-128 or fMP4 segments, and demuxed
-//! audio renditions (EXT-X-MEDIA) are ignored, so those streams play without sound.
+//! ponytail: only the tags a player acts on are read; any other tag is ignored.
 
 use crate::Error;
 

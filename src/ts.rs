@@ -1,8 +1,10 @@
-//! MPEG-TS demuxer for one HLS segment: H.264 video + AAC (ADTS) audio.
+//! MPEG-TS demuxer: H.264 video with AAC (ADTS) or AC-3, E-AC-3 and MP2 sound, fed in whatever
+//! pieces the network delivers (`Demuxer::feed`).
 //!
 //! ponytail: a segment is assumed to be self-contained (starts with PAT/PMT, PES packets don't
 //! straddle segments), PSI sections fit in one packet, and one video PES carries one frame.
-//! All true for normal HLS output; continuous `.ts` streams would need incremental input.
+//! All true for normal HLS output; endless `.ts` streams go through [`crate::Continuous`], which
+//! cuts them into fragments at keyframes.
 
 use std::collections::HashMap;
 

@@ -1,11 +1,12 @@
 # Issue acceptance and playback validation
 
-Results as of 2026-10-01. Completed work is linked from the GitHub issues to
-draft PR #41; issues stay open until the work lands. The table records evidence
-and further checks. Timing details are in [performance.md](performance.md).
+Results as of 2026-10-01. The work landed on `main` on 2026-10-09 through
+PR #41. The table records evidence and further checks. Timing details are in
+[performance.md](performance.md).
 
 Local acceptance is complete for #4, #6, #7, #10, #15, #18, #33, #35, #36,
-#38, #39 and #40. Extra checks listed below remain useful follow-up work.
+#38, #39 and #40, and those issues were closed when the work landed. Extra
+checks listed below remain useful follow-up work.
 
 | Issue | Local work and evidence | Remaining acceptance |
 | --- | --- | --- |
