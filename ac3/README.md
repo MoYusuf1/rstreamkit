@@ -43,7 +43,7 @@ Results on the files it was measured with:
 The cost is a little size: a browser page built with rstreamkit grows by 6.6 KB brotli-compressed
 (+2.1%), and the native command by 16.9 KB (+1.1%).
 
-Decoded PCM is byte-identical to oxideav-ac3 0.0.11's on all of them, and the full test suite
+Decoded PCM is byte-identical to oxideav-ac3 0.0.11's on all of these inputs, and the full test suite
 passes. rstreamkit's `sound` tests pin a checksum of decoded fixtures to that original output, so a
 change that alters a single sample fails there.
 
