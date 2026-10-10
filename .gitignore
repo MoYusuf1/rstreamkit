@@ -2,8 +2,10 @@
 Cargo.lock
 
 /tools/harness/target/
+/tools/player/target/
 /tools/harness/Cargo.lock
 /tools/web/pkg/
+/tools/web/player/
 /tools/node/pkg/
 /tools/media/
 /tools/results/

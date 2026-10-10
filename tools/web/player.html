@@ -1,0 +1,79 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>rstreamkit player baseline</title>
+<style>body{font:16px system-ui;max-width:900px;margin:32px auto;padding:16px}video{width:100%}input{width:60%}button,input,select{padding:8px}pre{white-space:pre-wrap}</style>
+<h1>Player baseline</h1>
+<p>Choose features with ?build=live, live-sound, vod or full. Keep this tab visible when measuring playback.</p>
+<video id="video" controls muted playsinline></video>
+<p><input id="url" value="/media/live.m3u8"><select id="mode"><option>live</option><option>movie</option></select> <button id="play">Play</button> <button id="stop">Stop</button></p>
+<p><button id="sample">Show report</button> <button id="save">Save report</button> <button id="capabilities">Check 4K support</button></p><pre id="report"></pre>
+<script type="module">
+const flavor=new URL(location).searchParams.get('build') || 'full';
+if(!['live','live-sound','vod','full'].includes(flavor))throw Error('Unknown build');
+const moduleStarted=performance.now();
+const kit=await import(`./player/${flavor}/rstreamkit_player.js`);
+const initStarted=performance.now();
+await kit.default();
+const startup={module_load_and_init_ms:performance.now()-moduleStarted,wasm_fetch_compile_init_ms:performance.now()-initStarted};
+const video=document.querySelector('#video');
+let session=null;
+let capabilities=null;
+const quality=()=>{const q=video.getVideoPlaybackQuality?.();return q?{total:q.totalVideoFrames,dropped:q.droppedVideoFrames}:null};
+const boundedPush=(list,item)=>{if(list.length===300)list.shift();list.push(item)};
+const finishVisibility=now=>{if(session?.active){session[session.visible?'visible_ms':'hidden_ms']+=now-session.visibility_at;session.visibility_at=now}};
+document.addEventListener('visibilitychange',()=>{finishVisibility(performance.now());if(session)session.visible=!document.hidden});
+video.addEventListener('loadedmetadata',()=>{if(session?.active)session.quality_at_start=quality()});
+function finishWaiting(){if(session?.waiting_at!=null){const duration_ms=performance.now()-session.waiting_at;session.waiting_ms+=duration_ms;boundedPush(session.waits,{ms:session.waiting_at-session.started,duration_ms});session.waiting_at=null}}
+video.addEventListener('waiting',()=>{if(session?.active&&session.first_frame_ms!=null&&!video.paused&&!video.seeking&&session.waiting_at==null){session.waiting_count++;session.waiting_at=performance.now()}});
+for(const event of ['playing','pause','seeking'])video.addEventListener(event,finishWaiting);
+video.addEventListener('ended',()=>{finishWaiting();finishVisibility(performance.now());if(session?.active){session.active=false;session.ended=performance.now()}});
+window.onStatus=status=>{if(session){session.status_count++;boundedPush(session.statuses,{ms:performance.now()-session.started,status});if(session.active&&/^(Failed|Unsupported|BrowserError)/.test(status)){finishWaiting();finishVisibility(performance.now());session.active=false;session.ended=performance.now()}}};
+window.addEventListener('error',e=>window.onStatus(`BrowserError: ${e.message}`));
+window.addEventListener('unhandledrejection',e=>window.onStatus(`BrowserError: ${e.reason}`));
+let observer;
+let longtaskSupported=false;
+try{if(PerformanceObserver.supportedEntryTypes.includes('longtask')){observer=new PerformanceObserver(list=>{if(session)for(const e of list.getEntries())if(e.startTime>=session.started&&e.startTime<=(session.ended??Infinity)){session.longtask_count++;session.longtask_ms+=e.duration;boundedPush(session.longtasks,{ms:e.startTime-session.started,duration_ms:e.duration})}});observer.observe({type:'longtask'});longtaskSupported=true}}catch{}
+let frameCallback;
+function watchFrame(current){
+ if(!video.requestVideoFrameCallback)return;
+ frameCallback=video.requestVideoFrameCallback((now,frame)=>{if(session!==current)return;
+  current.first_frame_ms ??= now-current.started;
+  current.last_frame={width:frame.width,height:frame.height,media_time:frame.mediaTime};
+  watchFrame(current);
+ });
+}
+window.start=async(url,mode='live')=>{
+ if(typeof kit[mode]!=='function')throw Error(`${mode} is not included in ${flavor}`);
+ kit.stop();
+ if(frameCallback!==undefined)video.cancelVideoFrameCallback?.(frameCallback);
+ session={started:performance.now(),url:new URL(url,location).href,mode,visible:!document.hidden,visibility_at:performance.now(),visible_ms:0,hidden_ms:0,first_frame_ms:null,last_frame:null,quality_at_start:quality(),longtask_count:0,longtask_ms:0,longtasks:[],status_count:0,statuses:[],memory:[],memory_samples:0,waiting_count:0,waiting_ms:0,waiting_at:null,waits:[],active:true};
+ watchFrame(session);
+ try{await kit[mode](session.url)}catch(error){window.onStatus(String(error));throw error}
+};
+window.stop=()=>{finishWaiting();finishVisibility(performance.now());if(session){session.active=false;session.ended=performance.now()}kit.stop();if(frameCallback!==undefined)video.cancelVideoFrameCallback?.(frameCallback)};
+setInterval(()=>{if(session?.active){session.memory_samples++;boundedPush(session.memory,{ms:performance.now()-session.started,wasm_bytes:kit.memory_bytes(),buffered_seconds:Array.from({length:video.buffered.length},(_,i)=>video.buffered.end(i)-video.buffered.start(i)).reduce((a,b)=>a+b,0),current_time:video.currentTime})}},1000);
+window.sample=()=>{
+ if(session?.active)finishVisibility(performance.now());
+ const q=quality(),base=session?.quality_at_start;
+ const frames=q&&base&&q.total>=base.total&&q.dropped>=base.dropped?{total:q.total-base.total,dropped:q.dropped-base.dropped}:null;
+ return {schema:1,build:flavor,user_agent:navigator.userAgent,device_pixel_ratio:devicePixelRatio,startup,capabilities,metrics_support:{longtasks:longtaskSupported,presented_frames:typeof video.requestVideoFrameCallback==='function'},
+  session:session?{...session,waiting_ms:session.waiting_ms+(session.waiting_at==null?0:performance.now()-session.waiting_at),elapsed_ms:(session.ended??performance.now())-session.started}:null,
+  playback:{current_time:video.currentTime,paused:video.paused,ready_state:video.readyState,width:video.videoWidth,height:video.videoHeight,frames,dropped_fraction:frames?.total?frames.dropped/frames.total:null,buffer:Array.from({length:video.buffered.length},(_,i)=>[video.buffered.start(i),video.buffered.end(i)]),stats:kit.stats(),wasm_bytes:kit.memory_bytes()},
+  limits:['Wasm committed memory excludes browser decoder, GPU and JS memory.','Frame counters may reset when the media source changes; null means the delta is unavailable.','Long-task and memory logs retain the last 300 entries; totals cover the session.','This development server does not serve Brotli; use size.json for compressed artifact bytes.','A short test is not a 30-minute 4K60 acceptance run.']};
+};
+document.querySelector('#play').onclick=()=>start(document.querySelector('#url').value,document.querySelector('#mode').value).catch(e=>document.querySelector('#report').textContent=String(e));
+document.querySelector('#stop').onclick=stop;
+document.querySelector('#sample').onclick=()=>document.querySelector('#report').textContent=JSON.stringify(sample(),null,2);
+document.querySelector('#capabilities').onclick=async()=>{
+ capabilities={note:'Video-only capability predictions. Actual playback, audio, hardware use and frame drops still need testing.',native_hls:video.canPlayType('application/vnd.apple.mpegurl'),mse_worker:typeof MediaSource!=='undefined'&&MediaSource.canConstructInDedicatedWorker===true,managed_media_source:typeof ManagedMediaSource!=='undefined',webcodecs:typeof VideoDecoder!=='undefined',configs:[]};
+ for(const [codec,width,height,framerate,bitrate] of [['avc1.640028',1920,1080,30,8000000],... [15000000,25000000,40000000].map(b=>['avc1.640034',3840,2160,60,b])]){
+  const config={type:'media-source',video:{contentType:`video/mp4; codecs="${codec}"`,width,height,framerate,bitrate}};
+  const entry={config,mse:typeof MediaSource!=='undefined'&&MediaSource.isTypeSupported(config.video.contentType)};
+  try{entry.prediction=await navigator.mediaCapabilities.decodingInfo(config)}catch(e){entry.error=String(e)}
+  capabilities.configs.push(entry);
+ }
+ document.querySelector('#report').textContent=JSON.stringify(sample(),null,2);
+};
+document.querySelector('#save').onclick=()=>{const url=URL.createObjectURL(new Blob([JSON.stringify(sample(),null,2)],{type:'application/json'}));const a=document.createElement('a');a.href=url;a.download=`rstreamkit-${flavor}-playback.json`;a.click();setTimeout(()=>URL.revokeObjectURL(url),1000)};
+window.ready=true;
+</script>

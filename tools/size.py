@@ -1,0 +1,89 @@
+#!/usr/bin/env python3
+"""Build the same playback entry point with four feature sets and record bytes."""
+import argparse
+import hashlib
+import json
+from pathlib import Path
+import subprocess
+import sys
+
+ROOT = Path(__file__).resolve().parents[1]
+PLAYER = ROOT / "tools/player"
+FLAVORS = {"live": [], "live-sound": ["sound"], "vod": ["vod"], "full": ["sound", "vod"]}
+
+
+def run(*args):
+    result = subprocess.run(args, cwd=ROOT, check=True, text=True, capture_output=True)
+    if result.stderr:
+        print(result.stderr, file=sys.stderr, end="")
+    return result.stdout.strip()
+
+
+def digest(path):
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--output", type=Path, default=ROOT / "tools/results/size.json")
+    parser.add_argument("--check-budgets", action="store_true",
+                        help="fail when wasm + JS Brotli bytes exceed tools/player/budgets.json")
+    args = parser.parse_args()
+    report = {
+        "schema": 1,
+        "revision": run("git", "rev-parse", "HEAD"),
+        "working_tree": run("git", "status", "--porcelain"),
+        "tools": {name: run(name, "--version") for name in
+                  ["rustc", "cargo", "wasm-bindgen", "wasm-opt", "brotli"]},
+        "recipe": {"profile": "release: opt-level=s, lto=true, codegen-units=1, panic=abort",
+                   "wasm_opt": "-Oz", "brotli_quality": 11,
+                   "target": "wasm32-unknown-unknown", "entry": "tools/player/src/lib.rs"},
+        "flavors": [],
+    }
+    for name, features in FLAVORS.items():
+        command = ["cargo", "build", "--offline", "--manifest-path", str(PLAYER / "Cargo.toml"),
+                   "--target", "wasm32-unknown-unknown", "--release", "--no-default-features"]
+        if features:
+            command += ["--features", ",".join(features)]
+        run(*command)
+        output = ROOT / "tools/web/player" / name
+        output.mkdir(parents=True, exist_ok=True)
+        run("wasm-bindgen", str(PLAYER / "target/wasm32-unknown-unknown/release/rstreamkit_player.wasm"),
+            "--target", "web", "--out-dir", str(output))
+        wasm = output / "rstreamkit_player_bg.wasm"
+        wasm_before_opt_bytes = wasm.stat().st_size
+        run("wasm-opt", str(wasm), "-Oz", "-o", str(wasm))
+        files = []
+        for path in [wasm, output / "rstreamkit_player.js"]:
+            compressed = path.with_suffix(path.suffix + ".br")
+            run("brotli", "-f", "-q", "11", str(path), "-o", str(compressed))
+            files.append({"file": path.name, "bytes": path.stat().st_size,
+                          "brotli_bytes": compressed.stat().st_size, "sha256": digest(path)})
+        entry = {"name": name, "features": features, "files": files,
+                 "wasm_before_opt_bytes": wasm_before_opt_bytes,
+                 "startup_bytes": sum(f["bytes"] for f in files),
+                 "startup_brotli_bytes": sum(f["brotli_bytes"] for f in files)}
+        report["flavors"].append(entry)
+        print(f'{name}: {entry["startup_brotli_bytes"]:,} Brotli bytes (wasm + JS)', flush=True)
+    report["source_sha256"] = {
+        str(p.relative_to(ROOT)): digest(p)
+        for p in sorted([*ROOT.glob("src/**/*.rs"), *ROOT.glob("ac3/src/**/*.rs"),
+                         *PLAYER.glob("src/**/*.rs"), ROOT / "Cargo.toml", ROOT / "ac3/Cargo.toml",
+                         PLAYER / "Cargo.toml", PLAYER / "Cargo.lock", Path(__file__).resolve()])
+    }
+    # Preserve the exact dependency resolution, even though generated Cargo.lock files are ignored.
+    report["cargo_lock"] = (PLAYER / "Cargo.lock").read_text()
+    args.output.parent.mkdir(parents=True, exist_ok=True)
+    args.output.write_text(json.dumps(report, indent=2) + "\n")
+    print(f"Report: {args.output}")
+    if args.check_budgets:
+        budgets = json.loads((PLAYER / "budgets.json").read_text())
+        failures = [f'{f["name"]}: {f["startup_brotli_bytes"]:,} > {budgets[f["name"]]:,} bytes'
+                    for f in report["flavors"] if f["startup_brotli_bytes"] > budgets[f["name"]]]
+        if failures:
+            raise SystemExit("Download budget exceeded:\n" + "\n".join(failures))
+        print("All download budgets passed.")
+
+
+if __name__ == "__main__":
+    main()

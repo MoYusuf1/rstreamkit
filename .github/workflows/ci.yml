@@ -55,6 +55,37 @@ jobs:
       - run: cargo +1.88.0 check --target wasm32-unknown-unknown --all-features
       - run: cargo +1.88.0 check --target wasm32-unknown-unknown --no-default-features
 
+  wasm-audio:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup target add wasm32-unknown-unknown
+      - run: rustup component add rustfmt clippy
+      - run: cargo fmt --manifest-path tools/player/Cargo.toml --check
+      - name: Minimal player feature combinations
+        run: |
+          for features in "" sound vod sound,vod; do
+            cargo clippy --manifest-path tools/player/Cargo.toml --target wasm32-unknown-unknown --no-default-features --features "$features" -- -D warnings
+          done
+      - run: cargo install wasm-bindgen-cli --version 0.2.128 --locked
+      - run: bash tools/build.sh
+      - run: node tools/node/audio-smoke.cjs
+      - name: Size tools (Binaryen 130)
+        run: |
+          sudo apt-get update && sudo apt-get install -y brotli
+          archive="$RUNNER_TEMP/binaryen.tar.gz"
+          curl -fL https://github.com/WebAssembly/binaryen/releases/download/version_130/binaryen-version_130-x86_64-linux.tar.gz -o "$archive"
+          echo "0a18362361ad05465118cd8eeb72edaeec89de6894bc283576ef4e07aa3babcc  $archive" | sha256sum --check
+          tar -xzf "$archive" -C "$RUNNER_TEMP"
+          echo "$RUNNER_TEMP/binaryen-version_130/bin" >> "$GITHUB_PATH"
+      - name: Check all four player download budgets
+        run: python3 tools/size.py --check-budgets
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: player-size
+          path: tools/results/size.json
+
   profile:
     runs-on: ubuntu-latest
     continue-on-error: true

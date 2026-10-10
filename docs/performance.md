@@ -6,6 +6,96 @@ and download size. Rust alone does not
 establish superiority over FFmpeg. Compare equivalent operations and output quality;
 remuxing H.264 is not a fair comparison with decoding or encoding it.
 
+## Player baseline (2026-10-10)
+
+The new `tools/player` entry point exports playback controls, without benchmark
+exports. Rust 1.99.0, wasm-bindgen 0.2.128, wasm-opt 130 (`-Oz`), Brotli 1.2.0
+(`-q 11`), release `opt-level=s`, LTO, one codegen unit and aborting panics.
+Two builds produced identical artifact hashes and sizes for all four feature sets.
+
+| Build | Features | Raw Wasm + JS bytes | Brotli Wasm + JS bytes | Initial download budget |
+| --- | --- | ---: | ---: | ---: |
+| Live | No optional decoders or movie readers | 295,490 | 108,769 | 115,000 |
+| Live + sound | AC-3, E-AC-3 and MP2 fallback | 546,110 | 206,708 | 220,000 |
+| Live + movies | MP4/MKV, without optional sound decoders | 359,382 | 131,778 | 140,000 |
+| Full | Sound and movies | 610,022 | 228,963 | 245,000 |
+
+These are the first player baselines, not a measured reduction against the old
+benchmark harness. Feature removal changes coverage. Host HTML, media and HTTP
+headers are excluded; generated JS is included without an extra minifier.
+Run `python3 tools/size.py --check-budgets` after fetching dependencies. JSON keeps
+source/artifact hashes, tool versions and the resolved lockfile; see tools/README.md.
+
+Browser check: Linux, Ryzen 7 5700, in-app Chromium 155, visible tab. The 24-second
+320×180 AAC control completed with 724 reported frames and no drops. The full
+player's six-second 1920×1080/30 AC-3 fixture completed with 180 frames, no drops,
+186.3 ms to the first presented frame, no observed long tasks and 10,354,688
+committed Wasm bytes. The AC-3 fixture SHA-256 is
+`a37d796f069bb82a4ca4dffe62e95180822abe85c5eaf4f38956049f517a0338`.
+Movie-only playback also advanced with no drops in a short 320×180 MP4 check.
+Wasm memory excludes decoder, GPU and JS allocations. These are short checks,
+not sustained performance results or a Chrome/Edge/Safari acceptance matrix.
+
+This run exposed a browser-only decoder regression: cached trace switches used
+`std::env::vars_os()`, which panics on browser Wasm. Trace switches now remain off
+on that target; native behavior is unchanged. A required CI smoke check decodes
+the checked-in AC-3, E-AC-3 and MP2 fixtures in Wasm, encodes FLAC and packages them.
+All 558 native decoder tests pass (two other tests remain ignored).
+
+Fresh Node harness measurements: seven iterations, six-second AC-3 streamed
+packaging median 45.020 ms, maximum 56.151 ms; programme FLAC median 8.591 ms,
+maximum 10.127 ms, 237,119 output bytes versus 798,720 PCM bytes. The fixture setup
+and initial programme decoding are excluded from FLAC timing. These shared-machine
+samples do not establish a new speedup or an equivalent FFmpeg comparison.
+
+MediaCapabilities predicts H.264 4K60 support at 15, 25 and 40 Mbps here, but reports
+`powerEfficient=false`. A prediction is not proof of hardware decoding or smooth
+playback. Actual 4K fixtures, longer runs and Edge/Safari checks remain open.
+
+## Buffer and 4K follow-up (2026-10-10)
+
+Same Linux/Ryzen 7 5700/in-app Chromium 155 setup, full player, visible tab and
+localhost server. `python3 tools/4k.py --mbps 40` generates 18 seconds of synthetic
+3840×2160/60, 8-bit 4:2:0 H.264 High level 5.2 + stereo AAC, in three six-second
+segments. Encoding and CPU-heavy checks finished before browser measurements.
+The playlist SHA-256 is
+`d98985881c25d187a25707ccebb4e7e0d6630a7d1ae96579cfde26f806fdcb78`;
+its JSON sidecar records all segment hashes and the encoder/probe settings.
+
+| Measure | Original player, one run | Final player, two fresh-page runs |
+| --- | ---: | ---: |
+| Frames accounted for | 1,080 | 1,080 each |
+| Dropped frames | 0 | 0 each |
+| Waiting events after first frame | Not recorded | 0 each |
+| Committed Wasm bytes | 70,909,952 | 35,848,192–36,700,160 (about 49% less) |
+| First presented frame | 195.7 ms | 160.5–180.8 ms |
+| Full player, Brotli Wasm + JS | 228,963 bytes | 229,337 bytes (+374, about 0.16%) |
+
+The changed policy reserves space for the next append, removes the two-segment
+ahead floor, gates speculative downloads by estimated bytes and caps their actual
+response bodies. Merged external audio is included in the estimate; bitrate spikes
+take effect immediately. Appended Rust output is freed before buffer waits. A
+clock-based timer wakes near the threshold, with half a second of minimum startup
+headroom. Finite playlists now continue after a throttle instead of ending with
+unconsumed segments.
+
+Keep one segment behind for video dependencies. An experiment trimming within the
+current keyframe group removed future dependent frames, so that approach was
+rejected. Long keyframe groups and oversized segments can exceed the approximate
+32 MiB compressed-media target. Browser coded buffers, decoded surfaces, JS and GPU
+memory are separate from the Wasm figures above. This result measures our own
+before/after player; it does not compare FFmpeg, prove hardware decoding or establish
+30-minute/four-hour acceptance. Edge and Safari remain untested here.
+
+Current compressed build totals are live 109,318, live+sound 207,114, live+movies
+132,204 and full 229,337 bytes. All four review budgets pass. CI now checks them
+using the checksum-pinned official Binaryen 130 build and uploads the report;
+the CI run itself still needs verification on GitHub.
+
+The browser reports worker MSE available, ManagedMediaSource unavailable and
+WebCodecs available on this installation. These are feature checks, not enabled
+backends. Technology choices and their costs are recorded in docs/roadmap.md.
+
 ## Work in order
 
 1. Preserve the reproducible Node and browser harness (#38). Run each memory scenario
