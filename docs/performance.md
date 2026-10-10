@@ -138,16 +138,94 @@ hashes for all 180 video frames and byte-identical decoded audio (1,159,168 byte
 Input probing/process startup contribute to FFmpeg's measured time. This does not
 measure in-process libavformat, codec conversion, general decoder speed or FFmpeg wasm.
 
-Reproduce after media generation:
+That measurement used the since-removed `transmux` example. The next section, the
+`rstreamkit` command against FFmpeg on five workloads, supersedes it, and shows most of
+that first 4.2× was FFmpeg's start-up and probing.
+
+## The rstreamkit command against FFmpeg (2026-10-10)
+
+AMD Ryzen 7 5700 (16 threads), Linux 7.2, Rust 1.99 release build, FFmpeg n9.0.2.
+Both tools run as fresh processes on the same input and write to a RAM-backed
+directory (`/dev/shm`). One warm-up, then timed runs in alternating order; medians,
+maxima in brackets. Wall time includes process start-up and reading and writing the
+files. FFmpeg's `-benchmark` rtime is its processing alone, without start-up and input
+probing; our whole wall time is also compared with it, so a win there is a win on
+processing. Peak memory is maximum resident set size, measured through `tools/peak.rs`:
+spawned straight from Python, every process reports Python's memory as its own peak.
+
+| Workload | Input | Runs | rstreamkit | FFmpeg | FFmpeg processing only | Peak memory, ours / FFmpeg | Faster by (whole / against processing only) |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 6 s 1080p TS, H.264/AAC, copied | 6,866,512 B | 8 | 7.94 ms (9.16) | 71.87 ms (74.32) | 9.0 ms | 12.7 / 68.1 MB | 9.05× / 1.13× |
+| 10 min 1080p TS, H.264/AAC, copied | 686,602,884 B | 5 | 334 ms (365) | 831 ms (836) | 715 ms | 17.3 / 67.7 MB | 2.49× / 2.14× |
+| 30 min 1080p MP4, H.264/AAC, copied | 1,989,780,176 B | 5 | 781 ms (858) | 1,442 ms (1,687) | 1,241 ms | 16.3 / 66.4 MB | 1.85× / 1.59× |
+| 6 s 1080p TS, AC-3 5.1 decoded to stereo FLAC | 7,119,372 B | 8 | 56.4 ms (64.5) | 77.3 ms (85.1) | 13.0 ms | 13.2 / 72.0 MB | 1.37× / 0.23× |
+| 30 min 640×360 MKV, AC-3 5.1 decoded to stereo FLAC | 514,185,862 B | 3 | 14,256 ms (14,543) | 2,256 ms (2,281) | 2,173 ms | 9.6 / 63.6 MB | 0.16× / 0.15× |
+
+Every workload's outputs were checked against each other. All decoded pictures are
+identical (`framecrc`: 180, 18,000, 53,666, 180 and 45,000 pictures). Copied sound
+decodes to identical samples. Decoded sound comes from different AC-3 decoders and
+downmixes, so it is checked to decode cleanly to the same length within one AC-3 frame.
+
+FFmpeg's options: `-map 0:v:0 -map 0:a:0`, then `-c copy` (with `-bsf:a aac_adtstoasc`
+for TS) or `-c:v copy -c:a flac -compression_level 0 -ac 2 -sample_fmt s16` (fixed
+predictors and stereo 16-bit, as ours), then `-movflags frag_keyframe+empty_moov -f mp4`.
+Input SHA-256 prefixes: `aac.ts` 26e59a26f948, `long.ts` 94510259bf7e,
+`movie-aac.mp4` 539587a591c6, `ac3.ts` a37d796f069b, `movie-51.mkv` d2385bdd4070.
+
+What it shows:
+
+- **Repackaging is faster than FFmpeg on every input**, including against FFmpeg's
+  processing time alone, with a quarter of its memory or less. Memory does not grow
+  with the input: a 2 GB movie peaks at 16 MB.
+- **Decoding AC-3 is slower.** In-process, 6 s of 5.1 takes 40.6 ms in the AC-3
+  decoder dependency (`oxideav-ac3`) and 6.6 ms in our FLAC encoder, so the decoder is
+  86% of the work. It decodes all six channels to PCM and mixes down afterwards; a
+  stereo source costs 1.5 ms per second of sound, 5.1 costs 6.7. FFmpeg's whole job is
+  13 ms. Its FLAC is also smaller here (456 against 497 MB for 30 minutes).
+- **The first 4.2× was mostly FFmpeg starting up.** On that file FFmpeg's processing
+  took 9.5 ms, less than our 14.5 ms whole command at the time. The changes below made
+  ours faster than FFmpeg's processing.
+
+What changed (same machine; in-process stage timings unless "command"):
+
+| Change | Before | After |
+| --- | ---: | ---: |
+| Demuxing a 6 s TS segment | 4.9 ms | 2.4 ms |
+| Demuxing 10 minutes of TS | 533 ms | 216 ms |
+| A continuous TS stream cut at keyframes, 10 minutes | 535 ms | 190 ms |
+| A 30-minute MP4: 4 MiB fresh buffers, then one reused 1 MiB buffer | 930 ms | 171 ms |
+| Command, 6 s TS (all of the changes) | 14.5 ms | 7.9 ms |
+| Command, 10 min TS (first measured after the demuxer change: threads only) | 657 ms | 334 ms |
+| Command, 30 min MP4 (buffer reuse and threads) | 1,768 ms | 781 ms |
+
+- H.264 start codes are found eight bytes at a time: a start code begins with a zero
+  byte, compressed pictures have few, and the lowest flagged byte of the word test is
+  exact. A test compares it with a byte-by-byte scan on 2,000 dense random buffers.
+- Each TS packet found its stream through a SipHash map; a list of at most a few
+  streams replaces it.
+- A continuous stream's next buffer starts at the last one's capacity instead of
+  growing (and copying, and faulting in pages) again for every group of pictures.
+- 4 MiB movie reads made glibc return each freed buffer to the system, and every new
+  one paid for its pages again: raising glibc's trim and mmap thresholds took the same
+  run from 957 to 226 ms. The command now reuses one 1 MiB buffer.
+- The command reads, converts and writes on three threads joined by two-piece queues:
+  as fast as eight-piece queues, at 17 instead of 25 MB of peak memory.
+
+The earlier looped AC-3 movie (`movie.mkv`) is not used here. Each of its 300 seams
+overlaps its sound by about 10 ms: FFmpeg trims the overlap, we keep the samples and
+re-anchor within one frame, so decoded lengths differed by 3.2 s. The benchmark uses
+`movie-51.mkv`, encoded straight through.
+
+Not measured: in-process libavformat, FFmpeg built for wasm, other machines, and
+FFmpeg with non-default thread settings.
+
+Reproduce:
 
 ```sh
-cargo build --release --example transmux
-python3 tools/compare.py
+python3 tools/media.py
+cargo build --release --bin rstreamkit
+python3 tools/compare.py        # all five; python3 tools/compare.py "10 min" runs one
 ```
-
-The script records timing, checks both outputs decode without errors and compares
-video frame hashes and decoded PCM bytes. Its FFmpeg command uses stream copying,
-AAC header conversion, and `frag_keyframe+empty_moov`; no video/audio re-encoding.
 
 Accelerated wasm soak: five batches of 2,000 AAC segments (10,000 total) commit
 1,900,544 wasm bytes in every batch. Batch times are 345–356 ms. No growth after

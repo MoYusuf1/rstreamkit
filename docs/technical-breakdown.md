@@ -28,8 +28,10 @@ files for playback in a web browser.
 - **Video is never decoded or re-encoded.** H.264 passes through byte for byte: it is repackaged,
   not transcoded. Only *sound the browser can't play* (AC-3, E-AC-3, MP2) is decoded, in Rust, and
   written back as FLAC, which browsers play.
-- The media core is plain Rust and runs natively and in WebAssembly. The browser adapter (`mse`)
-  compiles for wasm only. Native hosts use the core with their own I/O through two traits.
+- The media core is plain Rust and runs natively and in WebAssembly. The `rstreamkit` command
+  (`src/main.rs`) converts files natively, like `ffmpeg -i in -c copy out.mp4`. The browser
+  adapter (`mse`) compiles for wasm only. Native hosts use the core with their own I/O through two
+  traits.
 - Apps are clients. They plug in through traits and must not need changes inside the library.
 
 ### What it deliberately does not do
@@ -77,9 +79,10 @@ src/
   live.rs, cancel.rs  live scheduling and memory policy; cancellation (compiled for wasm and tests)
   mp4.rs, mkv.rs, vod.rs   movie files (feature vod)
   mse.rs              the browser player (wasm only)
-tests/                pipeline, vod, vod_without_sound, continuous, flac, passthrough; fixtures/
-examples/             transmux (TS segments to one fMP4 file), dump (a movie to one fMP4 file)
-tools/                harness crate, test-bed page, Node profiler, media generator, fault server, FFmpeg comparison
+  main.rs             the `rstreamkit` command (feature vod): files and pipes in, fragmented MP4 out
+tests/                pipeline, vod, vod_without_sound, continuous, flac, passthrough, cli; fixtures/
+tools/                harness crate, test-bed page, Node profiler, media generator, fault server,
+                      FFmpeg comparison (compare.py) and its memory-honest launcher (peak.rs)
 docs/                 api.md (public contract), performance.md (measurements), issues.md, roadmap.md, this file
 .github/workflows/    ci.yml: fmt, app-name guard, clippy (8 runs), tests (3 runs), MSRV, profiling
 ```
@@ -103,7 +106,10 @@ docs/                 api.md (public contract), performance.md (measurements), i
 | Node (v26) | Headless wasm profiling, one fresh process per scenario. |
 | A browser automation pane (Chromium 152 to 154, Linux) | The truth about MSE playback: `video.buffered`, `getVideoPlaybackQuality()`, console, long tasks. |
 | Python 3 | `tools/media.py` (fixtures), `tools/server.py` (CORS, Range and fault server), `tools/compare.py` (FFmpeg comparison). |
-| `ffmpeg -f framemd5`, `-f s16le` | Proving two outputs decode to the same frames and the same samples. |
+| `ffmpeg -f framecrc` / `framemd5`, `-f s16le` | Proving two outputs decode to the same frames and the same samples. |
+| `ffmpeg -benchmark` | FFmpeg's processing time (`rtime`) without its start-up and probing. |
+| `tools/compare.py`, `tools/peak.rs` | The command against FFmpeg on five workloads; true peak memory of each run. |
+| A scratch crate depending on the library by path | Timing each stage in-process (demux, mux, read, fragment) when there's no profiler. |
 | `git archive HEAD \| tar -x -C <scratch>` | Testing a clean copy when the working tree holds someone else's uncommitted work. |
 | `gh` CLI | Issues and pull requests. |
 
@@ -146,7 +152,8 @@ cargo test --no-default-features --features vod  # movies, with undecodable soun
 bash tools/build.sh                              # harness -> tools/web/pkg and tools/node/pkg
 bash tools/demo.sh                               # build, generate media, serve http://127.0.0.1:8765
 bash tools/profile.sh                            # fresh-process Node profiling, JSON per scenario
-cargo build --release --example transmux && python3 tools/compare.py   # against FFmpeg
+cargo run --release -- in.ts out.mp4             # the command (TS, .m3u8, MP4, MKV; - is a pipe)
+cargo build --release --bin rstreamkit && python3 tools/compare.py   # against FFmpeg, 5 workloads
 ```
 
 ### Before every push (CI runs the same)
@@ -166,7 +173,7 @@ Put that in a `#!/usr/bin/env bash` file with `set -euo pipefail`. **fish does n
 `$f`**, so typed into fish the loop silently passes one argument. And a chain without a gate once
 let a failing lint be followed by a commit.
 
-CI (`.github/workflows/ci.yml`) also greps `src examples tests Cargo.toml` for app names. It runs an
+CI (`.github/workflows/ci.yml`) also greps `src tests Cargo.toml` for app names. It runs an
 MSRV job (`cargo check` with Rust 1.88, native and wasm, all and no features) and a non-blocking
 profiling job. Run the checks locally rather than waiting on CI.
 
@@ -175,7 +182,7 @@ profiling job. Run the checks locally rather than waiting on CI.
 | Feature | Default | Adds | Without it |
 |---|---|---|---|
 | `sound` | yes | AC-3, E-AC-3 and MP2 decoders | That sound is passed through where the platform plays it, otherwise reported as `Unsupported::Sound`. FLAC writing is unchanged. |
-| `vod` | yes | `mp4`, `mkv`, `vod`; in the browser `mse::probe` and `mse::play_movie` | No movie files. Live playback is unchanged. |
+| `vod` | yes | `mp4`, `mkv`, `vod`; the `rstreamkit` command; in the browser `mse::probe` and `mse::play_movie` | No movie files and no command. Live playback is unchanged. |
 
 `mse` has no feature of its own: `target_arch = "wasm32"` selects it.
 
@@ -203,24 +210,26 @@ wasm. Input: one 6-second 1080p H.264 segment at 8 Mbit/s.
 | AC-3 5.1 decoded to FLAC, streamed | 7.19 MB | 10.4 MB (1.45×) | 85 ms |
 | 5 batches of 2,000 AAC segments | | 1,900,544 bytes in every batch | 368 to 399 ms a batch |
 
-**Against FFmpeg.** The job is turning H.264/AAC MPEG-TS into fragmented MP4 without re-encoding.
-Both run as native command-line processes, so start-up and file reading and writing are included.
-The FFmpeg command is
-`-map 0:v:0 -map 0:a:0 -c copy -bsf:a aac_adtstoasc -movflags frag_keyframe+empty_moov -f mp4`. One
-warm-up, then eight timed runs per tool, alternating; median reported.
+**Against FFmpeg.** `tools/compare.py` races the `rstreamkit` command against FFmpeg n9.0.2 on five
+workloads. Both run as fresh processes, so start-up and file reading and writing are included. One
+warm-up, then timed runs in alternating order; medians. FFmpeg's own `-benchmark` rtime gives its
+processing time without start-up and probing, and our whole time is compared with that too. Every
+workload's two outputs are checked: identical pictures (`framecrc`), identical copied sound, and
+decoded sound of the same length. Full method and the before/after of each change are in
+`docs/performance.md`.
 
-| Input | rstreamkit | FFmpeg n9.0.2 | Ratio |
+| Workload | rstreamkit | FFmpeg (processing only) | Peak memory, ours / FFmpeg |
 |---|---:|---:|---:|
-| 6.87 MB segment, first measurement | 14.5 ms | 60.5 ms | 4.17× |
-| Same file, repeated three times on a clean checkout | 17.8 ms | 73.4 ms | 4.1× to 4.2× |
-| A freshly regenerated 6.91 MB segment, three times | 17.9 ms | 73.5 ms | 4.1× to 4.2× |
+| 6 s 1080p TS, copied | 7.9 ms | 71.9 ms (9.0 ms) | 12.7 / 68.1 MB |
+| 10 min 1080p TS (687 MB), copied | 334 ms | 831 ms (715 ms) | 17.3 / 67.7 MB |
+| 30 min 1080p MP4 (2 GB), copied | 781 ms | 1,442 ms (1,241 ms) | 16.3 / 66.4 MB |
+| 6 s 1080p TS, AC-3 5.1 to stereo FLAC | 56.4 ms | 77.3 ms (13.0 ms) | 13.2 / 72.0 MB |
+| 30 min MKV, AC-3 5.1 to stereo FLAC | 14,256 ms | 2,256 ms (2,173 ms) | 9.6 / 63.6 MB |
 
-In every run both outputs decode to identical results: the 180 video frames (by `framemd5`) and
-1,159,168 bytes of decoded audio. The files differ slightly in size because fragment boundaries and
-metadata differ. Read the result narrowly. It compares two processes doing a remux, and FFmpeg's
-time includes probing and start-up. It says nothing about decoding, encoding, in-process libraries
-or FFmpeg built for wasm. Absolute times move with machine load (the later runs were about 20%
-slower), but the ratio held.
+Repackaging beats even FFmpeg's processing-only time, in a quarter of the memory or less. Decoding
+AC-3 is several times slower: 86% of that time is the `oxideav-ac3` decoder, which decodes all six
+channels before mixing down. Read the results narrowly: they say nothing about in-process
+libavformat, FFmpeg built for wasm, or other machines.
 
 ### Releasing
 
@@ -422,7 +431,51 @@ whatever the header says.
 **Lesson:** media servers mislabel things. Python's `http.server` labels `.ts` as a Qt Linguist
 file, which makes it a handy test.
 
-### 5.7 Browser and MSE facts (verified on Chromium, Linux)
+### 5.7 "Four times faster than FFmpeg" was mostly FFmpeg starting up
+
+**Symptom:** a 6-second remux took 14.5 ms here and 60 to 74 ms in FFmpeg, and read as a 4×
+advantage.
+
+**Cause:** both tools were timed as whole processes. FFmpeg's own `-benchmark` showed its
+processing took 9.0 to 9.5 ms; the rest was start-up and probing the input. On processing alone,
+FFmpeg was faster than our whole command.
+
+**Fix:** time our stages in-process (demuxing was 4.9 of the 14.5 ms) and speed up what dominated:
+
+- find H.264 start codes eight bytes at a time and jump to the first zero byte (a start code
+  begins with one, and compressed pictures have few);
+- route each 188-byte packet through a short list, not a SipHash map lookup per packet;
+- start a continuous stream's next buffer at the last one's capacity, so it doesn't grow, copy and
+  fault in fresh pages again for every group of pictures;
+- read, convert and write on three threads joined by two-piece queues.
+
+**Verification:** the command now takes 7.9 ms against FFmpeg's 9.0 ms processing alone (71.9 ms
+whole), and 334 ms against 715 ms on a 10-minute recording. Output bytes are unchanged, and
+`the_word_at_a_time_scan_finds_what_a_byte_at_a_time_one_does` checks the scan against a plain one.
+
+**Lesson:** "faster than X" needs the same scope on both sides. Separate start-up from processing,
+report the comparison you lose as well as the one you win, then go and win it.
+
+### 5.8 A 2 GB movie spent most of its time in page faults
+
+**Symptom:** the command was slower than FFmpeg on a 30-minute MP4 (1,768 against 1,493 ms),
+although its parsing and fragmenting were cheap.
+
+**Cause:** it read 4 MiB at a time into a fresh buffer and built a fresh 4 MiB fragment. Freed
+buffers that large make glibc return the memory to the system, so every new one paid for all its
+pages again. In-process, 4 MiB pieces took 930 ms and 1 MiB pieces 171 ms; raising glibc's trim
+and mmap thresholds (`MALLOC_TRIM_THRESHOLD_`, `MALLOC_MMAP_THRESHOLD_`) took the same 4 MiB run
+from 957 to 226 ms without changing a line of code.
+
+**Fix:** one read buffer, reused for every 1 MiB piece, and writing on its own thread.
+
+**Verification:** 781 ms against FFmpeg's 1,442 ms, with a `cat` of the same file into RAM taking
+615 to 738 ms. The command is now close to the cost of moving the bytes at all.
+
+**Lesson:** a "big buffers are faster" intuition can be backwards. Allocation size interacts with
+the allocator's trim policy, so measure several sizes, and reuse buffers in hot loops.
+
+### 5.9 Browser and MSE facts (verified on Chromium, Linux)
 
 - AC-3 and E-AC-3 are **not** supported by MSE or WebCodecs there. FLAC, Opus, H.264, AAC and
   `audio/mpeg` are. HEVC is not. Decoding to FLAC is what makes AC-3 sources audible.
@@ -439,12 +492,15 @@ file, which makes it a handy test.
 - This evidence comes from Chromium on Linux. Before assuming the same elsewhere, run the test bed's
   codec probe and playback checks on that browser.
 
-### 5.8 Where the time goes
+### 5.10 Where the time goes
 
-- Don't decode video. Passing it through costs almost nothing: 7.4 ms for six seconds of 1080p.
-- The real CPU cost is sound: 55 to 85 ms per 6 s of AC-3 5.1 in wasm, depending on the machine. The
-  decoder's optimisation level wasn't a lever. Running it off the main thread, or not running it
-  (passthrough), is.
+- Don't decode video. Passing it through costs almost nothing: 7.4 ms for six seconds of 1080p in
+  wasm, 2.4 ms natively.
+- The real CPU cost is sound: 55 to 85 ms per 6 s of AC-3 5.1 in wasm, and 40.6 ms natively, where
+  the decoder is 86% of the work (our FLAC encoding is 6.6 ms). The `oxideav-ac3` decoder decodes
+  all six channels and mixes down afterwards, so 5.1 costs 6.7 ms per second of sound against 1.5 for
+  stereo. Its optimisation level wasn't a lever. A mix-down before the inverse transforms, SIMD in
+  the transforms, running it off the main thread, or not running it (passthrough) are.
 - Yield between audio batches in the browser, so decoding is never one long task.
 - Profiling found two FLAC hot spots. A bitwise CRC16 over every byte was cut from 11 to 4 ms by a
   table. Updating the output `Vec` every few bits was replaced by a register, giving 29% less
@@ -455,7 +511,7 @@ file, which makes it a handy test.
 - Dropping the HTTP-client and URL crates in favour of the browser's `fetch` and `URL` cut the wasm
   dependency count from 87 to 31.
 
-### 5.9 Measuring honestly
+### 5.11 Measuring honestly
 
 - Most guesses about where time and memory went were wrong until measured. Measure before and after,
   each in a fresh process, with tool versions written down.
@@ -464,8 +520,16 @@ file, which makes it a handy test.
   regenerating it doesn't give you the same input.
 - When comparing with another tool, prove equal output (frame hashes, decoded samples) and state
   what the comparison doesn't cover. A narrow claim that is true outlasts a broad one.
+- **A child process's peak memory includes its parent's**, until it starts the program: Linux
+  counts the copy it began as. Spawned from a Python script holding hundreds of megabytes, both
+  tools "peaked" at exactly the same 376 MB. Launch measured programs from something tiny (`tools/peak.rs`).
+- Hashing every decoded 1080p frame with MD5 (`framemd5`) takes minutes on long files; `framecrc`
+  checks the same thing much faster.
+- Synthetic inputs carry their own artefacts. A movie made by looping a clip overlaps its sound by
+  10 ms at every seam, which FFmpeg trims and this library keeps. Encode benchmark inputs straight
+  through.
 
-### 5.10 Rust and API design
+### 5.12 Rust and API design
 
 - Replace string protocols with types. An early `convert:` string prefix became the `Unsupported`
   enum, which apps can match.
@@ -480,13 +544,17 @@ file, which makes it a handy test.
 - Keep policy out of the library. It reports `Unsupported`; the app decides whether to show a
   message, play without sound or hand the stream elsewhere.
 
-### 5.11 Working method
+### 5.13 Working method
 
 - Write the lint-and-test script once, gate it with `set -e`, and print the compiler's errors when it
   fails.
 - When the checkout holds someone else's uncommitted work, test a clean copy made with
   `git archive HEAD`, stage only your own files by name, and never stash, reset or discard theirs.
 - Edit repetitive text with scripts that fail loudly when a pattern doesn't match.
+- `grep -r PATTERN a b` exits with status 2 when `b` is missing, even if it found a match in `a`, so
+  `if grep ...` silently stops guarding. Keep guard paths in step with the tree.
+- Never `pkill -f PATTERN` when the pattern also appears in your own command line: it kills the
+  shell you are typing into. Use the process ID.
 - Keep module headers honest. When a feature lands, update the header and its `ponytail:` note in the
   same change. A stale header misleads the next reader more than having no header.
 
@@ -496,7 +564,7 @@ file, which makes it a handy test.
 
 - **The library knows no app.** No app names, proxy headers, URL schemes or credentials. Apps plug
   in through `net::Fetch` and `net::Sink` and own all policy. CI fails if an app name appears in
-  `src`, `examples`, `tests` or `Cargo.toml`. Apps conform to the library, not the reverse.
+  `src`, `tests` or `Cargo.toml`. Apps conform to the library, not the reverse.
 - **Ask the browser first.** Don't rebuild what the platform provides: `URL`, `fetch`, Web Crypto,
   `MediaSource.isTypeSupported`, native HLS.
 - **No FFmpeg at runtime, and never copy or translate FFmpeg source** (LGPL/GPL). Work from the
@@ -519,8 +587,9 @@ file, which makes it a handy test.
 1. Read this file, then `docs/api.md` (the public contract) and `docs/performance.md` (methods and
    numbers). Then skim `src/lib.rs`, `src/ts.rs`, `src/fmp4.rs`, `src/live.rs` and the top of
    `src/mse.rs`.
-2. Run `cargo test`, then `bash tools/demo.sh`. Open `http://127.0.0.1:8765` and play
-   `/media/live.m3u8`, `/media/ac3.m3u8` and `/media/movie.mp4`.
+2. Run `cargo test`, then convert a fixture natively:
+   `cargo run --release -- tests/fixtures/movie_ac3.mkv /tmp/out.mp4`. Then run `bash tools/demo.sh`,
+   open `http://127.0.0.1:8765` and play `/media/live.m3u8`, `/media/ac3.m3u8` and `/media/movie.mp4`.
 3. Before a change: decide where it belongs (section 2), and find the test that covers that area.
 4. After a change:
    - run the pre-push checks in section 3;

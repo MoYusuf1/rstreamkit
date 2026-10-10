@@ -29,6 +29,18 @@ Changes:
 - Reproducible browser/demo and Node profiling tools; multi-segment soak tests.
 - Isolate temporary FFmpeg test files to avoid parallel test races.
 - Plain-language README; `docs/technical-breakdown.md`, a handoff for contributors and AI agents.
+- `rstreamkit` command (feature `vod`): MPEG-TS from a file or standard input, local HLS
+  playlists of TS segments, MP4 and Matroska in; fragmented MP4 out, to a file or standard
+  output. It replaces the `transmux` and `dump` examples. Reading, converting and writing run on
+  their own threads with two-piece queues; it refuses to write over its own input, and checks
+  the input exists before creating the output.
+- TS demuxing 2 to 2.8 times faster with identical output: start codes are found a word at a
+  time, packets reach their stream without a hash lookup, and a continuous stream's buffer
+  keeps its size from one keyframe to the next instead of growing again each time.
+- `tools/compare.py` races the command against FFmpeg on five workloads, checks both outputs,
+  and reports FFmpeg's own processing time and both tools' true peak memory (`tools/peak.rs`).
+- CI's app-name guard no longer names the removed `examples` directory: grep exits with status
+  2 for a missing path even when it finds a match, which would have silently disabled the guard.
 
 ## 0.1.0
 

@@ -5,6 +5,10 @@ ffmpeg with libx264, Python 3 and Node. Generated files are ignored.
 
 - `bash tools/demo.sh`: build, generate local media and serve http://127.0.0.1:8765.
   The page exposes `live(url)`, `movie(url)`, `zap()`, `detach()` and `sample()`.
+- `cargo build --release --bin rstreamkit && python3 tools/compare.py`: the `rstreamkit`
+  command against FFmpeg on five workloads, outputs checked. `tools/peak.rs` launches
+  each run so its peak memory isn't inflated by Python's own (`python3 tools/compare.py "10 min"`
+  runs one workload).
 - `bash tools/profile.sh`: build, generate media and profile wasm in fresh Node
   processes, producing JSON records for demux, streamed and whole-segment pushes,
   movie index and complete sessions. Only the MP4 moov and requested movie ranges

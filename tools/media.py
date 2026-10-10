@@ -41,6 +41,11 @@ run("encrypted.m3u8", ["-i", str(ROOT / "live.m3u8"), "-c", "copy", "-hls_time",
 run("programme.ts", ["-i", str(ROOT.parent.parent / "tests/fixtures/bbb_480p.ts"), "-c:v", "copy", "-c:a", "ac3", "-b:a", "192k", "-f", "mpegts"])
 
 run("short-aac.mp4", ["-i", str(ROOT / "aac.ts"), "-c", "copy"])
+# Thirty minutes of 5.1 AC-3, encoded straight through. Not looped: a looped file's sound runs a
+# few milliseconds past its picture at every seam, and tools resolve that overlap differently.
+run("movie-51.mkv", ["-f", "lavfi", "-i", "testsrc2=size=640x360:rate=25", "-f", "lavfi", "-i", "sine=frequency=440:sample_rate=48000", "-t", "1800", "-c:v", "libx264", "-preset", "ultrafast", "-g", "50", "-c:a", "ac3", "-ac", "6", "-b:a", "448k"])
+# Ten minutes of 1080p TS, as one long recording: the benchmark's bounded-memory stream case.
+run("long.ts", ["-stream_loop", "99", "-i", str(ROOT / "aac.ts"), "-c", "copy", "-f", "mpegts"])
 run("movie-aac.mp4", ["-stream_loop", "299", "-i", str(ROOT / "short-aac.mp4"), "-t", "1800", "-c", "copy"])
 # CMAF byte ranges into a single resource; subsequent ranges omit offsets per RFC 8216.
 init=(ROOT/"cmaf-init.mp4").read_bytes();blob=bytearray(init)
