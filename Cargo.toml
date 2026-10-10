@@ -6,9 +6,9 @@ rust-version = "1.88"
 repository = "https://github.com/MoYusuf1/rstreamkit"
 readme = "README.md"
 keywords = ["streaming", "hls", "wasm", "media", "transmux"]
-categories = ["multimedia", "wasm"]
+categories = ["multimedia", "wasm", "command-line-utilities"]
 license = "MIT OR Apache-2.0"
-description = "Pure-Rust streaming toolkit for the browser: HLS, MPEG-TS and movie files in, fragmented MP4 out for MediaSource, with AC-3, E-AC-3 and MP2 sound decoded in Rust."
+description = "Pure-Rust streaming toolkit for programs, the command line and the browser: HLS, MPEG-TS, MP4 and Matroska in, fragmented MP4 out, with AC-3, E-AC-3 and MP2 sound decoded in Rust."
 
 [features]
 default = ["sound", "vod"]
@@ -34,8 +34,14 @@ required-features = ["vod", "sound"]
 name = "vod_without_sound"
 required-features = ["vod"]
 
-[[example]]
-name = "dump"
+[[test]]
+name = "cli"
+required-features = ["vod"]
+
+# The command-line tool: streams and movie files in, fragmented MP4 out.
+[[bin]]
+name = "rstreamkit"
+path = "src/main.rs"
 required-features = ["vod"]
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]

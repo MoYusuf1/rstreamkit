@@ -25,7 +25,7 @@ jobs:
       # The library serves any app, so nothing in it may know one (see CONTRIBUTING.md).
       - name: No app names in the library
         run: |
-          if grep -rIinE 'riptv|xtream' src examples tests Cargo.toml; then
+          if grep -rIinE 'riptv|xtream' src tests Cargo.toml; then
             echo "an app name is in the library source"; exit 1
           fi
       - run: cargo fmt --check

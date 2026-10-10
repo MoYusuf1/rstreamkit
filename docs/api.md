@@ -53,8 +53,11 @@ through the optional sound feature. Dolby object/Atmos metadata is not supported
 The media core and transport/output traits compile on native Rust targets and in
 WebAssembly. `mse` is an optional platform adapter selected by the wasm target;
 it connects the same pipeline to browser media APIs. Native hosts supply `net::Fetch`
-and `net::Sink`, or use `Transmuxer`/`Continuous` directly. The example `transmux`
-is a native Rust command-line tool and does not launch or link FFmpeg.
+and `net::Sink`, or use `Transmuxer`/`Continuous` directly. The `rstreamkit` command
+(`src/main.rs`, feature `vod`) is a native tool built only on this public API: TS,
+local HLS playlists of TS segments, MP4 and Matroska in, fragmented MP4 out, standard
+input and output included. It does not launch or link FFmpeg. Reading URLs waits for
+the shared live session, so the command reads local files and pipes for now.
 
 The library is not a complete FFmpeg replacement: it does not provide general
 video encoding, every codec, or a native device renderer. Browser AES-128 HLS uses
