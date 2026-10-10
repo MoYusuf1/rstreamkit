@@ -305,8 +305,23 @@ pub fn plays_hls_natively() -> bool {
     can_play("application/vnd.apple.mpegurl")
 }
 
-/// Resolves after `d`, via the browser's timer.
+struct BrowserTimer(Option<JsValue>);
+impl Drop for BrowserTimer {
+    fn drop(&mut self) {
+        if let Some(id) = self.0.take() {
+            let global = js_sys::global();
+            if let Ok(clear) = js_sys::Reflect::get(&global, &"clearTimeout".into())
+                .and_then(|f| f.dyn_into::<js_sys::Function>())
+            {
+                let _ = clear.call1(&global, &id);
+            }
+        }
+    }
+}
+
+/// Resolves after `d`, via the browser's timer. Dropping the future clears the timer.
 pub async fn sleep(d: Duration) {
+    let mut timer = BrowserTimer(None);
     let p = js_sys::Promise::new(&mut |resolve, reject| {
         let global = js_sys::global();
         let result = js_sys::Reflect::get(&global, &"setTimeout".into())
@@ -318,11 +333,15 @@ pub async fn sleep(d: Duration) {
                     &(d.as_millis().min(i32::MAX as u128) as i32).into(),
                 )
             });
-        if let Err(e) = result {
-            let _ = reject.call1(&JsValue::UNDEFINED, &e);
+        match result {
+            Ok(id) => timer.0 = Some(id),
+            Err(e) => {
+                let _ = reject.call1(&JsValue::UNDEFINED, &e);
+            }
         }
     });
     let _ = JsFuture::from(p).await;
+    drop(timer);
 }
 
 pub use crate::net::{Body, Fetch, FetchError, Response};
@@ -468,32 +487,33 @@ impl From<FetchError> for Fail {
     }
 }
 
-/// Retries transient failures with bounded exponential backoff.
+/// Browser timer adapter for the shared retry loop.
+struct BrowserClock;
+impl crate::net::Clock for BrowserClock {
+    async fn sleep(&self, duration: Duration) {
+        sleep(duration).await;
+    }
+}
+
 async fn with_retries<T, F: Future<Output = Result<T, Fail>>>(
     stop: &Cell<bool>,
-    mut once: impl FnMut() -> F,
+    once: impl FnMut() -> F,
     report: &mut dyn FnMut(Status),
 ) -> Result<T, Failure> {
-    let mut last = String::new();
-    for attempt in 0..7 {
-        if attempt > 0 && !stop.get() {
-            report(Status::Reconnecting { attempt });
-        }
-        if let Some(delay) = crate::live::retry_delay(attempt) {
-            sleep(Duration::from_secs(delay)).await;
-        }
-        if stop.get() {
-            break;
-        }
-        match once().await {
-            Ok(v) => return Ok(v),
-            // A refusal, or something that isn't what was asked for, won't get better by asking again.
-            Err(Fail::Final(e)) => return Err(e.into()),
-            Err(Fail::Unsupported(why)) => return Err(why.into()),
-            Err(Fail::Retry(e)) => last = e,
-        }
+    match crate::net::retry(
+        &BrowserClock,
+        || stop.get(),
+        once,
+        |error| matches!(error, Fail::Retry(_)),
+        |attempt| report(Status::Reconnecting { attempt }),
+    )
+    .await
+    {
+        Ok(value) => Ok(value),
+        Err(crate::net::RetryError::Failed(Fail::Retry(why) | Fail::Final(why))) => Err(why.into()),
+        Err(crate::net::RetryError::Failed(Fail::Unsupported(why))) => Err(why.into()),
+        Err(crate::net::RetryError::Cancelled) => Err("playback stopped".into()),
     }
-    Err(last.into())
 }
 
 async fn fetch_once(http: &impl Fetch, url: &str, limit: usize) -> Result<Fetched, Fail> {

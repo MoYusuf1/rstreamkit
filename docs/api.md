@@ -7,7 +7,7 @@ The crate root (`Transmuxer`, streamed `Segment`, `Continuous`, `Output`, `Init`
 playlist inspection and variant selection. With `vod`, `vod::Movie` and `Session`
 support indexed playback and seeking. `cmaf::Rebaser` inspects initialization segments and
 rebases supported fragmented MP4 clocks on native and wasm targets.
-`net::{Fetch, Response, FetchError, Sink}` supports native and browser hosts. On wasm, `mse::{Fetch, Response, Direct,
+`net::{Fetch, Response, FetchError, Sink, Clock, retry, RetryError}` supports native and browser hosts. On wasm, `mse::{Fetch, Response, Direct,
 Player, Status}` supports browser playback with application-owned transport.
 
 The public low-level modules (`avc`, `ts`, `fmp4`, `sound`, `body`, `mp4`, `mkv`)
@@ -80,3 +80,11 @@ This lets native HLS handle compatible streams and uses the Rust path for audio
 decoding and repair of broken timelines. Unsupported HEVC, DRM, Atmos and fully
 interlaced video still need a supported alternative or a clear error. Desktop
 Edge and Safari playback validation remains open.
+
+`net::retry` runs the same bounded retry loop on native and browser hosts. Supply a
+`Clock`, an operation, an error classifier, a stop check and a reconnect callback.
+It makes at most seven attempts with 31 seconds of total backoff. Permanent errors
+return immediately. Stop checks run between awaits; drop the future to cancel a
+pending request or timer. Host `Fetch` and `Clock` implementations must release
+pending work on drop. Browser timers now clear on drop too. Buffer trimming and
+throttling still belong to the browser session; the full shared session is pending.

@@ -193,22 +193,11 @@ impl Abr {
     }
 }
 
-/// Bounded retries tolerate a ten-second outage without an unbounded retry loop.
-pub(crate) fn retry_delay(attempt: u32) -> Option<u64> {
-    match attempt {
-        0 => Some(0),
-        1 => Some(1),
-        2 => Some(2),
-        3 => Some(4),
-        4..=6 => Some(8),
-        _ => None,
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::hls::{self, Parsed};
+    use crate::net::retry_delay;
     #[test]
     fn recovered_live_gaps_do_not_block_a_full_buffer_or_skip_playable_media() {
         let ranges = [(0.0, 18.026), (20.0, 48.021)];
