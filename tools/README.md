@@ -3,6 +3,30 @@
 Requires Rust with wasm32-unknown-unknown, wasm-bindgen CLI matching Cargo.lock,
 ffmpeg with libx264, Python 3 and Node. Generated files are ignored.
 
+## Browser regressions
+
+Build the four player flavors with `python3 tools/size.py`, then:
+
+```sh
+cd tools/browser
+npm ci --ignore-scripts
+npx playwright install chrome
+python3 fixtures.py
+npm test -- --project=chrome
+```
+
+Five checks cover finite playback after throttling, Dolby sound, missing file
+segments, stopping during a fetch, and recovery from a missing live segment.
+They save JSON reports and failure traces under `tools/results/`. CI runs real
+Chrome with one worker. These are correctness checks, not speed or 4K benchmarks.
+The finite-playlist test uses 4× playback after the video is ready to exercise
+the buffer threshold without a 40-second wall-clock wait.
+
+Use `--project=edge` with installed Edge, or `--project=webkit` after
+`npx playwright install webkit`. Playwright WebKit is not Safari acceptance;
+use macOS and real Safari for the final platform checks. Codec support depends
+on the browser build and OS. See [Playwright's browser guide](https://playwright.dev/docs/browsers).
+
 - `bash tools/demo.sh`: build, generate local media and serve http://127.0.0.1:8765.
   The page exposes `live(url)`, `movie(url)`, `zap()`, `detach()` and `sample()`.
 - `cargo build --release --bin rstreamkit && python3 tools/compare.py`: the `rstreamkit`
