@@ -76,3 +76,19 @@ These are diagnostic controls; no generated media is sent outside localhost.
 `node tools/node/soak.cjs` runs five batches of 2,000 short segments and checks
 that committed wasm memory stops growing after the first batch. This accelerated
 pipeline check is separate from a real-time browser/network soak.
+
+## Shared control checks
+
+Build with `python3 tools/size.py`, serve with `python3 tools/server.py`, and
+install `@playwright/test@1.64.0` plus Chrome in a development directory. Set
+`NODE_PATH` to its `node_modules`, then run:
+
+```sh
+node tools/node/retry-smoke.cjs
+node tools/node/buffer-smoke.cjs
+node tools/node/session-smoke.cjs
+```
+
+These use routes and committed fixtures; no generated media is needed.
+`RSTREAMKIT_URL` can point at another local full-player URL. They check retries,
+source failures and go-live request counts, not speed or 4K performance.

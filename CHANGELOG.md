@@ -9,6 +9,8 @@ Breaking changes:
 - Additional public enums are non-exhaustive; Demuxed gains passthrough metadata.
 
 Changes:
+- Share HLS playlist selection, refresh and restart control; add thirteen native session scenarios.
+- Reuse the periodic refresh when go-live is requested during its wait.
 - Share buffer trimming and backpressure with native hosts; add twelve control tests.
 - Report failed browser removals and inspect live gaps without a temporary range vector.
 - Share the retry loop between native and browser hosts; test nine outage/cancellation cases with fake time.

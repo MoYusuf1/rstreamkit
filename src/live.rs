@@ -1,80 +1,6 @@
 //! Platform-neutral live scheduling and memory policy, shared by the browser and tests.
-use crate::hls::{Media, Segment};
 
-/// Approximate compressed media budget; browsers account buffers differently.
-pub const BUFFER_BUDGET: usize = 32 << 20;
-
-#[derive(Default)]
-pub(crate) struct Window {
-    last: Option<(u64, String, Option<std::ops::Range<u64>>)>,
-    stalled_since: Option<f64>,
-}
-
-impl Window {
-    pub fn finished(&self, media: &Media) -> bool {
-        media.ended && self.next(media).is_none()
-    }
-
-    pub fn next<'a>(&self, media: &'a Media) -> Option<&'a Segment> {
-        let start = match &self.last {
-            None => {
-                if media.ended {
-                    0
-                } else {
-                    media.segments.len().saturating_sub(3)
-                }
-            }
-            Some((seq, uri, range)) => {
-                // URI anchors survive broken providers that slide without advancing sequence.
-                if let Some(at) = media
-                    .segments
-                    .iter()
-                    .position(|s| s.seq == *seq && s.uri == *uri && s.byte_range == *range)
-                {
-                    at + 1
-                } else if let Some(at) = media
-                    .segments
-                    .iter()
-                    .rposition(|s| s.uri == *uri && s.byte_range == *range)
-                {
-                    if media.segments[at].seq == *seq
-                        || media.segments.iter().any(|s| s.seq <= *seq)
-                    {
-                        at + 1
-                    } else {
-                        0
-                    }
-                } else if media.segments.first().is_some_and(|s| s.seq > *seq) {
-                    0
-                } else if media.segments.last().is_some_and(|s| s.seq > *seq) {
-                    media
-                        .segments
-                        .iter()
-                        .position(|s| s.seq > *seq)
-                        .unwrap_or(media.segments.len())
-                } else {
-                    media.segments.len().saturating_sub(3)
-                }
-            }
-        };
-        media.segments.get(start)
-    }
-
-    pub fn consumed(&mut self, segment: &Segment) {
-        self.last = Some((segment.seq, segment.uri.clone(), segment.byte_range.clone()));
-        self.stalled_since = None;
-    }
-
-    pub fn discontinuous(&self, segment: &Segment) -> bool {
-        self.last
-            .as_ref()
-            .is_some_and(|(seq, _, _)| segment.seq < *seq || segment.seq > seq.saturating_add(1))
-    }
-
-    pub fn frozen(&mut self, now: f64, target: f64) -> bool {
-        now - *self.stalled_since.get_or_insert(now) >= 3.0 * target.max(1.0)
-    }
-}
+pub(crate) use crate::session::{BUFFER_BUDGET, Session as Window, buffer_limits};
 
 /// Cross a nearby gap only after the current range is exhausted, never over playable media.
 pub(crate) fn gap_target(
@@ -91,28 +17,6 @@ pub(crate) fn gap_target(
         }
     }
     None
-}
-
-/// Duration limits derived from bytes actually appended, including decoded sound.
-/// Reserve the next segment before assigning rewind/ahead space. Keep at least
-/// one segment behind: removing part of the current GOP can also remove its future
-/// dependent frames. Long GOPs can exceed the budget; this is not a process-memory cap.
-pub(crate) fn buffer_limits(bytes_per_second: f64, segment_seconds: f64) -> (f64, f64) {
-    let total = if bytes_per_second > 0.0 && bytes_per_second.is_finite() {
-        BUFFER_BUDGET as f64 / bytes_per_second
-    } else {
-        40.0
-    };
-    let segment = if segment_seconds.is_finite() {
-        segment_seconds.max(1.0)
-    } else {
-        1.0
-    };
-    let available = (total - segment).max(0.0);
-    let behind = (available * 0.2).min(10.0).max(segment);
-    // Keep a little time for fetch, append and decoder startup at a segment boundary.
-    // A positive threshold also avoids waiting forever on the final frame of a range.
-    ((available - behind).clamp(0.5, 30.0), behind)
 }
 
 /// Speculative input shares the compressed-media estimate with buffered media and
@@ -191,7 +95,7 @@ impl Abr {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::hls::{self, Parsed};
+    use crate::hls::{self, Media, Parsed};
     use crate::net::{buffer_delay_ms as throttle_delay_ms, retry_delay};
     #[test]
     fn recovered_live_gaps_do_not_block_a_full_buffer_or_skip_playable_media() {

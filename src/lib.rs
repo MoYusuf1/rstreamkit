@@ -37,6 +37,7 @@ pub mod mp4;
 #[cfg(target_arch = "wasm32")]
 pub mod mse;
 pub mod net;
+pub mod session;
 pub mod sound;
 pub mod ts;
 #[cfg(feature = "vod")]

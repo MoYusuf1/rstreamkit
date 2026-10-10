@@ -500,3 +500,50 @@ removal. It runs at 4× after the video is ready. `RSTREAMKIT_URL` selects
 another local player URL. These accelerated correctness checks do not establish
 4K60 performance, a long soak, or real Edge/Safari acceptance. Full playlist and
 session orchestration still needs extraction for #23.
+
+## Shared playlist session (2026-10-10)
+
+The browser now calls `session::Session` for playlist selection, restart tracking,
+backpressure preparation and periodic refresh. Hosts supply clock, buffer and
+playlist I/O. Selection borrows the segment; no media bytes are cloned. Go-live
+during the periodic wait uses that refresh instead of fetching again next loop.
+
+| Measure | Buffer-control baseline | Shared playlist session |
+| --- | ---: | ---: |
+| Native playlist-session integration tests | 0 | 13 |
+| Shared retry/buffer/session integration tests | 21 | 34 |
+| Live player, Brotli bytes | 109,690 | 110,873 |
+| Live + sound player, Brotli bytes | 207,300 | 208,327 |
+| Movie player, Brotli bytes | 132,475 | 133,808 |
+| Full player, Brotli bytes | 229,637 | 231,013 |
+
+Baseline `58ff9b6` (PR #53); same Linux/Rust 1.99.0, wasm-bindgen 0.2.128,
+wasm-opt 130 and Brotli 1.2.0. Repeat with
+`python3 tools/size.py --check-budgets --output tools/results/size-session.json`.
+All four budgets pass. The full player grows 1,376 bytes (0.60%). No dependencies
+are added. This is shared control and test coverage, not a measured CPU,
+peak-memory or FFmpeg performance advantage.
+
+Run `cargo test --test session`, also with `--no-default-features`. Thirteen
+scenarios cover sliding windows with/without sequence updates, numbering/PTS
+resets, long-pause refresh, go-live, a ten-second outage, a dropped response,
+404, bounded endless bodies, finite backpressure, stop and frozen playlists.
+Media cases use the real TS parser, packager and ordered output sink. The slow
+request case advances fake time by three seconds per fetch; it is not a bandwidth
+or real-network throughput benchmark. Body cap tests use 1 KiB limits for quick
+termination; production browser limits are unchanged.
+
+Playwright Chrome 155.0.8059.39 passes twelve checks on the exact review build:
+five playback, four source-update faults, two retry checks, and one new session
+check. The last issues go-live during a 2.5-second poll wait: it observes two
+playlist requests total (initial + one refresh), with zero pending poll timers
+after Stop. The former browser code did a periodic fetch followed by a separate
+go-live fetch; that before count comes from code inspection, not a timing run.
+
+Build/serve the full player, install Playwright as above, then run
+`NODE_PATH=tools/browser/node_modules node tools/node/session-smoke.cjs`.
+It serves committed TS fixture bytes through routes and needs no generated media.
+`RSTREAMKIT_URL` selects another local full-player URL. Playback regression
+fixtures/tooling remain in PR #50. These checks establish neither 4K60 performance
+nor real Edge/Safari acceptance. #23 remains open for the complete media runner,
+variant/rendition transitions and streamed/pending-I/O faults through that runner.
