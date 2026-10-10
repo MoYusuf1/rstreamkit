@@ -24,6 +24,7 @@ Changes:
 - Add native Fetch/Sink transport types and CMAF clock rebasing, preserving mse re-exports.
 - Explicit AC-3/basic E-AC-3 passthrough with spec-derived configuration boxes.
 - Compress decoded stereo audio with fixed-predictor FLAC; yield between audio batches.
+- Reduce measured programme FLAC encoder CPU by 29.3% while preserving output bytes.
 - Adaptive throughput-based variant selection and one-segment bounded prefetch.
 - Reproducible browser/demo and Node profiling tools; multi-segment soak tests.
 - Isolate temporary FFmpeg test files to avoid parallel test races.

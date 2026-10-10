@@ -181,3 +181,37 @@ five core `dec3` bytes match exactly. Older FFmpeg muxers append a zero extensio
 the test accepts that disabled flag while rejecting a nonzero extension. The optional
 extension is documented by [Dolby](https://ott.dolby.com/OnDelKits/DDP/Dolby_Digital_Plus_Online_Delivery_Kit_v1.5/Documentation/Playback/SDM/help_files/topics/c_id_ddp_atmos_isobmff_2.html).
 Both reference layouts must still decode our complete output without errors.
+
+## FLAC CPU improvement (2026-10-01)
+
+The encoder now keeps unfinished output bits in a register, emits the Rice
+terminator and remainder together, and reuses one residual search buffer per
+channel. Predictor selection and compressed bytes are unchanged. This follows
+the [FLAC bitstream rules](https://www.rfc-editor.org/rfc/rfc9639.html#section-9.2.7).
+
+Same Ryzen 7 5700/Linux, Rust 1.98.1 and Node 26.10, same wasm release build and
+input files. Twelve fresh Node processes per version and scenario, alternating
+before/after order; each process uses the existing seven-run profiler. The table
+reports the median of those process medians. Build and audio preparation are
+outside the FLAC encoder timing. Baseline: `bb66f506`.
+
+| Work | Before | After | CPU reduction |
+| --- | ---: | ---: | ---: |
+| Programme audio FLAC encoding (4.16 seconds) | 12.583 ms | 8.899 ms | 29.3% |
+| Synthetic six-second audio FLAC encoding | 18.957 ms | 11.750 ms | 38.0% |
+| Full six-second AC-3 TS push | 76.921 ms | 69.813 ms | 9.2% |
+
+Programme FLAC output remains 237,119 bytes (29.7% of PCM). Synthetic output
+remains 277,281 bytes. Committed wasm memory is unchanged in these scenarios.
+A native before/after encoder check produces byte-identical programme FLAC;
+FFmpeg decodes it to the original PCM exactly. The independent decoder tests
+also cover silence, noise, extreme values, ramps and mixed constant/predicted
+channels. These are improvements over our previous implementation, not a
+comparison with FFmpeg's audio encoder or decoder.
+
+Reproduce with `bash tools/build.sh`, then
+`node tools/node/profile.cjs flac tools/media/programme.ts` and the equivalent
+`flac`/`push` runs for `tools/media/ac3.ts`. Keep a copy of `tools/node/pkg` and
+`profile.cjs` from the baseline build, use identical input files, and alternate
+baseline/current processes. This small programme sample does not represent all
+soundtracks; browser dropped-frame improvement is still unmeasured.

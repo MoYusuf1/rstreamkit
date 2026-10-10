@@ -38,7 +38,7 @@ Local acceptance is complete for #4, #6, #7, #10, #15, #18, #33, #35, #36,
 | #36 Live buffer | Documented 32 MiB policy based on appended bitrate. About 28.58 MB buffered after 19 minutes at 8.899 Mbps. | Investigate dropped 1080p frames separately; this is a compressed-byte estimate. |
 | #37 Closed source wait | Wait races update completion, source closure/end and buffer removal; cancellation drops the waiter. Browser hooks confirm updating=true at closure/removal and both settle with Failed rather than hanging. | Mid-remove closure and removal of an unrelated buffer. |
 | #38 Harness | Build/demo/profile commands, generated media, Node/browser probes and clean-source reproduction. Generator cache includes arguments/source hashes; historical low-resolution and fresh 1080p movie results are distinguished. | Clean-source profiling and CI report pass. Broader hardware repetition is follow-up work. |
-| #39 FLAC | Real programme sample: 29.7% of PCM size at about 12.4 ms encoder CPU; trade taken. Lossless noise/extreme/ramp checks pass. | Decision implemented and recorded: take the compression trade. A broader corpus would improve confidence. |
+| #39 FLAC | Real programme sample: 29.7% of PCM size; encoder CPU reduced from 12.583 to 8.899 ms (29.3%) across twelve alternating fresh processes; trade taken. Lossless noise/extreme/ramp checks pass. | Decision implemented and recorded: take the compression trade. A broader corpus would improve confidence. |
 | #40 Discontinuity skew | Twenty alternating ±100 ms splices: maximum reduced from 316.811 to 105.467 ms with correction capped at 2%; regression test. | Real broadcast splice measurements. |
 
 ## Desktop browser matrix

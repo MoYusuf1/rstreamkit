@@ -23,6 +23,13 @@ fn compressed_flac_roundtrips_silence_noise_extremes_and_predictable_audio() {
             [i16::MAX, i16::MIN]
         }
     }));
+    // One channel can be constant while the other needs prediction or verbatim;
+    // the second subframe must also work when it starts inside a byte.
+    pcm.extend((0..1536).flat_map(|i| [1234, i as i16 * 12 - 9000]));
+    pcm.extend((0..1536).flat_map(|_| {
+        rng = rng.wrapping_mul(1664525).wrapping_add(1013904223);
+        [(rng >> 16) as i16, -4321]
+    }));
     let mut flac = b"fLaC".to_vec();
     flac.extend([0x80, 0, 0, 34]);
     flac.extend(flac_streaminfo(48000));

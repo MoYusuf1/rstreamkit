@@ -514,10 +514,14 @@ pub fn flac_frame(pcm: &[i16], number: u32) -> Vec<u8> {
     frame.push(crc8(&frame));
     let mut bits = FlacBits {
         bytes: frame,
+        word: 0,
         used: 0,
     };
     for channel in 0..2 {
         flac_channel(&mut bits, pcm, channel);
+    }
+    if bits.used != 0 {
+        bits.bytes.push((bits.word << (8 - bits.used)) as u8);
     }
     let mut frame = bits.bytes;
     let crc = crc16(&frame);
@@ -528,24 +532,23 @@ pub fn flac_frame(pcm: &[i16], number: u32) -> Vec<u8> {
 // MSB-first writer. Channels share the bitstream; only the complete frame is byte padded.
 struct FlacBits {
     bytes: Vec<u8>,
-    used: u8,
+    word: u64,
+    used: u32,
 }
 impl FlacBits {
-    fn put(&mut self, value: u32, mut width: u32) {
-        while width > 0 {
-            if self.used == 0 {
-                self.bytes.push(0);
-            }
-            let n = width.min(u32::from(8 - self.used));
-            width -= n;
-            *self.bytes.last_mut().unwrap() |=
-                (((value >> width) & ((1 << n) - 1)) as u8) << (8 - self.used - n as u8);
-            self.used = (self.used + n as u8) % 8;
+    fn put(&mut self, value: u32, width: u32) {
+        // Keep the unfinished byte in a register instead of updating the Vec for
+        // every few bits. Values are masked because PCM samples can be negative.
+        self.word = (self.word << width) | (u64::from(value) & ((1u64 << width) - 1));
+        self.used += width;
+        while self.used >= 8 {
+            self.used -= 8;
+            self.bytes.push((self.word >> self.used) as u8);
         }
     }
     fn zeros(&mut self, mut n: u32) {
         if self.used != 0 {
-            let take = n.min(u32::from(8 - self.used));
+            let take = n.min(8 - self.used);
             self.put(0, take);
             n -= take;
         }
@@ -553,6 +556,7 @@ impl FlacBits {
         self.put(0, n % 8);
     }
 }
+
 fn folded(n: i32) -> u32 {
     ((n as u32) << 1) ^ ((n >> 31) as u32)
 }
@@ -568,17 +572,18 @@ fn flac_channel(bits: &mut FlacBits, pcm: &[i16], channel: usize) {
         bits.put(samples[0] as u32, 16);
         return;
     }
-    let mut best = (8 + samples.len() * 16, 0, 0, vec![]);
+    let mut best = (8 + samples.len() * 16, None, 0);
+    // Reuse one search buffer; remember the winning parameters instead of cloning it.
+    let mut residual = Vec::with_capacity(samples.len());
     for order in 0..=2usize.min(samples.len() - 1) {
-        let residual: Vec<u32> = (order..samples.len())
-            .map(|i| {
-                folded(match order {
-                    0 => samples[i],
-                    1 => samples[i] - samples[i - 1],
-                    _ => samples[i] - 2 * samples[i - 1] + samples[i - 2],
-                })
+        residual.clear();
+        residual.extend((order..samples.len()).map(|i| {
+            folded(match order {
+                0 => samples[i],
+                1 => samples[i] - samples[i - 1],
+                _ => samples[i] - 2 * samples[i - 1] + samples[i - 2],
             })
-            .collect();
+        }));
         // A mean-based estimate limits the search to adjacent parameters. Exact cost still
         // decides against verbatim, bounding the output even on noise and pathological audio.
         let mean = residual.iter().map(|&n| u64::from(n)).sum::<u64>() / residual.len() as u64;
@@ -592,26 +597,30 @@ fn flac_channel(bits: &mut FlacBits, pcm: &[i16], channel: usize) {
                     .map(|&n| (n >> k) as usize + 1 + k as usize)
                     .sum::<usize>();
             if cost < best.0 {
-                best = (cost, order, k, residual.clone());
+                best = (cost, Some(order), k);
             }
         }
     }
-    if best.3.is_empty() {
-        bits.put(2, 8);
-        for n in samples {
-            bits.put(n as u32, 16);
-        }
-    } else {
-        bits.put(((8 + best.1) << 1) as u32, 8);
-        for &n in &samples[..best.1] {
+    if let Some(order) = best.1 {
+        bits.put(((8 + order) << 1) as u32, 8);
+        for &n in &samples[..order] {
             bits.put(n as u32, 16);
         }
         bits.put(0, 6); // Rice method 0, one partition.
         bits.put(best.2, 4);
-        for n in best.3 {
+        for i in order..samples.len() {
+            let n = folded(match order {
+                0 => samples[i],
+                1 => samples[i] - samples[i - 1],
+                _ => samples[i] - 2 * samples[i - 1] + samples[i - 2],
+            });
             bits.zeros(n >> best.2);
-            bits.put(1, 1);
-            bits.put(n, best.2);
+            bits.put((1 << best.2) | (n & ((1 << best.2) - 1)), best.2 + 1);
+        }
+    } else {
+        bits.put(2, 8);
+        for n in samples {
+            bits.put(n as u32, 16);
         }
     }
 }
