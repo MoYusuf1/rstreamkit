@@ -254,6 +254,13 @@ struct Output {
 }
 impl Sink for Output {
     async fn append(&mut self, bytes: &mut [u8]) -> Result<(), String> {
+        if self.appends == 0 {
+            assert_eq!(
+                &bytes[4..8],
+                b"ftyp",
+                "output must start with initialization"
+            );
+        }
         self.appends += 1;
         self.bytes += bytes.len();
         Ok(())
@@ -275,6 +282,9 @@ async fn package_next(
     let moof = &packaged.fragments[0].moof;
     let tfdt = moof.windows(4).position(|w| w == b"tfdt").unwrap();
     let time = u64::from_be_bytes(moof[tfdt + 8..tfdt + 16].try_into().unwrap());
+    if let Some(init) = &mut packaged.init {
+        output.append(&mut init.bytes).await.unwrap();
+    }
     net::append_fragments(&mut packaged.fragments, output)
         .await
         .unwrap();
@@ -319,7 +329,7 @@ fn sliding_windows_with_and_without_sequence_updates_feed_real_output() {
             &mut out,
         ))
         .unwrap();
-        assert_eq!(out.appends, 16);
+        assert_eq!(out.appends, 17);
         assert!(out.bytes > 0);
     }
 }
@@ -658,7 +668,7 @@ fn slow_segment_delivery_keeps_output_and_cursor_in_order() {
     assert!(second > first);
     assert!(session.finished(&current));
     assert_eq!(state.now.get(), 6.0);
-    assert_eq!(out.appends, 8);
+    assert_eq!(out.appends, 9);
     assert_eq!(
         provider
             .requests
