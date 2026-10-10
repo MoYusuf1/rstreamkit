@@ -6,8 +6,6 @@
 //! All true for normal HLS output; endless `.ts` streams go through [`crate::Continuous`], which
 //! cuts them into fragments at keyframes.
 
-use std::collections::HashMap;
-
 #[derive(Debug, Clone, PartialEq, thiserror::Error)]
 #[non_exhaustive]
 pub enum Error {
@@ -115,9 +113,25 @@ fn codec_name(stream_type: u8) -> String {
 
 /// Splits a PES payload of Annex-B data into NAL units (without start codes).
 fn nal_units(es: &[u8]) -> Vec<&[u8]> {
+    const ONES: u64 = 0x0101_0101_0101_0101;
+    const HIGHS: u64 = 0x8080_8080_8080_8080;
     let mut starts = vec![];
     let mut i = 0;
     while i + 3 <= es.len() {
+        // A start code begins with a zero byte, and compressed pictures have few: look at eight
+        // bytes at a time and go straight to the first zero (the lowest flagged byte is exact).
+        if let Some(word) = es.get(i..i + 8) {
+            let w = u64::from_le_bytes(word.try_into().unwrap());
+            let zeros = w.wrapping_sub(ONES) & !w & HIGHS;
+            if zeros == 0 {
+                i += 8;
+                continue;
+            }
+            i += zeros.trailing_zeros() as usize / 8;
+            if i + 3 > es.len() {
+                break;
+            }
+        }
         if es[i] == 0 && es[i + 1] == 0 && es[i + 2] == 1 {
             starts.push(i + 3);
             i += 3;
@@ -303,7 +317,9 @@ pub struct Demuxer {
     sound: Option<(u16, crate::sound::Kind)>,
     undecodable_audio: Option<String>,
     foreign_video: Option<String>,
-    pes: HashMap<u16, Vec<u8>>,
+    /// The PES packet being put together for each stream (there are never more than a few, so a
+    /// list beats a hash map: it is looked up for every packet).
+    pes: Vec<(u16, Vec<u8>)>,
     out: Demuxed,
 }
 
@@ -419,11 +435,18 @@ impl Demuxer {
             if pusi {
                 // One buffer per stream, reused for every packet of it: after the largest frame
                 // there is nothing left to allocate.
-                let buf = self.pes.entry(pid).or_default();
+                let at = match self.pes.iter().position(|(p, _)| *p == pid) {
+                    Some(at) => at,
+                    None => {
+                        self.pes.push((pid, Vec::new()));
+                        self.pes.len() - 1
+                    }
+                };
+                let buf = &mut self.pes[at].1;
                 flush(pid, buf, self.video_pid, self.sound, &mut self.out);
                 buf.clear();
                 buf.extend(payload);
-            } else if let Some(buf) = self.pes.get_mut(&pid) {
+            } else if let Some((_, buf)) = self.pes.iter_mut().find(|(p, _)| *p == pid) {
                 buf.extend(payload);
             }
         }
@@ -522,10 +545,14 @@ impl Demuxer {
         };
         let cutoff = self.out.video[cut].pts;
         let bytes: usize = self.out.video[..cut].iter().map(|v| v.len as usize).sum();
-        let remaining = self.out.video_data.split_off(self.video_base + bytes);
-        let prefix = self.out.video_data[..self.video_base].to_vec();
-        let video_data = std::mem::replace(&mut self.out.video_data, prefix);
-        self.out.video_data.extend(remaining);
+        // The next fragment's buffer starts at this one's size, so it doesn't grow (and copy, and
+        // fault in fresh pages) all over again for every group of pictures.
+        let end = self.video_base + bytes;
+        let mut next = Vec::with_capacity(self.out.video_data.capacity());
+        next.extend_from_slice(&self.out.video_data[..self.video_base]);
+        next.extend_from_slice(&self.out.video_data[end..]);
+        self.out.video_data.truncate(end);
+        let video_data = std::mem::replace(&mut self.out.video_data, next);
         let video = self.out.video.drain(..cut).collect();
         let (audio, later) = std::mem::take(&mut self.out.audio)
             .into_iter()
@@ -558,7 +585,7 @@ impl Demuxer {
     pub(crate) fn buffered_bytes(&self) -> usize {
         self.out.video_data.len()
             + self.carry.len()
-            + self.pes.values().map(Vec::len).sum::<usize>()
+            + self.pes.iter().map(|(_, buf)| buf.len()).sum::<usize>()
             + self.out.audio.iter().map(|s| s.data.len()).sum::<usize>()
             + self.out.sound.iter().map(|s| s.data.len()).sum::<usize>()
     }
@@ -678,6 +705,41 @@ mod tests {
             p[3] = 0x90;
         }
         assert_eq!(demux(&packets).unwrap_err(), Error::Scrambled);
+    }
+
+    #[test]
+    fn the_word_at_a_time_scan_finds_what_a_byte_at_a_time_one_does() {
+        fn slow(es: &[u8]) -> Vec<&[u8]> {
+            let starts: Vec<usize> = (0..es.len().saturating_sub(2))
+                .filter(|&i| es[i..i + 3] == [0, 0, 1])
+                .map(|i| i + 3)
+                .collect();
+            // Overlapping matches can't happen (00 00 01 can't start inside another), so this
+            // is the same split the real one makes.
+            let mut out = vec![];
+            for (n, &s) in starts.iter().enumerate() {
+                let mut e = starts.get(n + 1).map_or(es.len(), |&next| next - 3);
+                while e > s && es[e - 1] == 0 {
+                    e -= 1;
+                }
+                if e > s {
+                    out.push(&es[s..e]);
+                }
+            }
+            out
+        }
+        // Bytes drawn mostly from {0, 1, 3, 0x65}: zeros and start codes everywhere, at every
+        // alignment, which is the hard case for skipping eight bytes at a time.
+        let mut seed = 0x9e37_79b9u32;
+        for len in 0..2000 {
+            let es: Vec<u8> = (0..len % 97)
+                .map(|_| {
+                    seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                    [0, 0, 0, 1, 3, 0x65, (seed >> 8) as u8][(seed >> 24) as usize % 7]
+                })
+                .collect();
+            assert_eq!(nal_units(&es), slow(&es), "{es:?}");
+        }
     }
 
     #[test]
