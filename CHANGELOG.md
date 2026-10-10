@@ -9,6 +9,8 @@ Breaking changes:
 - Additional public enums are non-exhaustive; Demuxed gains passthrough metadata.
 
 Changes:
+- Reject oversized MP4 timing runs, bound malformed edit counts and check file-offset arithmetic.
+- Clamp extreme negative Matroska seeks; add five bounded parser fuzz targets and four regression tests.
 - Cancel player tasks and Direct fetches on stop/drop; release buffer listeners.
 - Handle source closure/removal while waiting for appends and removals.
 - Retain HLS durations, source dates and discontinuities; prefer supported codecs.
