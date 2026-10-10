@@ -1,63 +1,44 @@
 # rstreamkit
 
-**Get live streams and video files ready to play, quickly, without FFmpeg: in a web page, in your
-own program, or from the command line.**
+Get live streams and video files ready to play in browsers, Rust apps, and the command line. rstreamkit keeps the picture unchanged and converts unsupported sound when needed. The engine is Rust and needs no FFmpeg at runtime.
 
-Videos and live streams come in many formats, and players (web browsers especially) only take some
-of them. rstreamkit repackages the rest into a form they can play, without touching the picture. It
-can also turn sound that browsers can't play (such as Dolby AC-3) into sound they can.
+## Compared with FFmpeg
 
-It is written in Rust, is free to use and change, and doesn't need FFmpeg installed.
-
-## Is it faster than FFmpeg?
-
-[FFmpeg](https://ffmpeg.org) is the best-known tool for working with video. We gave both programs
-the same jobs: repackage HD video and its sound for streaming, without changing a single picture.
+Both tools did the same job: repackage video and sound without changing the picture.
 
 | Job | rstreamkit | FFmpeg | Result |
 | --- | ---: | ---: | --- |
 | 6 seconds of HD video | 0.008 s | 0.072 s | **9× faster** |
-| A 10-minute HD recording (687 MB) | 0.33 s | 0.83 s | **2.5× faster** |
-| A 30-minute HD movie (2 GB) | 0.78 s | 1.44 s | **1.8× faster** |
-| Memory used, on any of these | 13 to 17 MB | 66 to 68 MB | **4 to 5 times less** |
+| 10-minute HD recording (687 MB) | 0.33 s | 0.83 s | **2.5× faster** |
+| 30-minute HD movie (2 GB) | 0.78 s | 1.44 s | **1.8× faster** |
+| Memory for these jobs | 13–17 MB | 66–68 MB | **About 4–5× less** |
+| Convert 30 minutes of Dolby sound | 8.4 s | 2.2 s | **FFmpeg is about 4× faster** |
 
-*Lower is better. s means seconds.*
+Lower is better. Times include starting each program and reading and writing files.
+Results are medians of 5–8 runs on a Ryzen 7 5700, Linux, FFmpeg 9.0.2. The repackaged picture and sound were checked against the inputs. These results cover these jobs; FFmpeg supports far more formats and can also convert video.
 
-**Why you can trust the numbers**
+## Latest improvements
 
-- Same files, same jobs. Each program was started fresh every time, so the times include starting
-  up and reading and writing the files.
-- Every time is the middle result of five to eight timed runs.
-- FFmpeg can also report how long its work took without its start-up. rstreamkit's *whole* run is
-  still faster than that, on every one of these jobs.
-- We checked the results. Every picture came out identical from both programs (53,666 of them in
-  the movie), and so did all of the sound.
-- Measured on an AMD Ryzen 7 5700 running Linux, with FFmpeg 9.0.2. A script repeats all of it
-  (see the benchmark details).
+Same 18-second 4K60 clip at 40 Mbps, before and after our buffer fixes. Two final runs in Linux Chromium 155:
 
-**What this does not mean.** It doesn't mean rstreamkit is faster at everything. FFmpeg can convert
-almost any format into any other; rstreamkit does one narrow job, repackaging for playback. When
-Dolby sound has to be converted, FFmpeg is faster today: 30 minutes of 5.1 sound take 2.2 seconds in
-FFmpeg and 8.4 seconds here (it was 14 before our decoder got twice as fast). That's still far faster
-than real time.
+| Measure | Before | After |
+| --- | ---: | ---: |
+| Rust/Wasm memory | 70.9 MB | **35.8–36.7 MB (about 49% less)** |
+| Dropped frames | 0 of 1,080 | **0 of 1,080 in each run** |
+| Full player download | 228,963 bytes | 229,337 bytes (+0.16%) |
 
-## What it can do
+Memory here excludes the browser, video decoder and GPU. This short check does not prove long-run 4K performance. Chrome, Edge and Safari endurance tests are still planned.
 
-- Play live streams (HLS, the format most live TV and radio streams use).
-- Play movie files (MP4 and MKV), including jumping to any point.
-- Make sound playable that a browser can't play by itself.
-- Convert files from the command line: `rstreamkit recording.ts recording.mp4`.
-- Run inside a browser page, or inside your own Rust program.
+## What you can use it for
 
-It does not convert video that a player can't show (such as HEVC on browsers without support). It
-says so clearly, and your app decides what to do.
+- Play HLS live streams and MP4/MKV files, including seeking.
+- Convert Dolby AC-3, E-AC-3 and MP2 sound when a browser needs it.
+- Repackage files: `rstreamkit recording.ts recording.mp4`.
+- Build a browser player or use the engine in a Rust app.
 
-## Learn more
+Your player must support the video codec. rstreamkit does not convert the picture. Browser builds use generated JavaScript glue and the browser’s media player.
 
-[Benchmark details and commands](docs/performance.md) ·
-[Developer guide](docs/api.md) ·
-[Technical breakdown for contributors and AI agents](docs/technical-breakdown.md) ·
-[Demo and tests](tools/README.md) · [Roadmap](docs/roadmap.md)
+[Measurements and repeat commands](docs/performance.md) · [Developer guide](docs/api.md) · [Demo and tests](tools/README.md) · [Roadmap](docs/roadmap.md) · [Contributor guide](docs/technical-breakdown.md)
 
 Open source under [MIT](LICENSE-MIT) or [Apache 2.0](LICENSE-APACHE).
 
