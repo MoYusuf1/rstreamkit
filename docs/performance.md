@@ -247,6 +247,10 @@ The command against FFmpeg afterwards (`python3 tools/compare.py "AC-3"`, checks
 | 6 s 1080p TS, AC-3 5.1 to stereo FLAC | 37.6 ms (was 56.4) | 74.3 ms (12.0 ms) | 13.2 / 71.8 MB |
 | 30 min MKV, AC-3 5.1 to stereo FLAC | 8,437 ms (was 14,256) | 2,151 ms (2,077 ms) | 9.7 / 63.8 MB |
 
+Size cost, measured on the browser test bed's wasm (`tools/harness`, release,
+`wasm-opt -Oz`, `brotli -q 11`): 316,435 to 323,026 bytes (+6.6 KB, +2.1%). The native
+`rstreamkit` binary grew from 1,571,424 to 1,588,312 bytes (+16.9 KB, +1.1%).
+
 FFmpeg remains four times faster at decoding long AC-3. What remains is real work:
 parsing the bitstream (exponents, bit allocation, mantissas) is about 64% of decoding,
 the transforms about 20%, the downmix about 6%. The next levers change results within rounding rather than bit for bit (mixing
