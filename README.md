@@ -37,8 +37,9 @@ the same jobs: repackage HD video and its sound for streaming, without changing 
 
 **What this does not mean.** It doesn't mean rstreamkit is faster at everything. FFmpeg can convert
 almost any format into any other; rstreamkit does one narrow job, repackaging for playback. When
-Dolby sound has to be converted, FFmpeg is faster today: 30 minutes of 5.1 sound take 2.3 seconds in
-FFmpeg and 14 seconds here. That's still far faster than real time, and it's being worked on.
+Dolby sound has to be converted, FFmpeg is faster today: 30 minutes of 5.1 sound take 2.2 seconds in
+FFmpeg and 8.4 seconds here (it was 14 before our decoder got twice as fast). That's still far faster
+than real time.
 
 ## What it can do
 
@@ -59,3 +60,7 @@ says so clearly, and your app decides what to do.
 [Demo and tests](tools/README.md) · [Roadmap](docs/roadmap.md)
 
 Open source under [MIT](LICENSE-MIT) or [Apache 2.0](LICENSE-APACHE).
+
+The Dolby (AC-3 and E-AC-3) decoder in [ac3/](ac3/README.md) is
+[oxideav-ac3](https://github.com/OxideAV/oxideav-ac3) by Mark Karpeles, used under its MIT licence
+and made faster here. Thank you.

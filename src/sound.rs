@@ -295,7 +295,7 @@ mod decode {
                 let mut params = CodecParameters::audio(CodecId::new(name));
                 params.channels = Some(u16::from(frame.channels.max(1)));
                 let made = match kind {
-                    Kind::Ac3 => oxideav_ac3::decoder::make_decoder(&params),
+                    Kind::Ac3 => rstreamkit_ac3::decoder::make_decoder(&params),
                     Kind::Mpeg => oxideav_mp2::codec_decoder::make_decoder(&params),
                 };
                 *slot = made.ok();
@@ -727,5 +727,56 @@ mod tests {
             decode::stereo(&[1, 0, 2, 0, 3, 0, 4, 0], 2).unwrap(),
             [1, 2, 3, 4]
         );
+    }
+
+    /// The decoder in `ac3/` is oxideav-ac3 0.0.11 made faster. These checksums are of what the
+    /// original decoded (FNV-1a over the little-endian stereo samples), so a speed-up that moves a
+    /// single sample fails here.
+    #[cfg(feature = "sound")]
+    #[test]
+    fn the_absorbed_dolby_decoder_still_decodes_exactly_what_the_original_did() {
+        fn fnv1a(samples: &[i16]) -> u64 {
+            samples
+                .iter()
+                .flat_map(|s| s.to_le_bytes())
+                .fold(0xcbf2_9ce4_8422_2325, |h, b| {
+                    (h ^ u64::from(b)).wrapping_mul(0x0100_0000_01b3)
+                })
+        }
+        let fixtures: [(&[u8], u64); 3] = [
+            (
+                include_bytes!("../tests/fixtures/h264_ac3.ts"),
+                0xb928_f2d0_e7a0_8325,
+            ),
+            (
+                include_bytes!("../tests/fixtures/h264_ac3_51.ts"),
+                0xb190_f6a4_83d9_40c4,
+            ),
+            (
+                include_bytes!("../tests/fixtures/h264_eac3_51.ts"),
+                0x6ed6_3118_859e_6727,
+            ),
+        ];
+        for (n, (ts, original)) in fixtures.into_iter().enumerate() {
+            let d = crate::ts::demux(ts).unwrap();
+            let kind = d.sound_kind.unwrap();
+            let mut decoder = Decoder::new();
+            let pcm: Vec<i16> = d
+                .sound
+                .iter()
+                .flat_map(|f| {
+                    decoder.decode(
+                        kind,
+                        &Coded {
+                            data: &f.data,
+                            samples: f.samples,
+                            rate: f.rate,
+                            channels: f.channels,
+                        },
+                    )
+                })
+                .collect();
+            assert_eq!(fnv1a(&pcm), original, "fixture {n}");
+        }
     }
 }

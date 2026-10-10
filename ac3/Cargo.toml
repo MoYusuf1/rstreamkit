@@ -1,0 +1,20 @@
+[package]
+name = "rstreamkit-ac3"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.80"
+# The decoder is Mark Karpeles's oxideav-ac3 0.0.11 (Karpelès Lab Inc., MIT), absorbed into
+# rstreamkit and changed for speed; see README.md for what changed and LICENSE for the original
+# terms, which still apply.
+authors = ["Mark Karpeles", "rstreamkit contributors"]
+license = "MIT"
+description = "AC-3 and E-AC-3 decoding for rstreamkit, based on oxideav-ac3 0.0.11 by Mark Karpeles"
+repository = "https://github.com/MoYusuf1/rstreamkit"
+readme = "README.md"
+publish = false
+
+[lib]
+name = "rstreamkit_ac3"
+
+[dependencies]
+oxideav-core = "0.1"

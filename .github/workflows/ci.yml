@@ -41,6 +41,9 @@ jobs:
       - run: cargo test --no-default-features
       # Movies without the sound decoders (they are reported as unsupported).
       - run: cargo test --no-default-features --features vod
+      # The Dolby decoder kept in ac3/ (from oxideav-ac3, MIT) with its own test suite. Its code keeps
+      # its original style, so it is tested here rather than held to this crate's lints.
+      - run: cargo test --release --manifest-path ac3/Cargo.toml
 
   msrv:
     runs-on: ubuntu-latest

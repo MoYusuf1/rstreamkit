@@ -39,6 +39,11 @@ Changes:
   keeps its size from one keyframe to the next instead of growing again each time.
 - `tools/compare.py` races the command against FFmpeg on five workloads, checks both outputs,
   and reports FFmpeg's own processing time and both tools' true peak memory (`tools/peak.rs`).
+- The AC-3/E-AC-3 decoder is now `rstreamkit-ac3` in `ac3/`: oxideav-ac3 0.0.11 by Mark Karpeles
+  (MIT, licence and credit kept), decoding twice as fast with byte-identical output. Its
+  transform constants are built once, powers of two come from their exponent bits, the inverse
+  FFT is table-driven, the downmix plans its taps once, and trace switches are read once. A test
+  pins decoded checksums to the original's output; its own 558 tests run in CI.
 - CI's app-name guard no longer names the removed `examples` directory: grep exits with status
   2 for a missing path even when it finds a match, which would have silently disabled the guard.
 

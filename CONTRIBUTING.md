@@ -16,7 +16,8 @@ Apps are its clients; RIPTV is the first. Apps conform to rstreamkit, not the re
    without touching the rest; a new dependency has to earn its bytes (the wasm size of a page is a
    feature of the library). **Keep logic testable.** `mse` only compiles for the browser, so put everything that can run natively
    in the modules around it, with a test.
-5. **Don't copy or translate ffmpeg's code.** It is LGPL/GPL; work from the specifications.
+5. **Don't copy or translate ffmpeg's code.** It is LGPL/GPL; work from the specifications. Code under a
+   permissive licence may be taken in with its licence and credit kept, as `ac3/` (oxideav-ac3, MIT) is.
 6. **Changes land by pull request.** The maintainer may push directly.
 
 ## Before you push
@@ -30,6 +31,7 @@ done
 cargo test
 cargo test --no-default-features
 cargo test --no-default-features --features vod
+cargo test --release --manifest-path ac3/Cargo.toml
 ```
 
 CI runs the same, with ffmpeg installed so the tests that decode our output run instead of skipping.

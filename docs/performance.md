@@ -219,6 +219,40 @@ re-anchor within one frame, so decoded lengths differed by 3.2 s. The benchmark 
 Not measured: in-process libavformat, FFmpeg built for wasm, other machines, and
 FFmpeg with non-default thread settings.
 
+## A twice-as-fast Dolby decoder (2026-10-10)
+
+The AC-3 decoder (oxideav-ac3 0.0.11 by Mark Karpeles, MIT) now lives in `ac3/` as
+`rstreamkit-ac3`, with five changes found by sampling it with pprof. Before them, 23% of
+decoding was `2f32.powi(-e)` per coefficient, 10% rebuilding the IMDCT's twiddle table on
+every call, 21% the FFT (which also recomputed its twiddles and bit reversal in every group),
+7.5% a downmix re-deciding its taps per sample, and 1.4% `std::env::var` per block. Each
+change keeps every arithmetic operation and its order, so decoded PCM is byte-identical
+to the original on stereo, 5.1, E-AC-3 and real programme audio; the crate's own 558
+tests pass.
+
+Decoding alone, best of ten in-process (the same Ryzen 7 5700):
+
+| Input | oxideav-ac3 0.0.11 | rstreamkit-ac3 |
+| --- | ---: | ---: |
+| 6 s AC-3 5.1, 448 kbit/s (`tools/media/ac3.ts`) | 40.3 ms | 20.0 ms |
+| 4.2 s programme audio (`tools/media/programme.ts`) | 10.4 ms | 5.9 ms |
+| 4 s AC-3 stereo (`h264_ac3.ts`) | 5.75 ms | 2.74 ms |
+| 2 s AC-3 5.1 (`h264_ac3_51.ts`) | 9.08 ms | 3.59 ms |
+| 2 s E-AC-3 5.1 (`h264_eac3_51.ts`) | 9.70 ms | 4.36 ms |
+
+The command against FFmpeg afterwards (`python3 tools/compare.py "AC-3"`, checks passed):
+
+| Workload | rstreamkit | FFmpeg (processing only) | Peak memory, ours / FFmpeg |
+| --- | ---: | ---: | ---: |
+| 6 s 1080p TS, AC-3 5.1 to stereo FLAC | 37.6 ms (was 56.4) | 74.3 ms (12.0 ms) | 13.2 / 71.8 MB |
+| 30 min MKV, AC-3 5.1 to stereo FLAC | 8,437 ms (was 14,256) | 2,151 ms (2,077 ms) | 9.7 / 63.8 MB |
+
+FFmpeg remains four times faster at decoding long AC-3. What remains is real work:
+parsing the bitstream (exponents, bit allocation, mantissas) is about 64% of decoding,
+the transforms about 20%, the downmix about 6%. The next levers change results within rounding rather than bit for bit (mixing
+down before the inverse transforms, which would run 2 of them instead of 6) or need
+care with decoder state (decoding parts of a file in parallel).
+
 Reproduce:
 
 ```sh

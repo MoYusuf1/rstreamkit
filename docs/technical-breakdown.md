@@ -59,7 +59,7 @@ simplification and names its ceiling and upgrade path; keep that convention).
 |---|---|---|
 | Language | Rust, edition 2024. MSRV 1.88; developed on 1.99 | Everything is Rust. The only JavaScript is what wasm-bindgen generates, plus the test-bed page. |
 | Browser target | `wasm32-unknown-unknown`; `wasm-bindgen` 0.2.128, `wasm-bindgen-futures`, `js-sys`, `web-sys` | `web-sys` features are opt-in per type (the list is in `Cargo.toml`), and each one costs bytes. |
-| Sound decoders | `oxideav-ac3` 0.0.11, `oxideav-mp2` 0.0.10, `oxideav-core` 0.1 | Optional, behind the `sound` feature; about a quarter of a built page. |
+| Sound decoders | `rstreamkit-ac3` (in `ac3/`), `oxideav-mp2` 0.0.10, `oxideav-core` 0.1 | Optional, behind the `sound` feature; about a quarter of a built page. `ac3/` is oxideav-ac3 0.0.11 by Mark Karpeles (MIT), kept in this repo and made twice as fast. |
 | Everything else | `thiserror`, `futures-core` | No HTTP client and no URL crate: the browser provides both. |
 | Reference and oracle | `ffmpeg` / `ffprobe` (n9.0.2 here) | Test fixtures, an independent decoder in tests, the benchmark baseline. Never a dependency. |
 
@@ -80,6 +80,7 @@ src/
   mp4.rs, mkv.rs, vod.rs   movie files (feature vod)
   mse.rs              the browser player (wasm only)
   main.rs             the `rstreamkit` command (feature vod): files and pipes in, fragmented MP4 out
+ac3/                  rstreamkit-ac3: the AC-3/E-AC-3 decoder (from oxideav-ac3, MIT; LICENSE and credit kept)
 tests/                pipeline, vod, vod_without_sound, continuous, flac, passthrough, cli; fixtures/
 tools/                harness crate, test-bed page, Node profiler, media generator, fault server,
                       FFmpeg comparison (compare.py) and its memory-honest launcher (peak.rs)
@@ -167,6 +168,7 @@ done
 cargo test
 cargo test --no-default-features
 cargo test --no-default-features --features vod
+cargo test --release --manifest-path ac3/Cargo.toml   # the Dolby decoder's own 558 tests
 ```
 
 Put that in a `#!/usr/bin/env bash` file with `set -euo pipefail`. **fish does not word-split
@@ -223,12 +225,12 @@ decoded sound of the same length. Full method and the before/after of each chang
 | 6 s 1080p TS, copied | 7.9 ms | 71.9 ms (9.0 ms) | 12.7 / 68.1 MB |
 | 10 min 1080p TS (687 MB), copied | 334 ms | 831 ms (715 ms) | 17.3 / 67.7 MB |
 | 30 min 1080p MP4 (2 GB), copied | 781 ms | 1,442 ms (1,241 ms) | 16.3 / 66.4 MB |
-| 6 s 1080p TS, AC-3 5.1 to stereo FLAC | 56.4 ms | 77.3 ms (13.0 ms) | 13.2 / 72.0 MB |
-| 30 min MKV, AC-3 5.1 to stereo FLAC | 14,256 ms | 2,256 ms (2,173 ms) | 9.6 / 63.6 MB |
+| 6 s 1080p TS, AC-3 5.1 to stereo FLAC | 37.6 ms | 74.3 ms (12.0 ms) | 13.2 / 71.8 MB |
+| 30 min MKV, AC-3 5.1 to stereo FLAC | 8,437 ms | 2,151 ms (2,077 ms) | 9.7 / 63.8 MB |
 
 Repackaging beats even FFmpeg's processing-only time, in a quarter of the memory or less. Decoding
-AC-3 is several times slower: 86% of that time is the `oxideav-ac3` decoder, which decodes all six
-channels before mixing down. Read the results narrowly: they say nothing about in-process
+long AC-3 is still about four times slower, even after the decoder was made twice as fast (lesson
+5.9): it decodes all six channels before mixing down. Read the results narrowly: they say nothing about in-process
 libavformat, FFmpeg built for wasm, or other machines.
 
 ### Releasing
@@ -475,7 +477,41 @@ from 957 to 226 ms without changing a line of code.
 **Lesson:** a "big buffers are faster" intuition can be backwards. Allocation size interacts with
 the allocator's trim policy, so measure several sizes, and reuse buffers in hot loops.
 
-### 5.9 Browser and MSE facts (verified on Chromium, Linux)
+### 5.9 The Dolby decoder spent a third of its time recomputing constants
+
+**Symptom:** converting 30 minutes of 5.1 AC-3 took 14.3 s here and 2.3 s in FFmpeg. In-process,
+the decoder (then the oxideav-ac3 crate) was 86% of our time.
+
+**Cause:** sampled with pprof (no `perf` on the machine):
+
+- 23% was `2f32.powi(-e)`, a loop of multiplications, run for every coefficient;
+- 10% was a twiddle table its comment called cached, rebuilt (128 cosines and 128 sines) on every
+  inverse transform;
+- the FFT recomputed its twiddles and bit reversal in every group;
+- the downmix re-decided its taps for every sample, and about ten `std::env::var` lookups ran per
+  block.
+
+**Fix:** with the maintainer's agreement, the MIT-licensed decoder was taken into the repo as `ac3/`
+(`rstreamkit-ac3`), its LICENSE kept and its author credited. Then:
+
+- powers of two are built from their exponent bits;
+- the twiddles are tables built once, replaying the original recurrence so every value is the same;
+- the bit reversal is a table;
+- the downmix plans its taps once a call;
+- the trace switches are read once.
+
+No arithmetic changed order.
+
+**Verification:** decoding is twice as fast (40.3 to 20.0 ms for 6 s of 5.1), the command takes 8.4 s
+instead of 14.3 s for the 30-minute movie, and decoded PCM is byte-identical to the original's on
+stereo, 5.1, E-AC-3 and programme audio. `the_absorbed_dolby_decoder_still_decodes_exactly_what_the_original_did`
+pins checksums of the original's output, and the crate's own 558 tests pass.
+
+**Lesson:** profile code you depend on before deciding it is the floor. Read a sampling profiler's
+inclusive view: with inlining, the self-time labels put loop bodies under whatever was inlined into
+them (here, `cos` at 32% after every cosine had been cached).
+
+### 5.10 Browser and MSE facts (verified on Chromium, Linux)
 
 - AC-3 and E-AC-3 are **not** supported by MSE or WebCodecs there. FLAC, Opus, H.264, AAC and
   `audio/mpeg` are. HEVC is not. Decoding to FLAC is what makes AC-3 sources audible.
@@ -492,15 +528,15 @@ the allocator's trim policy, so measure several sizes, and reuse buffers in hot 
 - This evidence comes from Chromium on Linux. Before assuming the same elsewhere, run the test bed's
   codec probe and playback checks on that browser.
 
-### 5.10 Where the time goes
+### 5.11 Where the time goes
 
 - Don't decode video. Passing it through costs almost nothing: 7.4 ms for six seconds of 1080p in
   wasm, 2.4 ms natively.
-- The real CPU cost is sound: 55 to 85 ms per 6 s of AC-3 5.1 in wasm, and 40.6 ms natively, where
-  the decoder is 86% of the work (our FLAC encoding is 6.6 ms). The `oxideav-ac3` decoder decodes
-  all six channels and mixes down afterwards, so 5.1 costs 6.7 ms per second of sound against 1.5 for
-  stereo. Its optimisation level wasn't a lever. A mix-down before the inverse transforms, SIMD in
-  the transforms, running it off the main thread, or not running it (passthrough) are.
+- The real CPU cost is sound. Natively, 6 s of AC-3 5.1 took 40.6 ms to decode, then 20.0 ms after
+  lesson 5.9 (our FLAC encoding adds 6.6 ms). The decoder decodes all six channels and mixes down
+  afterwards, so 5.1 costs several times what stereo does. Its optimisation level wasn't a lever.
+  Mixing down before the inverse transforms, SIMD in the transforms, running it off the main thread,
+  or not running it at all (passthrough) are.
 - Yield between audio batches in the browser, so decoding is never one long task.
 - Profiling found two FLAC hot spots. A bitwise CRC16 over every byte was cut from 11 to 4 ms by a
   table. Updating the output `Vec` every few bits was replaced by a register, giving 29% less
@@ -511,7 +547,7 @@ the allocator's trim policy, so measure several sizes, and reuse buffers in hot 
 - Dropping the HTTP-client and URL crates in favour of the browser's `fetch` and `URL` cut the wasm
   dependency count from 87 to 31.
 
-### 5.11 Measuring honestly
+### 5.12 Measuring honestly
 
 - Most guesses about where time and memory went were wrong until measured. Measure before and after,
   each in a fresh process, with tool versions written down.
@@ -529,7 +565,7 @@ the allocator's trim policy, so measure several sizes, and reuse buffers in hot 
   10 ms at every seam, which FFmpeg trims and this library keeps. Encode benchmark inputs straight
   through.
 
-### 5.12 Rust and API design
+### 5.13 Rust and API design
 
 - Replace string protocols with types. An early `convert:` string prefix became the `Unsupported`
   enum, which apps can match.
@@ -544,7 +580,7 @@ the allocator's trim policy, so measure several sizes, and reuse buffers in hot 
 - Keep policy out of the library. It reports `Unsupported`; the app decides whether to show a
   message, play without sound or hand the stream elsewhere.
 
-### 5.13 Working method
+### 5.14 Working method
 
 - Write the lint-and-test script once, gate it with `set -e`, and print the compiler's errors when it
   fails.
@@ -574,6 +610,10 @@ the allocator's trim policy, so measure several sizes, and reuse buffers in hot 
   bytes. Don't poll; wait on events. Write each byte once.
 - **Unsupported is a report, not a workaround.** There is no software video decoder in wasm.
 - **Testable by default.** Logic that can run natively lives outside `mse`, with a test.
+- **`ac3/` is borrowed work.** It is oxideav-ac3 by Mark Karpeles under the MIT licence: keep its
+  `LICENSE` and the credits in `ac3/README.md` and the main README. Changes there must keep decoded
+  output identical (a checksum test enforces it) unless a change is meant to alter it, and then the
+  checksums, the README's change list and the changelog are updated together.
 - **The project had an earlier name, and it is retired.** If you meet it in a comment, doc or
   commit message, replace it with rstreamkit.
 - **The repository is private for now.** Don't publish it or change its visibility.
