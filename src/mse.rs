@@ -843,11 +843,9 @@ fn cross_live_gap(video: &HtmlVideoElement, target: f64) {
         return;
     }
     let b = video.buffered();
-    let ranges: Vec<_> = (0..b.length())
-        .filter_map(|i| Some((b.start(i).ok()?, b.end(i).ok()?)))
-        .collect();
+    let ranges = (0..b.length()).filter_map(|i| Some((b.start(i).ok()?, b.end(i).ok()?)));
     if let Some(start) =
-        crate::live::gap_target(&ranges, video.current_time(), target.max(1.0) * 2.0)
+        crate::live::gap_target(ranges, video.current_time(), target.max(1.0) * 2.0)
     {
         video.set_current_time(start);
     }
@@ -903,25 +901,60 @@ async fn wait_idle(sb: &SourceBuffer, ms: &MediaSource) -> Result<(), String> {
     }
 }
 
-/// Drops buffered media far behind the playhead so a long live session doesn't fill memory.
+/// Browser I/O for shared buffer control. No media bytes or range lists are copied.
+struct BrowserBuffer<'a> {
+    video: &'a HtmlVideoElement,
+    sb: Option<&'a SourceBuffer>,
+    ms: &'a MediaSource,
+}
+impl crate::net::PlaybackBuffer for BrowserBuffer<'_> {
+    fn position(&self) -> f64 {
+        self.video.current_time()
+    }
+    fn ahead(&self) -> f64 {
+        buffered_ahead(self.video)
+    }
+    fn playback_rate(&self) -> f64 {
+        self.video.playback_rate()
+    }
+    fn cross_gap(&mut self, target: f64) {
+        cross_live_gap(self.video, target);
+    }
+    async fn oldest(&mut self) -> Result<Option<f64>, String> {
+        let Some(sb) = self.sb else {
+            return Ok(None);
+        };
+        wait_idle(sb, self.ms).await?;
+        let ranges = sb.buffered().map_err(js_err)?;
+        if ranges.length() == 0 {
+            Ok(None)
+        } else {
+            ranges.start(0).map(Some).map_err(js_err)
+        }
+    }
+    async fn remove(&mut self, range: Range<f64>) -> Result<(), String> {
+        let sb = self.sb.ok_or("no media buffer")?;
+        sb.remove(range.start, range.end).map_err(js_err)?;
+        wait_idle(sb, self.ms).await
+    }
+}
+
+/// Drops buffered media far behind the playhead using shared Rust policy.
 async fn trim(
     video: &HtmlVideoElement,
     sb: &SourceBuffer,
     ms: &MediaSource,
     keep: f64,
 ) -> Result<(), String> {
-    wait_idle(sb, ms).await?;
-    let b = sb.buffered().map_err(js_err)?;
-    if b.length() == 0 {
-        return Ok(());
-    }
-    let start = b.start(0).map_err(js_err)?;
-    let cut = video.current_time() - keep;
-    if cut - start > 1.0 {
-        let _ = sb.remove(start, cut);
-        wait_idle(sb, ms).await?;
-    }
-    Ok(())
+    crate::net::trim_buffer(
+        &mut BrowserBuffer {
+            video,
+            sb: Some(sb),
+            ms,
+        },
+        keep,
+    )
+    .await
 }
 
 /// Hands `bytes` to the browser, which copies what it needs before returning: they are lent as a
@@ -1068,24 +1101,24 @@ async fn run(
         }
         // Refresh after throttling: old playlist entries may have expired during a pause.
         let (ahead, behind) = crate::live::buffer_limits(bytes_per_second, media.target_duration);
-        let mut throttled = false;
-        while buffered_ahead(video) > ahead {
-            if go_live.get() {
-                throttled = true;
-                break;
-            }
-            cross_live_gap(video, media.target_duration);
-            if let Some(buffer) = &sb {
-                trim(video, buffer, &ms, behind).await?;
-            }
-            throttled = true;
-            sleep(Duration::from_millis(crate::live::throttle_delay_ms(
-                buffered_ahead(video),
-                ahead,
-                video.playback_rate(),
-            )))
-            .await;
-        }
+        let waited = crate::net::wait_for_room(
+            &BrowserClock,
+            &mut BrowserBuffer {
+                video,
+                sb: sb.as_ref(),
+                ms: &ms,
+            },
+            (ahead, behind),
+            media.target_duration,
+            || stop.get(),
+            || go_live.get(),
+        )
+        .await?;
+        let throttled = match waited {
+            crate::net::BufferWait::Ready { waited } => waited,
+            crate::net::BufferWait::Interrupted => true,
+            crate::net::BufferWait::Cancelled => return Ok(()),
+        };
         if throttled && !media.ended {
             prefetch = None;
             latest = fetch(http, &media_url, PLAYLIST_LIMIT, stop, &mut say).await?;

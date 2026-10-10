@@ -455,3 +455,48 @@ installation's `node_modules`, then run `node tools/node/retry-smoke.cjs`.
 two checks: Stop reduced one pending retry timer to zero with no later request;
 a 503 followed by a 404 made exactly two requests and stopped. These are
 functional checks; real Edge/Safari and long 4K60 acceptance remain pending.
+
+## Shared buffer control (2026-10-10)
+
+Browser playback now uses the native-testable Rust trim and backpressure loop.
+It stops before new media work when the buffer is full, honours stop/go-live,
+and reports removal failures. Gap checks read ranges as an iterator instead of
+building a temporary vector. The loop adds no dependencies or media-byte copies.
+
+| Measure | Retry baseline | Shared buffer control |
+| --- | ---: | ---: |
+| Native buffer-control integration tests | 0 | 12 |
+| Temporary range vectors per gap check | 1 | 0 |
+| Live player, Brotli bytes | 108,751 | 109,690 |
+| Live + sound player, Brotli bytes | 206,631 | 207,300 |
+| Movie player, Brotli bytes | 131,598 | 132,475 |
+| Full player, Brotli bytes | 228,866 | 229,637 |
+
+Baseline: `70c709b` (PR #52), with the same Linux/Rust 1.99.0,
+wasm-bindgen 0.2.128, wasm-opt 130 and Brotli 1.2.0. Repeat with
+`python3 tools/size.py --check-budgets --output tools/results/size-buffer-control.json`.
+All four size budgets pass. The full player grows 771 bytes (0.34%) to expose
+and validate shared host control. This is a correctness/testability tradeoff;
+no runtime CPU, memory peak or FFmpeg speed advantage was measured here.
+
+Run `cargo test --test buffer_control`, also with `--no-default-features`.
+Twelve cases cover normal backpressure, immediate room, gap recovery, go-live
+before/during a wait, stop before/during removal, removal errors, small/empty
+buffers, invalid limits/durations and dropping a paused wait. The nine shared
+retry integration tests still pass too.
+
+Playwright Chrome 155.0.8059.39 passes the five playback regressions from PR #50
+against this exact build. It also passes four source-update fault checks from
+`tools/node/buffer-smoke.cjs`: close during append, close during removal, remove
+the active buffer, and remove an unrelated buffer. Each records `updating=true`.
+The first three settle with Failed; the unrelated removal reaches Ended.
+
+To repeat, install Playwright as described above, build and serve the player,
+and run `NODE_PATH=tools/browser/node_modules node tools/node/buffer-smoke.cjs`.
+The fault test serves 20 copies of the committed `bbb_480p.ts` fixture
+through Playwright routes, so no media generator or PR #50 tooling is needed.
+The roughly 90-second playlist is long enough to trigger actual rewind
+removal. It runs at 4× after the video is ready. `RSTREAMKIT_URL` selects
+another local player URL. These accelerated correctness checks do not establish
+4K60 performance, a long soak, or real Edge/Safari acceptance. Full playlist and
+session orchestration still needs extraction for #23.

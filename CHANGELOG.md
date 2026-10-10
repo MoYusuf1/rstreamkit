@@ -9,6 +9,8 @@ Breaking changes:
 - Additional public enums are non-exhaustive; Demuxed gains passthrough metadata.
 
 Changes:
+- Share buffer trimming and backpressure with native hosts; add twelve control tests.
+- Report failed browser removals and inspect live gaps without a temporary range vector.
 - Share the retry loop between native and browser hosts; test nine outage/cancellation cases with fake time.
 - Clear browser timers when their waiting future is dropped.
 - Cancel player tasks and Direct fetches on stop/drop; release buffer listeners.
