@@ -811,6 +811,13 @@ fn buffered_ahead(video: &HtmlVideoElement) -> f64 {
     }
 }
 
+fn buffered_duration(video: &HtmlVideoElement) -> f64 {
+    let ranges = video.buffered();
+    (0..ranges.length())
+        .filter_map(|i| Some((ranges.end(i).ok()? - ranges.start(i).ok()?).max(0.0)))
+        .sum()
+}
+
 fn cross_live_gap(video: &HtmlVideoElement, target: f64) {
     if video.paused() {
         return;
@@ -1040,7 +1047,7 @@ async fn run(
             jump_requested = true;
         }
         // Refresh after throttling: old playlist entries may have expired during a pause.
-        let (ahead, _) = crate::live::buffer_limits(bytes_per_second, media.target_duration);
+        let (ahead, behind) = crate::live::buffer_limits(bytes_per_second, media.target_duration);
         let mut throttled = false;
         while buffered_ahead(video) > ahead {
             if go_live.get() {
@@ -1048,8 +1055,16 @@ async fn run(
                 break;
             }
             cross_live_gap(video, media.target_duration);
+            if let Some(buffer) = &sb {
+                trim(video, buffer, &ms, behind).await?;
+            }
             throttled = true;
-            sleep(Duration::from_millis(250)).await;
+            sleep(Duration::from_millis(crate::live::throttle_delay_ms(
+                buffered_ahead(video),
+                ahead,
+                video.playback_rate(),
+            )))
+            .await;
         }
         if throttled && !media.ended {
             prefetch = None;
@@ -1080,6 +1095,10 @@ async fn run(
                 match downloaded {
                     Ok(segment) => finish_segment(&tx, segment).await,
                     Err(_) => {
+                        // A capped/failed speculative body is not a complete download
+                        // timing sample. Do not infer throughput from the fallback's
+                        // full output size and the failed request's shorter duration.
+                        download_seconds = None;
                         fetch_segment(
                             http,
                             &url,
@@ -1133,7 +1152,6 @@ async fn run(
             } else {
                 media.target_duration.max(1.0)
             };
-            let measured = appended as f64 / seconds;
             if !speculative {
                 abr.observe(
                     appended,
@@ -1143,11 +1161,6 @@ async fn run(
             if let Some(seconds) = download_seconds {
                 abr.observe(appended, seconds);
             }
-            bytes_per_second = if bytes_per_second == 0.0 {
-                measured
-            } else {
-                0.8 * bytes_per_second + 0.2 * measured
-            };
             if let Some(codec) = &out.skipped_audio {
                 if !partial {
                     return Err(Unsupported::Sound(codec.clone()).into());
@@ -1158,31 +1171,6 @@ async fn run(
                         "{codec} audio can't be played in the browser; playing without sound"
                     )));
                 }
-            }
-            if !video.paused()
-                && prefetch.is_none()
-                && let Some(next) = media
-                    .segments
-                    .iter()
-                    .position(|s| {
-                        s.seq == seg.seq && s.uri == seg.uri && s.byte_range == seg.byte_range
-                    })
-                    .and_then(|i| media.segments.get(i + 1))
-                && next.key.is_none()
-                && next.map.is_none()
-                && next.byte_range.is_none()
-            {
-                let next_url = resolve(&latest.url, &next.uri)?;
-                let language = selected_audio.clone();
-                prefetch = Some(Prefetch {
-                    uri: next.uri.clone(),
-                    future: Some(Box::pin(async move {
-                        download_segment(http, &next_url, SEGMENT_LIMIT, language).await
-                    })),
-                    ready: None,
-                    started: js_sys::Date::now() / 1000.0,
-                    seconds: None,
-                });
             }
             if let Some(url) = &audio_url {
                 let mut audio = get_rendition(
@@ -1223,6 +1211,45 @@ async fn run(
                     }
                 }
                 out.fragments.extend(audio.fragments);
+            }
+            // Include merged rendition audio, including any decoded FLAC, in the memory
+            // estimate. React immediately to a bitrate spike, then decay gradually.
+            let appended: usize = out
+                .fragments
+                .iter()
+                .map(|f| f.moof.len() + f.mdat.len())
+                .sum();
+            bytes_per_second = crate::live::buffer_rate(bytes_per_second, appended, seconds);
+            if !video.paused()
+                && prefetch.is_none()
+                && let Some(next) = media
+                    .segments
+                    .iter()
+                    .position(|s| {
+                        s.seq == seg.seq && s.uri == seg.uri && s.byte_range == seg.byte_range
+                    })
+                    .and_then(|i| media.segments.get(i + 1))
+                && next.key.is_none()
+                && next.map.is_none()
+                && next.byte_range.is_none()
+                && let Some(limit) = crate::live::prefetch_limit(
+                    bytes_per_second,
+                    buffered_duration(video),
+                    appended,
+                    next.duration,
+                )
+            {
+                let next_url = resolve(&latest.url, &next.uri)?;
+                let language = selected_audio.clone();
+                prefetch = Some(Prefetch {
+                    uri: next.uri.clone(),
+                    future: Some(Box::pin(async move {
+                        download_segment(http, &next_url, limit.min(SEGMENT_LIMIT), language).await
+                    })),
+                    ready: None,
+                    started: js_sys::Date::now() / 1000.0,
+                    seconds: None,
+                });
             }
             if let Some(mut init) = out.init {
                 if init.interlaced && !partial {
@@ -1276,6 +1303,9 @@ async fn run(
                 },
             )
             .await?;
+            // Browser appends have copied these bytes. Release the Rust allocations
+            // before trimming, throttling or requesting the following segment.
+            out.fragments.clear();
             window.consumed(seg);
             frontier += seconds;
             let remaining: f64 = media
@@ -1375,6 +1405,11 @@ async fn run(
         }
 
         if media.ended {
+            // A finite playlist may have more segments after a buffer throttle. Only
+            // end the media source once every listed segment has actually been consumed.
+            if !window.finished(&media) {
+                continue;
+            }
             if let Some(b) = &sb {
                 wait_idle(b, &ms).await?;
             }

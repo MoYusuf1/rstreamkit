@@ -24,6 +24,51 @@ Timing results depend on CPU, browser, compiler and media. Record these with eac
 run. Sine-wave benchmark audio is deliberately synthetic and must not be used to
 claim a representative FLAC compression ratio.
 
+## Small player and download budgets
+
+`tools/player` is a Rust browser entry point with playback controls only. The larger
+`tools/harness` also exports benchmarks; its size is not the player download size.
+
+With wasm-opt and Brotli installed, run:
+
+```sh
+cargo fetch --manifest-path tools/player/Cargo.toml --target wasm32-unknown-unknown
+python3 tools/size.py --check-budgets
+python3 tools/server.py
+```
+
+The size script builds offline after fetching dependencies. CI checks all four
+download budgets with Binaryen 130 and saves the JSON report. It records compiler and
+tool versions, source/artifact hashes, the resolved Cargo.lock, raw bytes and Brotli
+bytes in `tools/results/size.json`. It leaves playable packages under `tools/web/player`.
+The download count includes both Wasm and generated JS. It excludes the host page,
+media, HTTP headers and optional type declarations. There is no JS minifier in this
+recipe. Keep the same features and recipe when comparing changes.
+
+Open http://127.0.0.1:8765/player.html?build=full. Choose `live`, `live-sound`,
+`vod` or `full` in the URL. `vod` includes live and movie playback, without the optional
+sound decoders. Removing sound means unsupported source audio needs another stream;
+it does not provide equivalent coverage to the full build.
+
+The page saves JSON with time to first presented frame, frame drops, visible/hidden
+time, long tasks, bounded status/memory samples and codec capability predictions.
+Wasm memory excludes JS, decoder and GPU memory. Long tasks are not total CPU time.
+The development server serves uncompressed packages; the size report measures
+compressed artifacts separately. Short checks and capability predictions do not
+prove 4K60 support. Record fixture hashes and hardware alongside the saved report.
+
+`python3 tools/4k.py --mbps 40` generates an 18-second 3840×2160/60 SDR H.264
+High level 5.2 + AAC stress stream, split into three six-second segments. Use 15,
+25 or 40 Mbps. The fixture is synthetic and tests load, not visual quality.
+Its JSON sidecar records the encoder command, version, probed video format and
+file hashes. Play `/media/4k60-40m.m3u8` in the small player. Finish encoding and
+other CPU-heavy jobs before measuring, use a fresh page for each run, and compare
+all 1,080 expected frames as well as reported drops: skipping media is not a win.
+
+`bash tools/build.sh && node tools/node/audio-smoke.cjs` checks AC-3, E-AC-3 and MP2
+decoding in browser-targeted Wasm using checked-in fixtures. CI treats this as a
+required check, separately from the optional performance profiling job.
+
 The page also offers pause/resume/go-live controls, codec probes and a cold
 main-thread/worker audio benchmark. `worker.js` uses a transferable input buffer.
 These are diagnostic controls; no generated media is sent outside localhost.

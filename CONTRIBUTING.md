@@ -22,6 +22,18 @@ Apps are its clients; RIPTV is the first. Apps conform to rstreamkit, not the re
 
 ## Before you push
 
+Use Conventional Commits: `fix(buffer): reduce retained media memory` or
+`test(browser): check finite playback`. Keep the title short and use plain English.
+In the commit body, include a small Markdown table with the measured before/after
+numbers, the input and the test setup. For docs or tests, report useful counts or
+coverage instead of inventing a speedup. State what was not measured.
+
+| Measure | Before | After |
+| --- | ---: | ---: |
+| Wasm memory, same 18-second 4K60 clip | 70.9 MB | 35.8–36.7 MB |
+
+Performance claims must link to repeat commands and limits in `docs/performance.md`.
+
 ```sh
 cargo fmt --check
 for f in "" "--no-default-features" "--no-default-features --features sound" "--no-default-features --features vod"; do

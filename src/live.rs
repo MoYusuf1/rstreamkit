@@ -11,6 +11,10 @@ pub(crate) struct Window {
 }
 
 impl Window {
+    pub fn finished(&self, media: &Media) -> bool {
+        media.ended && self.next(media).is_none()
+    }
+
     pub fn next<'a>(&self, media: &'a Media) -> Option<&'a Segment> {
         let start = match &self.last {
             None => {
@@ -86,19 +90,65 @@ pub(crate) fn gap_target(ranges: &[(f64, f64)], time: f64, limit: f64) -> Option
 }
 
 /// Duration limits derived from bytes actually appended, including decoded sound.
+/// Reserve the next segment before assigning rewind/ahead space. Keep at least
+/// one segment behind: removing part of the current GOP can also remove its future
+/// dependent frames. Long GOPs can exceed the budget; this is not a process-memory cap.
 pub(crate) fn buffer_limits(bytes_per_second: f64, segment_seconds: f64) -> (f64, f64) {
-    let total = if bytes_per_second > 0.0 {
+    let total = if bytes_per_second > 0.0 && bytes_per_second.is_finite() {
         BUFFER_BUDGET as f64 / bytes_per_second
     } else {
         40.0
     };
-    let floor = (2.0 * segment_seconds.max(1.0)).min(30.0);
-    let behind = (total * 0.2).clamp(0.0, 10.0);
-    // Reserve one segment: the append completing a throttle can overshoot its threshold.
-    (
-        (total - behind - segment_seconds.max(1.0)).clamp(floor, 30.0),
-        behind,
-    )
+    let segment = if segment_seconds.is_finite() {
+        segment_seconds.max(1.0)
+    } else {
+        1.0
+    };
+    let available = (total - segment).max(0.0);
+    let behind = (available * 0.2).min(10.0).max(segment);
+    // Keep a little time for fetch, append and decoder startup at a segment boundary.
+    // A positive threshold also avoids waiting forever on the final frame of a range.
+    ((available - behind).clamp(0.5, 30.0), behind)
+}
+
+/// Speculative input shares the compressed-media estimate with buffered media and
+/// the output awaiting append. Unknown rates disable speculation. The returned cap
+/// also bounds a provider that sends a larger body than its preceding segment.
+pub(crate) fn prefetch_limit(
+    bytes_per_second: f64,
+    buffered_seconds: f64,
+    output_bytes: usize,
+    next_seconds: f64,
+) -> Option<usize> {
+    if !bytes_per_second.is_finite()
+        || bytes_per_second <= 0.0
+        || !buffered_seconds.is_finite()
+        || !next_seconds.is_finite()
+        || next_seconds <= 0.0
+    {
+        return None;
+    }
+    let resident = buffered_seconds.max(0.0) * bytes_per_second + output_bytes as f64;
+    let room = (BUFFER_BUDGET as f64 - resident).max(0.0).floor() as usize;
+    // Allow for container overhead and normal variation; actual input is capped too.
+    let expected = bytes_per_second * next_seconds * 1.25;
+    (expected <= room as f64 && room > 0).then_some(room)
+}
+
+/// A new peak must affect memory policy immediately; retain a little history when
+/// the bitrate falls so a small segment does not suddenly authorize a large queue.
+pub(crate) fn buffer_rate(previous: f64, appended: usize, seconds: f64) -> f64 {
+    let measured = appended as f64 / seconds;
+    measured.max(0.8 * previous + 0.2 * measured)
+}
+
+/// Wake near the buffer threshold instead of overshooting it by a fixed timer
+/// tick. Bound wake frequency and tolerate a paused/invalid playback clock.
+pub(crate) fn throttle_delay_ms(buffered: f64, ahead: f64, rate: f64) -> u64 {
+    if !buffered.is_finite() || !ahead.is_finite() || !rate.is_finite() || rate <= 0.0 {
+        return 250;
+    }
+    ((buffered - ahead) * 1000.0 / rate).clamp(10.0, 250.0) as u64
 }
 
 #[derive(Default)]
@@ -260,6 +310,38 @@ mod tests {
         w.consumed(w.next(&recovery).unwrap());
         assert!(!w.frozen(20.0, 2.0));
     }
+
+    #[test]
+    fn finite_input_is_not_finished_when_a_buffer_throttle_leaves_segments() {
+        let mut media = playlist(0, &["first", "second", "third"]);
+        media.ended = true;
+        let mut window = Window::default();
+        for segment in &media.segments {
+            assert!(!window.finished(&media));
+            window.consumed(segment);
+        }
+        assert!(window.finished(&media));
+        media.ended = false;
+        assert!(!window.finished(&media));
+    }
+
+    #[test]
+    fn memory_rate_reacts_to_spikes_immediately_and_falls_gradually() {
+        assert_eq!(buffer_rate(1_000_000.0, 30_000_000, 6.0), 5_000_000.0);
+        assert_eq!(buffer_rate(5_000_000.0, 6_000_000, 6.0), 4_200_000.0);
+        assert_eq!(buffer_rate(0.0, 6_000_000, 6.0), 1_000_000.0);
+    }
+
+    #[test]
+    fn throttle_wakes_at_the_threshold_without_busy_polling() {
+        assert_eq!(throttle_delay_ms(6.0, 0.25, 1.0), 250);
+        assert_eq!(throttle_delay_ms(1.25, 1.0, 2.0), 125);
+        assert_eq!(throttle_delay_ms(0.251, 0.25, 1.0), 10);
+        assert_eq!(throttle_delay_ms(0.0, 0.25, 1.0), 10);
+        for rate in [0.0, -1.0, f64::NAN, f64::INFINITY] {
+            assert_eq!(throttle_delay_ms(1.0, 0.25, rate), 250);
+        }
+    }
     #[test]
     fn adaptive_selection_steps_down_then_recovers_with_headroom() {
         let variants = vec![
@@ -288,9 +370,53 @@ mod tests {
     #[test]
     fn bitrate_limits_and_retry_budget() {
         let (ahead, behind) = buffer_limits(2_000_000.0, 6.0);
-        assert!((12.0..30.0).contains(&ahead));
-        assert!((ahead + behind) * 2_000_000.0 <= BUFFER_BUDGET as f64);
+        assert!((0.5..6.0).contains(&ahead));
+        assert!((ahead + behind + 6.0) * 2_000_000.0 <= BUFFER_BUDGET as f64);
         assert_eq!(retry_delay(7), None);
         assert!((0..7).map(|a| retry_delay(a).unwrap()).sum::<u64>() > 10);
+    }
+
+    #[test]
+    fn high_bitrate_limits_reserve_the_next_segment_without_a_two_segment_floor() {
+        for mbps in [8.0, 15.0, 25.0, 40.0] {
+            let rate = mbps * 1_000_000.0 / 8.0;
+            for segment in [1.0, 2.0, 6.0] {
+                let (ahead, behind) = buffer_limits(rate, segment);
+                assert!(ahead > 0.0 && behind >= 0.0);
+                if (2.0 * segment + 0.5) * rate <= BUFFER_BUDGET as f64 {
+                    assert!((ahead + behind + segment) * rate <= BUFFER_BUDGET as f64 + 0.01);
+                } else {
+                    assert_eq!(ahead, 0.5);
+                }
+                assert!(behind >= segment, "keep the current GOP's dependencies");
+            }
+        }
+        let (ahead, behind) = buffer_limits(5_000_000.0, 6.0);
+        assert_eq!((ahead, behind), (0.5, 6.0));
+    }
+
+    #[test]
+    fn oversized_segments_and_invalid_estimates_still_allow_forward_progress() {
+        let (ahead, behind) = buffer_limits(10_000_000.0, 6.0);
+        assert_eq!((ahead, behind), (0.5, 6.0));
+        for rate in [0.0, -1.0, f64::NAN, f64::INFINITY] {
+            for seconds in [0.0, -1.0, f64::NAN, f64::INFINITY] {
+                let (ahead, behind) = buffer_limits(rate, seconds);
+                assert!(ahead.is_finite() && ahead > 0.0 && behind.is_finite());
+            }
+        }
+    }
+
+    #[test]
+    fn speculation_fits_all_buffered_ranges_and_pending_output_or_is_disabled() {
+        let room = prefetch_limit(1_000_000.0, 10.0, 6_000_000, 6.0).unwrap();
+        assert_eq!(room, BUFFER_BUDGET - 16_000_000);
+        assert_eq!(prefetch_limit(5_000_000.0, 0.0, 30_000_000, 6.0), None);
+        assert_eq!(prefetch_limit(1_000_000.0, 30.0, 6_000_000, 1.0), None);
+        assert_eq!(prefetch_limit(1_000_000.0, 0.0, 0, 60.0), None);
+        for invalid in [0.0, -1.0, f64::NAN, f64::INFINITY] {
+            assert_eq!(prefetch_limit(invalid, 0.0, 0, 2.0), None);
+            assert_eq!(prefetch_limit(1.0, 0.0, 0, invalid), None);
+        }
     }
 }

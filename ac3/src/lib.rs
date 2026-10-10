@@ -95,6 +95,7 @@ pub use crate::drc::{DrcMode, DrcSettings};
 /// A debug-trace switch (`AC3_TRACE_*`, `AC3_DEBUG_*`, `EAC3_*`) from the environment. Read once,
 /// rather than on every block as before: decoding consults about ten of them per block. Same
 /// answers as `std::env::var`, including treating a value that isn't Unicode as unset.
+#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
 pub(crate) fn trace_var(name: &str) -> core::result::Result<&'static str, ()> {
     static VARS: std::sync::OnceLock<Vec<(String, String)>> = std::sync::OnceLock::new();
     VARS.get_or_init(|| {
@@ -107,6 +108,13 @@ pub(crate) fn trace_var(name: &str) -> core::result::Result<&'static str, ()> {
     .find(|(k, _)| k == name)
     .map(|(_, v)| v.as_str())
     .ok_or(())
+}
+
+// Browser wasm has no process environment. Enumerating it with vars_os() panics;
+// leave diagnostic switches off, as the previous individual var() lookups did.
+#[cfg(all(target_family = "wasm", target_os = "unknown"))]
+pub(crate) fn trace_var(_name: &str) -> core::result::Result<&'static str, ()> {
+    Err(())
 }
 
 /// Register the AC-3 + E-AC-3 decoder + encoder with the supplied codec
