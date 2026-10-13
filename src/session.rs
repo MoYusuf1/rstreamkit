@@ -158,13 +158,13 @@ pub struct ScheduledSegment<'a> {
     pub window_seconds: f64,
 }
 
-/// One immutable snapshot walk. The duration cache costs eight bytes per pending
-/// segment plus a sentinel. It is freed with the batch; it holds no media copies.
+/// One immutable snapshot walk with constant extra duration storage.
+/// Ordinary durations need no heap allocation; extreme inputs use a fixed-size fallback.
+/// The accumulator preserves small tails even after an overflowing total.
 pub struct Batch<'a> {
     media: &'a Media,
     index: usize,
-    start: usize,
-    suffix: Vec<f64>,
+    remaining: crate::duration::DurationSum,
     window_seconds: f64,
 }
 impl<'a> Iterator for Batch<'a> {
@@ -172,10 +172,11 @@ impl<'a> Iterator for Batch<'a> {
     fn next(&mut self) -> Option<Self::Item> {
         let segment = self.media.segments.get(self.index)?;
         self.index += 1;
+        self.remaining.remove(segment.duration);
         Some(ScheduledSegment {
             segment,
             next: self.media.segments.get(self.index),
-            remaining_seconds: self.suffix[self.index - self.start],
+            remaining_seconds: self.remaining.value(),
             window_seconds: self.window_seconds,
         })
     }
@@ -245,22 +246,29 @@ impl Session {
     pub fn batch<'a>(&self, media: &'a Media) -> Batch<'a> {
         let start = self.next_index(media).min(media.segments.len());
         let pending = &media.segments[start..];
-        let mut suffix = vec![0.0; pending.len() + 1];
-        for (index, segment) in pending.iter().enumerate().rev() {
-            suffix[index] = segment.duration + suffix[index + 1];
-        }
         Batch {
             media,
             index: start,
-            start,
-            suffix,
+            remaining: crate::duration::DurationSum::new(
+                pending.iter().map(|segment| segment.duration),
+            ),
             window_seconds: media.duration(),
         }
     }
 
     /// Advance only after successful output, or an explicit host decision to skip a failed segment.
     pub fn consumed(&mut self, segment: &Segment) {
-        self.last = Some((segment.seq, segment.uri.clone(), segment.byte_range.clone()));
+        if let Some((seq, uri, range)) = &mut self.last {
+            *seq = segment.seq;
+            if uri.capacity() > segment.uri.len().saturating_mul(4).max(256) {
+                *uri = segment.uri.clone();
+            } else {
+                uri.clone_from(&segment.uri);
+            }
+            range.clone_from(&segment.byte_range);
+        } else {
+            self.last = Some((segment.seq, segment.uri.clone(), segment.byte_range.clone()));
+        }
         self.stalled_since = None;
     }
 
@@ -295,4 +303,25 @@ pub fn buffer_limits(bytes_per_second: f64, segment_seconds: f64) -> (f64, f64) 
     // Keep a little time for fetch, append and decoder startup at a segment boundary.
     // A positive threshold also avoids waiting forever on the final frame of a range.
     ((available - behind).clamp(0.5, 30.0), behind)
+}
+
+#[cfg(test)]
+mod memory_tests {
+    use super::*;
+    #[test]
+    fn cursor_releases_an_oversized_uri_after_it_is_replaced() {
+        let crate::hls::Parsed::Media(mut media) = crate::hls::parse(
+            b"#EXTM3U\n#EXT-X-TARGETDURATION:6\n#EXTINF:6,\nfirst\n#EXTINF:6,\nshort\n",
+        )
+        .unwrap() else {
+            panic!()
+        };
+        media.segments[0].uri = "x".repeat(8192);
+        let mut cursor = Session::default();
+        cursor.consumed(&media.segments[0]);
+        assert!(cursor.last.as_ref().unwrap().1.capacity() >= 8192);
+        cursor.consumed(&media.segments[1]);
+        assert!(cursor.last.as_ref().unwrap().1.capacity() <= 256);
+        assert_eq!(cursor.last.as_ref().unwrap().1, "short");
+    }
 }

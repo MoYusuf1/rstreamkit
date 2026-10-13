@@ -104,36 +104,24 @@ fn suffix_cache_does_not_lose_small_tails_after_huge_or_overflowing_sums() {
 #[ignore = "manual native playlist bookkeeping benchmark; run in release mode"]
 fn measure_playlist_bookkeeping() {
     use std::{hint::black_box, time::Instant};
+    // PR #55's suffix-vector walk and original per-segment URI allocation.
     fn old(media: &Media) {
-        let mut cursor = Session::default();
-        while let Some(segment) = cursor.next(media) {
-            let next = media
-                .segments
-                .iter()
-                .position(|s| {
-                    s.seq == segment.seq
-                        && s.uri == segment.uri
-                        && s.byte_range == segment.byte_range
-                })
-                .and_then(|i| media.segments.get(i + 1));
-            let remaining: f64 = media
-                .segments
-                .iter()
-                .skip_while(|s| {
-                    s.seq != segment.seq
-                        || s.uri != segment.uri
-                        || s.byte_range != segment.byte_range
-                })
-                .skip(1)
-                .map(|s| s.duration)
-                .sum();
+        let mut suffix = vec![0.0; media.segments.len() + 1];
+        for (index, segment) in media.segments.iter().enumerate().rev() {
+            suffix[index] = segment.duration + suffix[index + 1];
+        }
+        let window = media.duration();
+        let mut last = None;
+        black_box(&last);
+        for (index, segment) in media.segments.iter().enumerate() {
             black_box((
-                next.map(|s| s.seq),
-                remaining,
-                if media.ended { 0.0 } else { media.duration() },
-                if media.ended { 0.0 } else { media.duration() },
+                media.segments.get(index + 1).map(|s| s.seq),
+                suffix[index + 1],
+                if media.ended { 0.0 } else { window },
+                if media.ended { 0.0 } else { window },
             ));
-            cursor.consumed(segment);
+            last = Some((segment.seq, segment.uri.clone(), segment.byte_range.clone()));
+            black_box(&last);
         }
     }
     fn prepared(media: &Media) {
@@ -154,13 +142,21 @@ fn measure_playlist_bookkeeping() {
                 },
             ));
             cursor.consumed(item.segment);
+            black_box(&cursor);
         }
     }
     let counts = std::env::var("RSTREAMKIT_BENCH_SEGMENTS")
         .map(|count| vec![count.parse::<usize>().expect("segment count")])
         .unwrap_or_else(|_| vec![128, 2048, 20_000]);
     for count in counts {
-        let media = playlist(count, true);
+        let mut media = playlist(count, true);
+        let variable = std::env::var_os("RSTREAMKIT_BENCH_VARIABLE").is_some();
+        let kind = if variable { "variable" } else { "uniform" };
+        if variable {
+            for (index, segment) in media.segments.iter_mut().enumerate() {
+                segment.duration = [4.589889, 5.123457, 5.5][index % 3];
+            }
+        }
         old(&media);
         prepared(&media);
         let mut before = Vec::new();
@@ -191,12 +187,13 @@ fn measure_playlist_bookkeeping() {
         before.sort_by(f64::total_cmp);
         after.sort_by(f64::total_cmp);
         println!(
-            "segments={count} before_median_ms={:.6} after_median_ms={:.6} before_p95_ms={:.6} after_p95_ms={:.6} cache_bytes={}",
+            "durations={kind} segments={count} before_median_ms={:.6} after_median_ms={:.6} before_p95_ms={:.6} after_p95_ms={:.6} before_cache_bytes={} after_heap_bytes=0 batch_struct_bytes={}",
             before[4],
             after[4],
             before[8],
             after[8],
-            (count + 1) * 8
+            (count + 1) * 8,
+            std::mem::size_of::<rstreamkit::session::Batch<'_>>()
         );
     }
 }

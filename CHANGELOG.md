@@ -9,6 +9,8 @@ Breaking changes:
 - Additional public enums are non-exhaustive; Demuxed gains passthrough metadata.
 
 Changes:
+- Replace the growing duration cache with bounded storage while retaining linear playlist walks.
+- Reuse cursor URI storage and release oversized buffers after shorter replacements.
 - Prepare playlist walks once; reuse next-segment and duration metadata across finite buffer waits.
 - Reduce measured native 20,000-entry bookkeeping from 573 ms to 0.339 ms, with a 160 KB cache.
 - Share HLS playlist selection, refresh and restart control; add thirteen native session scenarios.
