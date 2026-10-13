@@ -149,13 +149,55 @@ pub struct Session {
     stalled_since: Option<f64>,
 }
 
+/// A borrowed segment and constant-time metadata from a prepared playlist walk.
+#[non_exhaustive]
+pub struct ScheduledSegment<'a> {
+    pub segment: &'a Segment,
+    pub next: Option<&'a Segment>,
+    pub remaining_seconds: f64,
+    pub window_seconds: f64,
+}
+
+/// One immutable snapshot walk. The duration cache costs eight bytes per pending
+/// segment plus a sentinel. It is freed with the batch; it holds no media copies.
+pub struct Batch<'a> {
+    media: &'a Media,
+    index: usize,
+    start: usize,
+    suffix: Vec<f64>,
+    window_seconds: f64,
+}
+impl<'a> Iterator for Batch<'a> {
+    type Item = ScheduledSegment<'a>;
+    fn next(&mut self) -> Option<Self::Item> {
+        let segment = self.media.segments.get(self.index)?;
+        self.index += 1;
+        Some(ScheduledSegment {
+            segment,
+            next: self.media.segments.get(self.index),
+            remaining_seconds: self.suffix[self.index - self.start],
+            window_seconds: self.window_seconds,
+        })
+    }
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        let remaining = self.media.segments.len() - self.index;
+        (remaining, Some(remaining))
+    }
+}
+impl ExactSizeIterator for Batch<'_> {}
+impl std::iter::FusedIterator for Batch<'_> {}
+
 impl Session {
     pub fn finished(&self, media: &Media) -> bool {
         media.ended && self.next(media).is_none()
     }
 
     pub fn next<'a>(&self, media: &'a Media) -> Option<&'a Segment> {
-        let start = match &self.last {
+        media.segments.get(self.next_index(media))
+    }
+
+    fn next_index(&self, media: &Media) -> usize {
+        match &self.last {
             None => {
                 if media.ended {
                     0
@@ -195,8 +237,25 @@ impl Session {
                     media.segments.len().saturating_sub(3)
                 }
             }
-        };
-        media.segments.get(start)
+        }
+    }
+
+    /// Prepare one immutable playlist walk. Keep it across finite-media buffer waits;
+    /// rebuild after a refresh or selection/control change. No segment bytes are copied.
+    pub fn batch<'a>(&self, media: &'a Media) -> Batch<'a> {
+        let start = self.next_index(media).min(media.segments.len());
+        let pending = &media.segments[start..];
+        let mut suffix = vec![0.0; pending.len() + 1];
+        for (index, segment) in pending.iter().enumerate().rev() {
+            suffix[index] = segment.duration + suffix[index + 1];
+        }
+        Batch {
+            media,
+            index: start,
+            start,
+            suffix,
+            window_seconds: media.duration(),
+        }
     }
 
     /// Advance only after successful output, or an explicit host decision to skip a failed segment.
