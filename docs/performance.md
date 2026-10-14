@@ -697,3 +697,60 @@ grows 1,335 bytes (0.58%) to remove growing runtime storage. All four budgets
 pass: `python3 tools/size.py --check-budgets --output tools/results/size-constant-space.json`.
 Required Rust/native/wasm checks, media/decoder tests and twelve Playwright Chrome
 155.0.8059.39 checks pass. 4K60 soak and real Edge/Safari acceptance remain open.
+
+
+## Allocation-free H.264 scanning (2026-10-13)
+
+The TS parser now borrows one Annex-B NAL unit at a time. Previously it built
+one growing list of offsets and another of borrowed slices for every video PES
+payload. The scan still uses the existing eight-byte zero search and preserves
+three/four-byte start codes, empty units and trailing-zero handling. Input and
+output media storage are unchanged. Only scan bookkeeping changes from O(k)
+heap space to O(1), where k is the number of NAL units; time remains O(bytes).
+No dependencies, runtime unsafe code or public API changes are added.
+
+Baseline: `cb6e2a3` (PR #56). The test-only collected scanner preserves that
+implementation for a side-by-side comparison. Linux x86_64, Ryzen 7 5700,
+Rust 1.99.0, release profile. Synthetic escaped payloads contain 129 bytes per
+NAL and alternate three/four-byte start codes. Inputs are built before measuring;
+both paths consume borrowed slices without collecting the result. Nine alternating
+pairs follow warmup. p95 is the largest of nine batch averages, not per-call latency.
+
+| NAL units | Heap calls before → after¹ | Requested bytes before → after² | Median µs before → after | p95 µs before → after |
+| ---: | ---: | ---: | ---: | ---: |
+| 1 | 2 → 0 | 96 → 0 | 0.118 → 0.100 | 0.119 → 0.104 |
+| 128 | 12 → 0 | 6,048 → 0 | 13.445 → 13.039 | 13.516 → 13.141 |
+| 4,096 | 22 → 0 | 196,512 → 0 | 424.528 → 419.362 | 426.116 → 420.598 |
+
+¹ Allocations plus reallocations. ² Cumulative requested sizes, including each
+reallocation; not peak live memory, whole-app RSS or committed Wasm pages.
+The modest timing difference does not establish faster end-to-end playback or
+an advantage over FFmpeg. The reliable win is removing temporary heap work.
+
+| Player download, Wasm + JS Brotli bytes | Before | After | Change |
+| --- | ---: | ---: | ---: |
+| Live | 112,767 | 112,830 | +63 |
+| Live + sound | 210,542 | 210,259 | −283 |
+| Movie | 135,739 | 135,702 | −37 |
+| Full | 232,785 | 232,817 | +32 |
+
+All four download budgets pass. Compression and code layout can make the same
+source change shrink one feature build and grow another; full grows 0.014%.
+Same recipe as the preceding report: wasm-bindgen 0.2.128, wasm-opt 130,
+Brotli 1.2.0. Reproduce:
+
+```sh
+cargo test --release --lib measure_nal_scan -- --ignored --nocapture --test-threads=1
+python3 tools/size.py --check-budgets --output tools/results/size-nal-scan.json
+```
+
+The zero-allocation regression covers 0, 1, 128 and 4,096 units; existing
+byte-at-a-time oracle tests cover 2,000 generated inputs. Native chunking,
+continuous input and independent FFmpeg output/decoder checks remain required.
+
+Validation: formatting, all eight native/Wasm clippy configurations, default,
+minimal and vod tests, and the vendored decoder suite pass. Five Playwright
+Chrome 155.0.8059.39 checks pass against this exact full-player build: finite
+completion, Dolby fallback, finite 404, stop/new session, and live 404 recovery.
+This is not 4K60 or desktop Edge/Safari acceptance. #48 remains open for the
+broader retained-size/startup audit and build-profile comparisons.
