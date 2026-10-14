@@ -846,3 +846,39 @@ its speed/space tradeoff needs more profiling under #45/#48.
 Mono validation also passes formatting, all eight native/Wasm clippy builds,
 default/minimal/vod tests, the complete vendored decoder suite and five existing
 Playwright playback/recovery checks.
+
+
+## Live provider recovery acceptance (2026-10-13)
+
+Playwright Chrome 155.0.8059.39, exact full build from PR #60. The provider uses
+the committed `bbb_480p.ts` clip so repeated media isolates transport and playlist
+policy. Tests add zero runtime code, dependencies or download bytes.
+
+| Case | Real browser result |
+| --- | --- |
+| One segment returns 404 | One request for the bad segment, following good segment fetched; playback passes 5.8 s, beyond the first 4.59 s segment |
+| One segment returns HTML with HTTP 200 | Skipped as invalid TS; following good segment fetched; playback passes 5.8 s |
+| Ten-second HTTP 503 outage | Five attempts at about 0, 1, 3, 7 and 15 s; four Reconnecting states, then playback |
+| Pause with eviction | 50.024 s paused across a 9.179778 s window (5.449 windows); old resource probe returns 404; fresh segments 10 and 11 fetched |
+| Resume after eviction | Continued playback after the seek and latency below 17 s observed within 2.237 s; reported latency 9.551 s |
+
+All four cases have no Failed/Unsupported/browser error. The outage and pause
+were each run twice; final tests strengthen acceptance by requiring playback
+past the bad-segment boundary and real advancement after the live-edge seek.
+The first pause run took 50.009 s and reached the target after a seek in 0.360 s;
+that earlier timing is not evidence of continued post-seek playback. The final
+2.237 s result includes that stronger check. Latency is a player snapshot at
+append time, not a continuously sampled wall-clock live-edge measurement.
+
+Old resources are actually evicted in the pause provider, closing the retained-
+file gap in the earlier test. HTTP 503 responses simulate an outage; this does
+not reproduce physical network disconnection, codec changes or real provider
+content. #2 and #3 acceptance are covered; close after the test PR merges.
+
+```sh
+NODE_PATH=tools/browser/node_modules node tools/node/resilience-smoke.cjs
+NODE_PATH=tools/browser/node_modules node tools/node/pause-smoke.cjs
+```
+
+Serve the built full player first; `RSTREAMKIT_URL` can select another local URL.
+These are standalone Playwright checks, not yet CI jobs or a real-time 4K soak.

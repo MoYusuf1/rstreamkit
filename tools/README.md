@@ -89,6 +89,8 @@ node tools/node/buffer-smoke.cjs
 node tools/node/session-smoke.cjs
 node tools/node/abr-smoke.cjs
 node tools/node/mono-smoke.cjs
+node tools/node/resilience-smoke.cjs
+node tools/node/pause-smoke.cjs
 ```
 
 These use routes and committed fixtures; no generated media is needed.
@@ -102,3 +104,7 @@ the same committed clip to isolate policy; this is not a resolution/quality test
 
 The mono check observes decoded PCM with Web Audio and requires non-silent,
 equal left/right channels; it sends no sound to physical speakers.
+
+Resilience checks exercise a real ten-second HTTP 503 outage, one missing body
+and one HTML body. The pause check takes about a minute: pause for 50 seconds,
+prove old resources return 404, then require fresh downloads and continued playback.
