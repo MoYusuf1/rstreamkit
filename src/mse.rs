@@ -1149,7 +1149,8 @@ async fn run(
                 jump_requested |= jump;
             }
         }
-        while let Some(seg) = window.next(&media) {
+        for scheduled in window.batch(&media) {
+            let seg = scheduled.segment;
             let url = resolve(&latest.url, &seg.uri)?;
             let fetch_started = js_sys::Date::now() / 1000.0;
             if seg.discontinuity || window.discontinuous(seg) {
@@ -1296,13 +1297,7 @@ async fn run(
             bytes_per_second = crate::live::buffer_rate(bytes_per_second, appended, seconds);
             if !video.paused()
                 && prefetch.is_none()
-                && let Some(next) = media
-                    .segments
-                    .iter()
-                    .position(|s| {
-                        s.seq == seg.seq && s.uri == seg.uri && s.byte_range == seg.byte_range
-                    })
-                    .and_then(|i| media.segments.get(i + 1))
+                && let Some(next) = scheduled.next
                 && next.key.is_none()
                 && next.map.is_none()
                 && next.byte_range.is_none()
@@ -1382,15 +1377,7 @@ async fn run(
             out.fragments.clear();
             window.consumed(seg);
             frontier += seconds;
-            let remaining: f64 = media
-                .segments
-                .iter()
-                .skip_while(|s| {
-                    s.seq != seg.seq || s.uri != seg.uri || s.byte_range != seg.byte_range
-                })
-                .skip(1)
-                .map(|s| s.duration)
-                .sum();
+            let remaining = scheduled.remaining_seconds;
             let ranges = video.buffered();
             let end = ranges
                 .length()
@@ -1404,7 +1391,11 @@ async fn run(
                 state.buffered_seconds = buffered_ahead(video);
                 state.latency_seconds = latency.max(0.0);
                 state.current_variant = Some(variant_uri.clone());
-                state.live_window_seconds = if media.ended { 0.0 } else { media.duration() };
+                state.live_window_seconds = if media.ended {
+                    0.0
+                } else {
+                    scheduled.window_seconds
+                };
             }
             if !media.ended {
                 let target = (media.target_duration * 3.0).max(3.0);
@@ -1412,7 +1403,7 @@ async fn run(
                 if !video.paused() {
                     video.set_playback_rate(if latency > target + 2.0 { 1.05 } else { 1.0 });
                 }
-                let _ = ms.set_live_seekable_range((end - media.duration()).max(0.0), end);
+                let _ = ms.set_live_seekable_range((end - scheduled.window_seconds).max(0.0), end);
             }
             if jump_requested && !media.ended {
                 video.set_current_time((end - media.target_duration.max(1.0)).max(0.0));
@@ -1473,8 +1464,33 @@ async fn run(
                     break;
                 }
             }
-            if buffered_ahead(video) > ahead {
-                break;
+            if buffered_ahead(video) > ahead && scheduled.next.is_some() {
+                if !media.ended {
+                    break;
+                }
+                // Keep this finite snapshot's duration cache across buffer waits.
+                // Live snapshots still refresh before selecting more input.
+                let waited = crate::net::wait_for_room(
+                    &BrowserClock,
+                    &mut BrowserBuffer {
+                        video,
+                        sb: Some(buffer),
+                        ms: &ms,
+                    },
+                    (ahead, behind),
+                    media.target_duration,
+                    || stop.get(),
+                    || go_live.get(),
+                )
+                .await?;
+                if waited == crate::net::BufferWait::Cancelled {
+                    return Ok(());
+                }
+                if waited == crate::net::BufferWait::Interrupted
+                    || *audio_request.borrow() != selected_audio
+                {
+                    break;
+                }
             }
         }
 

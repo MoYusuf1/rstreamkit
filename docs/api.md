@@ -111,3 +111,12 @@ limits, transport retry/error classification and media output. Stop is checked
 between awaits; drop pending work for immediate cancellation. Full per-segment
 processing, variant/rendition changes and a single generic media runner are still
 pending. The new controller does not claim to finish #23 by itself.
+
+`Session::batch(&media)` returns an exact-size, fused `session::Batch` iterator.
+Each `ScheduledSegment` borrows the current/next segment and supplies cached
+remaining/window seconds. Build once per snapshot and keep it across finite
+buffer waits; rebuild after refresh or a control/selection change. The immutable
+borrow prevents changing the playlist underneath a batch. Duration cache payload
+is `8 * (pending_segments + 1)` bytes; no media bytes are copied. Suffix sums avoid
+losing small tails through subtraction of very large totals. Ordinary floating
+point sums can differ from the former forward sums by roundoff.

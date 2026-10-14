@@ -547,3 +547,62 @@ It serves committed TS fixture bytes through routes and needs no generated media
 fixtures/tooling remain in PR #50. These checks establish neither 4K60 performance
 nor real Edge/Safari acceptance. #23 remains open for the complete media runner,
 variant/rendition transitions and streamed/pending-I/O faults through that runner.
+
+## Prepared playlist walks (2026-10-13)
+
+The old browser loop found the current/next segment and summed the remaining
+playlist for every segment. Live stats also summed the whole window repeatedly.
+The new `Session::batch` prepares suffix durations once, borrows segment references
+and supplies the next segment directly. The browser keeps a finite batch across
+buffer waits, so pausing does not rebuild the cache. Refresh/control/variant changes
+start a new batch. Fixed-snapshot work is O(n), rather than O(n²).
+
+Native bookkeeping benchmark, Ryzen 7 5700/Linux x86_64, Rust 1.99.0 release,
+baseline `341edf2` (PR #54). The test retains the old finite-loop bookkeeping
+beside the new walk; live-only duration sums are excluded for finite input.
+Generated metadata has six-second segments. Each size runs in a fresh process:
+one warm-up per path, then nine alternating pairs. Cache construction and the
+same consumed-cursor updates are timed; playlist parsing, media processing,
+network, playback waits and file I/O are excluded. Values are medians; p95 below
+is the nearest-rank ninth sample. These are not end-to-end browser/4K or FFmpeg
+benchmarks, and should not be read as playback speedups.
+
+| Playlist entries | Before median | After median | Before p95 | After p95 | Added cache payload |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| 128 | 0.022663 ms | 0.002565 ms | 0.024827 ms | 0.002645 ms | 1,032 bytes |
+| 2,048 | 4.367354 ms | 0.032271 ms | 4.382802 ms | 0.034325 ms | 16,392 bytes |
+| 20,000 | 573.062639 ms | 0.338950 ms | 582.513679 ms | 0.375549 ms | 160,008 bytes |
+
+Cache payload costs eight bytes per pending segment plus a sentinel, not per
+advertised segment already consumed. An initial live selection of three segments
+uses 32 bytes. Allocator/header overhead and total process/Wasm peak memory are
+not measured here. Media bytes are not copied and no dependencies are added.
+Reverse suffix sums preserve tiny tails even after totals overflow; subtracting
+from a single accumulated total would lose them. Minor floating-point roundoff
+versus the former forward sum is expected.
+
+| Player download (Wasm + JS, Brotli) | Before | After |
+| --- | ---: | ---: |
+| Live | 110,873 bytes | 111,440 bytes |
+| Live + sound | 208,327 bytes | 208,904 bytes |
+| Movie | 133,808 bytes | 134,520 bytes |
+| Full | 231,013 bytes | 231,450 bytes |
+
+Same wasm-bindgen 0.2.128, wasm-opt 130 and Brotli 1.2.0 size recipe. Full download
+grows 437 bytes (0.19%); all budgets pass. Reproduce with
+`python3 tools/size.py --check-budgets --output tools/results/size-playlist-batch.json`.
+
+```sh
+for count in 128 2048 20000; do
+  RSTREAMKIT_BENCH_SEGMENTS=$count cargo test --release --test playlist_batch measure_playlist_bookkeeping -- --ignored --nocapture
+done
+```
+
+Four native tests check selection/next pointers, variable durations, empty/live/
+resumed snapshots, broken sequence/byte-range anchors, and extreme sums. Run
+`cargo test --test playlist_batch`, also without default features. Required Rust
+checks and decoder tests pass. Playwright Chrome 155.0.8059.39 passes twelve
+existing checks against this build: five playback, four source-update faults,
+two retry and one go-live check. In particular, finite playback still reaches
+its last segment across buffer waits. Browser instructions are above and in
+`tools/README.md`. Long 4K60 and real Edge/Safari validation remain pending.
