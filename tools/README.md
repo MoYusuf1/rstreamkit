@@ -177,3 +177,22 @@ The Chrome suite also runs `tools/node/rendition-smoke.cjs`: a mixed HEVC/H.264 
 `tools/node/boundary-smoke.cjs` is an optional two-minute real-network check of a public 720p HLS source. It checks buffered continuity and frame counters across actual segment boundaries. The source can change, so this is outside deterministic CI. Set RSTREAMKIT_BOUNDARY_SOURCE to another compatible media playlist if needed.
 
 `tools/node/movie-yield-smoke.cjs` compares complete MP4/MKV outputs at three range sizes and profiles synchronous/yielded decoding. `tools/node/movie-playback-smoke.cjs` checks MP4, MKV, encrypted Dolby HLS and a seek injected during a decoder yield; the Chrome suite runs these four cases together.
+
+### Full startup report
+
+`python3 tools/size.py --check-budgets` reports the engine and the complete
+HTML + JavaScript + Wasm download. The shared HTML has a separate 4,096-byte
+Brotli budget. Existing engine budgets still apply. No external UI assets load.
+
+With the server running, use:
+
+```sh
+NODE_PATH=tools/browser/node_modules node tools/node/startup-smoke.cjs > tools/results/startup.json
+```
+
+Set `RSTREAMKIT_URL` for a different server origin. The default is five fresh
+Chrome processes per build; `RSTREAMKIT_STARTUP_TRIALS=1` is the CI smoke check.
+The report records readiness, committed Wasm memory before playback, source and
+artifact hashes, and every startup request. Local HTTP is uncompressed; consult
+the size report for Brotli totals. Timing excludes process launch. Memory excludes
+the browser, JS and GPU. Small samples do not prove production cold starts.

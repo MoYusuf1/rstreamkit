@@ -1326,3 +1326,44 @@ The seek case uses a generated 40-second file; a zero-delay decoder timer trigge
 | Full | 233,328 B | 234,032 B |
 
 All budgets pass. Root feature lints/tests, harness checks, Node decoder/continuous/movie checks and all nine Chrome CI cases (the ninth contains four movie/encryption/seek checks) pass locally. Rust 1.88 is not installed locally; GitHub's MSRV job is required before merge. The new integer predicate is [supported since Rust 1.87](https://doc.rust-lang.org/std/primitive.usize.html#method.is_multiple_of), and the full API must still pass that CI job. Reports: tools/results/movie-yield-smoke.json, movie-yield-repeat.json, movie-playback-smoke.json and size-movie-yield.json. External hardware/browser and high-resolution endurance acceptance remain separate.
+
+### Complete player startup accounting — 2026-10-14
+
+The size report now includes the shared HTML page, with its inline styles and
+scripts. No external font, image, UI framework or renderer is required. Each
+build makes exactly three startup requests: HTML, generated JavaScript and Wasm.
+A data-URI icon prevents an implicit favicon request. The HTML is 8,569 raw bytes
+and 2,750 Brotli bytes; it has a separate 4,096-byte budget in CI. The existing
+engine budgets and `startup_brotli_bytes` fields retain their Wasm + JS meaning.
+Schema 2 adds `shared_startup_files`, `complete_startup_bytes` and
+`complete_startup_brotli_bytes`, and hashes the shell source too.
+
+| Build | Engine Brotli | Complete Brotli | Ready median (range) | Initial committed Wasm |
+| --- | ---: | ---: | ---: | ---: |
+| live | 108,548 B | 111,298 B | 33.4 ms (25.1–98.1) | 1,179,648 B |
+| live-sound | 212,290 B | 215,040 B | 39.1 ms (25.9–59.4) | 1,245,184 B |
+| vod | 130,352 B | 133,102 B | 39.5 ms (35.6–44.3) | 1,179,648 B |
+| full | 234,032 B | 236,782 B | 40.8 ms (35.8–70.7) | 1,245,184 B |
+
+This is a more complete measurement, not a new engine speed or size win. The
+full engine remains 234,032 compressed bytes, unchanged from PR #70. The shell
+adds 2,750 bytes to its accounted download. The earlier 20% full-player reduction
+goal is not met. Feature removal is not counted as a same-feature saving.
+
+Measured using Chrome 155.0.8059.39 on AMD Ryzen 7 5700, Linux, Node
+v26.11.1. Five fresh Chrome processes per flavor, alternating flavor order,
+use uncompressed loopback HTTP and a warm OS file cache. The page records readiness
+at its ready setter, measured from navigation; process launch is excluded. Asset
+inventory waits for network idle. Initial memory is taken before playback and
+excludes JS, browser decoder, GPU and process RSS. These small samples are not
+production cold-cache percentiles or 4K playback measurements. CI checks asset
+identity and successful startup, without a timing threshold that would vary
+with runner load.
+
+Reproduce with `python3 tools/size.py --check-budgets`, the development server,
+and `NODE_PATH=tools/browser/node_modules node tools/node/startup-smoke.cjs`.
+Set `RSTREAMKIT_URL` to the server origin. Reports: `size-complete-startup.json`
+and `startup-complete.json` under ignored `tools/results/`; they record source
+and exact emitted asset hashes. The retained-symbol and build-profile results
+above remain the CPU/size tradeoff evidence. Playback memory and processing
+measurements are separate; this startup test does not replace them.

@@ -165,3 +165,18 @@ test('movies and encrypted sound play; a seek interrupts audio decoding', async 
   await testInfo.attach('movie-playback-report', { body: stdout, contentType: 'application/json' });
   expect(JSON.parse(stdout).checks).toBe(4);
 });
+
+test("all four player builds load exactly three startup assets", async ({ baseURL }, testInfo) => {
+  test.skip(testInfo.project.name !== "chrome", "This helper launches installed Chrome.");
+  test.setTimeout(90000);
+  const path = require("node:path");
+  const { promisify } = require("node:util");
+  const { execFile } = require("node:child_process");
+  const { stdout } = await promisify(execFile)(process.execPath, [path.join(__dirname, "../node/startup-smoke.cjs")], {
+    env: { ...process.env, RSTREAMKIT_URL: baseURL, RSTREAMKIT_STARTUP_TRIALS: "1",
+      NODE_PATH: process.env.NODE_PATH || path.join(__dirname, "node_modules") },
+    timeout: 80000, maxBuffer: 1024 * 1024,
+  });
+  await testInfo.attach("startup-report", { body: stdout, contentType: "application/json" });
+  expect(JSON.parse(stdout).runs).toHaveLength(4);
+});
