@@ -1,6 +1,6 @@
 # Roadmap: reliable 4K streaming with a small Rust engine
 
-Updated 2026-10-10. [GitHub tracker #26](https://github.com/MoYusuf1/rstreamkit/issues/26).
+Updated 2026-10-13. [GitHub tracker #26](https://github.com/MoYusuf1/rstreamkit/issues/26).
 Initial review: `fdcf179`. The targets below remain goals; completed baseline and
 buffer work is recorded in [performance.md](performance.md). All 24 issues open at review are mapped below, plus new
 [#47](https://github.com/MoYusuf1/rstreamkit/issues/47) (4K60) and
@@ -79,7 +79,7 @@ against the reviewed code; being implemented is not the same as passing acceptan
 | #14 | Stats and catch-up implemented | After a ten-second stall, measure return to target latency; state when a seek is necessary | 3 |
 | #16 | Boundary snapping implemented | Real multi-segment stream shows continuous buffering and no repeated boundary jitter | 3 |
 | #22 | Library controls/stats implemented | Verify the consuming client's overlay and go-live adoption; external app work is not in this repo | 6 |
-| #23 | Traits and policy helpers exist | Extract the full loop and test every listed provider scenario natively | 2 |
+| #23 | Shared session and constant-space walks; 34 control, four walk and six memory/math tests | Extract media processing/error and variant/rendition orchestration into one generic runner; complete streamed fault scenarios | 2 |
 | #24 | CI exists; browser matrix incomplete | Current main checks plus actual Chrome/Edge/Safari playback on recorded hardware | 0, 4 |
 | #25 | Accelerated soak exists | Mixed parameter/discontinuity fixtures and four hours of real-time playback with stable resources | 4 |
 | #26 | Tracking issue | Keep this queue and acceptance ledger synchronized; do not close it after only one milestone | All |
@@ -89,12 +89,12 @@ against the reviewed code; being implemented is not the same as passing acceptan
 | #34 | Yielding exists on live path | Measure actual current decoder on live, movies, AES and raw TS; compare yielding/worker CPU, startup and frame drops | 1, 4 |
 | #37 | Wait cancellation implemented | Closure during trim and removal of an unrelated buffer; no hang or false completion | 2 |
 | #42 | Five CLI workloads recorded; remaining comparison work open | Visible baseline, in-process comparison and new wasm figures; explain the old frame-drop result | 0 |
-| #43 | Systematic fuzzing missing | Seeded bounded campaigns, CI smoke runs and regression cases for parsers | 2 |
+| #43 | Five bounded parser targets and four regressions; integrated 5,000-case run passes, refreshed PR CI pending | Review [campaign evidence and limits](../tools/fuzz/README.md); longer coverage-guided campaigns remain useful | 2 |
 | #44 | Local-file CLI now implemented | Rust URL transport uses the shared live session, cancellation and bounded outputs; no duplicate player loop | 5 |
 | #45 | Profiling and bit-exact decoder speedups already landed | Re-profile native AND wasm; benchmark remaining kernels and keep or reject SIMD/algorithm changes with quality gates | 5 |
 | #46 | Deferred upstream contribution | Prepare an attributable patch when requested; do not message upstream now | Later |
 | #47 | New 4K60 goal | Supported 4K60 SDR paths pass the foreground matrix and fall back predictably | 0, 4 |
-| #48 | New size budget | Real-player feature builds, retained-size audit, startup/decode costs and CI growth report | 0, 1 |
+| #48 | Feature budgets and measured per-package profiles; smaller live/movie payloads, faster MP2 | Retained-size audit, whole-app startup/decode costs and CI growth report | 0, 1 |
 
 ## Web playback and library choices
 

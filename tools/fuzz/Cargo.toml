@@ -1,0 +1,59 @@
+[package]
+name = "rstreamkit-fuzz"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[package.metadata]
+cargo-fuzz = true
+
+[features]
+coverage = ["dep:libfuzzer-sys"]
+
+[dependencies]
+rstreamkit = { path = "../..", default-features = false, features = ["vod"] }
+libfuzzer-sys = { version = "=0.4.13", optional = true }
+
+[profile.release]
+debug = 1
+overflow-checks = true
+debug-assertions = true
+
+[[bin]]
+name = "smoke"
+path = "src/main.rs"
+
+[[bin]]
+name = "hls"
+path = "targets/hls.rs"
+required-features = ["coverage"]
+test = false
+doc = false
+
+[[bin]]
+name = "ts"
+path = "targets/ts.rs"
+required-features = ["coverage"]
+test = false
+doc = false
+
+[[bin]]
+name = "mp4"
+path = "targets/mp4.rs"
+required-features = ["coverage"]
+test = false
+doc = false
+
+[[bin]]
+name = "mkv"
+path = "targets/mkv.rs"
+required-features = ["coverage"]
+test = false
+doc = false
+
+[[bin]]
+name = "cmaf"
+path = "targets/cmaf.rs"
+required-features = ["coverage"]
+test = false
+doc = false

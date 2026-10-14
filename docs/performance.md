@@ -356,7 +356,7 @@ Decoding alone, best of ten in-process (the same Ryzen 7 5700):
 | --- | ---: | ---: |
 | 6 s AC-3 5.1, 448 kbit/s (`tools/media/ac3.ts`) | 40.3 ms | 20.0 ms |
 | 4.2 s programme audio (`tools/media/programme.ts`) | 10.4 ms | 5.9 ms |
-| 4 s AC-3 stereo (`h264_ac3.ts`) | 5.75 ms | 2.74 ms |
+| 4 s AC-3 mono (`h264_ac3.ts`; historical silent output, invalid audio-speed comparison) | 5.75 ms | 2.74 ms |
 | 2 s AC-3 5.1 (`h264_ac3_51.ts`) | 9.08 ms | 3.59 ms |
 | 2 s E-AC-3 5.1 (`h264_eac3_51.ts`) | 9.70 ms | 4.36 ms |
 
@@ -451,3 +451,708 @@ Reproduce with `bash tools/build.sh`, then
 `profile.cjs` from the baseline build, use identical input files, and alternate
 baseline/current processes. This small programme sample does not represent all
 soundtracks; browser dropped-frame improvement is still unmeasured.
+
+## Shared retry loop (2026-10-10)
+
+Browser playback now uses the same Rust retry loop as native hosts. Fake time
+makes outage and stop tests immediate; it does not make real network retries
+faster. No dependencies were added. The loop keeps its seven-attempt limit and
+31-second total backoff budget. Dropping a browser wait now clears its timer.
+
+| Measure | Before | After |
+| --- | ---: | ---: |
+| Native tests of the actual retry loop | 0 | 9 |
+| Live player, Brotli bytes (Wasm + JS) | 109,318 | 108,751 |
+| Live + sound player, Brotli bytes | 207,114 | 206,631 |
+| Movie player, Brotli bytes | 132,204 | 131,598 |
+| Full player, Brotli bytes | 229,337 | 228,866 |
+
+Same Linux, Rust 1.99.0, wasm-bindgen 0.2.128, wasm-opt 130 and Brotli 1.2.0;
+`python3 tools/size.py --check-budgets --output tools/results/size-retry.json`.
+The baseline is the main tree at `39f9c383`, with the existing
+`size-buffer-final.json` report. These small build-size changes are not runtime
+speed measurements or a comparison with FFmpeg.
+
+Run `cargo test --test retry` (also with `--no-default-features`). The nine cases
+cover a ten-second outage through real TS parsing, a dropped response body,
+404, retry exhaustion, three stop points, and dropping pending timer/request
+work. The fake provider recovers at the scheduled 15-second attempt.
+
+For browser checks, install `@playwright/test@1.64.0` in a development directory,
+build the player and run `python3 tools/server.py`. Set `NODE_PATH` to that
+installation's `node_modules`, then run `node tools/node/retry-smoke.cjs`.
+`RSTREAMKIT_URL` can select another local player URL. Chrome 155.0.8059.39 passed
+two checks: Stop reduced one pending retry timer to zero with no later request;
+a 503 followed by a 404 made exactly two requests and stopped. These are
+functional checks; real Edge/Safari and long 4K60 acceptance remain pending.
+
+## Shared buffer control (2026-10-10)
+
+Browser playback now uses the native-testable Rust trim and backpressure loop.
+It stops before new media work when the buffer is full, honours stop/go-live,
+and reports removal failures. Gap checks read ranges as an iterator instead of
+building a temporary vector. The loop adds no dependencies or media-byte copies.
+
+| Measure | Retry baseline | Shared buffer control |
+| --- | ---: | ---: |
+| Native buffer-control integration tests | 0 | 12 |
+| Temporary range vectors per gap check | 1 | 0 |
+| Live player, Brotli bytes | 108,751 | 109,690 |
+| Live + sound player, Brotli bytes | 206,631 | 207,300 |
+| Movie player, Brotli bytes | 131,598 | 132,475 |
+| Full player, Brotli bytes | 228,866 | 229,637 |
+
+Baseline: `70c709b` (PR #52), with the same Linux/Rust 1.99.0,
+wasm-bindgen 0.2.128, wasm-opt 130 and Brotli 1.2.0. Repeat with
+`python3 tools/size.py --check-budgets --output tools/results/size-buffer-control.json`.
+All four size budgets pass. The full player grows 771 bytes (0.34%) to expose
+and validate shared host control. This is a correctness/testability tradeoff;
+no runtime CPU, memory peak or FFmpeg speed advantage was measured here.
+
+Run `cargo test --test buffer_control`, also with `--no-default-features`.
+Twelve cases cover normal backpressure, immediate room, gap recovery, go-live
+before/during a wait, stop before/during removal, removal errors, small/empty
+buffers, invalid limits/durations and dropping a paused wait. The nine shared
+retry integration tests still pass too.
+
+Playwright Chrome 155.0.8059.39 passes the five playback regressions from PR #50
+against this exact build. It also passes four source-update fault checks from
+`tools/node/buffer-smoke.cjs`: close during append, close during removal, remove
+the active buffer, and remove an unrelated buffer. Each records `updating=true`.
+The first three settle with Failed; the unrelated removal reaches Ended.
+
+To repeat, install Playwright as described above, build and serve the player,
+and run `NODE_PATH=tools/browser/node_modules node tools/node/buffer-smoke.cjs`.
+The fault test serves 20 copies of the committed `bbb_480p.ts` fixture
+through Playwright routes, so no media generator or PR #50 tooling is needed.
+The roughly 90-second playlist is long enough to trigger actual rewind
+removal. It runs at 4× after the video is ready. `RSTREAMKIT_URL` selects
+another local player URL. These accelerated correctness checks do not establish
+4K60 performance, a long soak, or real Edge/Safari acceptance. Full playlist and
+session orchestration still needs extraction for #23.
+
+## Shared playlist session (2026-10-10)
+
+The browser now calls `session::Session` for playlist selection, restart tracking,
+backpressure preparation and periodic refresh. Hosts supply clock, buffer and
+playlist I/O. Selection borrows the segment; no media bytes are cloned. Go-live
+during the periodic wait uses that refresh instead of fetching again next loop.
+
+| Measure | Buffer-control baseline | Shared playlist session |
+| --- | ---: | ---: |
+| Native playlist-session integration tests | 0 | 13 |
+| Shared retry/buffer/session integration tests | 21 | 34 |
+| Live player, Brotli bytes | 109,690 | 110,873 |
+| Live + sound player, Brotli bytes | 207,300 | 208,327 |
+| Movie player, Brotli bytes | 132,475 | 133,808 |
+| Full player, Brotli bytes | 229,637 | 231,013 |
+
+Baseline `58ff9b6` (PR #53); same Linux/Rust 1.99.0, wasm-bindgen 0.2.128,
+wasm-opt 130 and Brotli 1.2.0. Repeat with
+`python3 tools/size.py --check-budgets --output tools/results/size-session.json`.
+All four budgets pass. The full player grows 1,376 bytes (0.60%). No dependencies
+are added. This is shared control and test coverage, not a measured CPU,
+peak-memory or FFmpeg performance advantage.
+
+Run `cargo test --test session`, also with `--no-default-features`. Thirteen
+scenarios cover sliding windows with/without sequence updates, numbering/PTS
+resets, long-pause refresh, go-live, a ten-second outage, a dropped response,
+404, bounded endless bodies, finite backpressure, stop and frozen playlists.
+Media cases use the real TS parser, packager and ordered output sink. The slow
+request case advances fake time by three seconds per fetch; it is not a bandwidth
+or real-network throughput benchmark. Body cap tests use 1 KiB limits for quick
+termination; production browser limits are unchanged.
+
+Playwright Chrome 155.0.8059.39 passes twelve checks on the exact review build:
+five playback, four source-update faults, two retry checks, and one new session
+check. The last issues go-live during a 2.5-second poll wait: it observes two
+playlist requests total (initial + one refresh), with zero pending poll timers
+after Stop. The former browser code did a periodic fetch followed by a separate
+go-live fetch; that before count comes from code inspection, not a timing run.
+
+Build/serve the full player, install Playwright as above, then run
+`NODE_PATH=tools/browser/node_modules node tools/node/session-smoke.cjs`.
+It serves committed TS fixture bytes through routes and needs no generated media.
+`RSTREAMKIT_URL` selects another local full-player URL. Playback regression
+fixtures/tooling remain in PR #50. These checks establish neither 4K60 performance
+nor real Edge/Safari acceptance. #23 remains open for the complete media runner,
+variant/rendition transitions and streamed/pending-I/O faults through that runner.
+
+## Prepared playlist walks (2026-10-13)
+
+Historical benchmark below is from `c80c0ee` (PR #55). The later constant-space
+section compares against that cache-based implementation.
+
+
+The old browser loop found the current/next segment and summed the remaining
+playlist for every segment. Live stats also summed the whole window repeatedly.
+The new `Session::batch` prepares suffix durations once, borrows segment references
+and supplies the next segment directly. The browser keeps a finite batch across
+buffer waits, so pausing does not rebuild the cache. Refresh/control/variant changes
+start a new batch. Fixed-snapshot work is O(n), rather than O(n²).
+
+Native bookkeeping benchmark, Ryzen 7 5700/Linux x86_64, Rust 1.99.0 release,
+baseline `341edf2` (PR #54). The test retains the old finite-loop bookkeeping
+beside the new walk; live-only duration sums are excluded for finite input.
+Generated metadata has six-second segments. Each size runs in a fresh process:
+one warm-up per path, then nine alternating pairs. Cache construction and the
+same consumed-cursor updates are timed; playlist parsing, media processing,
+network, playback waits and file I/O are excluded. Values are medians; p95 below
+is the nearest-rank ninth sample. These are not end-to-end browser/4K or FFmpeg
+benchmarks, and should not be read as playback speedups.
+
+| Playlist entries | Before median | After median | Before p95 | After p95 | Added cache payload |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| 128 | 0.022663 ms | 0.002565 ms | 0.024827 ms | 0.002645 ms | 1,032 bytes |
+| 2,048 | 4.367354 ms | 0.032271 ms | 4.382802 ms | 0.034325 ms | 16,392 bytes |
+| 20,000 | 573.062639 ms | 0.338950 ms | 582.513679 ms | 0.375549 ms | 160,008 bytes |
+
+Cache payload costs eight bytes per pending segment plus a sentinel, not per
+advertised segment already consumed. An initial live selection of three segments
+uses 32 bytes. Allocator/header overhead and total process/Wasm peak memory are
+not measured here. Media bytes are not copied and no dependencies are added.
+Reverse suffix sums preserve tiny tails even after totals overflow; subtracting
+from a single accumulated total would lose them. Minor floating-point roundoff
+versus the former forward sum is expected.
+
+| Player download (Wasm + JS, Brotli) | Before | After |
+| --- | ---: | ---: |
+| Live | 110,873 bytes | 111,440 bytes |
+| Live + sound | 208,327 bytes | 208,904 bytes |
+| Movie | 133,808 bytes | 134,520 bytes |
+| Full | 231,013 bytes | 231,450 bytes |
+
+Same wasm-bindgen 0.2.128, wasm-opt 130 and Brotli 1.2.0 size recipe. Full download
+grows 437 bytes (0.19%); all budgets pass. Reproduce with
+`python3 tools/size.py --check-budgets --output tools/results/size-playlist-batch.json`.
+
+```sh
+for count in 128 2048 20000; do
+  RSTREAMKIT_BENCH_SEGMENTS=$count cargo test --release --test playlist_batch measure_playlist_bookkeeping -- --ignored --nocapture
+done
+```
+
+Four native tests check selection/next pointers, variable durations, empty/live/
+resumed snapshots, broken sequence/byte-range anchors, and extreme sums. Run
+`cargo test --test playlist_batch`, also without default features. Required Rust
+checks and decoder tests pass. Playwright Chrome 155.0.8059.39 passes twelve
+existing checks against this build: five playback, four source-update faults,
+two retry and one go-live check. In particular, finite playback still reaches
+its last segment across buffer waits. Browser instructions are above and in
+`tools/README.md`. Long 4K60 and real Edge/Safari validation remain pending.
+
+## Constant-space runtime walks (2026-10-13)
+
+The playlist walk now keeps bounded duration totals instead of an array per
+segment. Equal durations use a count and one value. Ordinary varying durations
+use scaled 128-bit integers. Extreme values use a fixed 2176-bit integer sum;
+this fallback preserves small tails after overflowing totals. Conversion rounds
+the exact remaining total once. The cursor also reuses URI storage and releases
+an unusually large buffer after a short replacement.
+
+For one unchanged snapshot, time remains O(n). Extra walk storage changes from
+O(n) to O(1). The parsed playlist and media buffers still occupy their own memory;
+this does not make the whole player constant-space.
+
+Allocator measurements: native x86_64, Ryzen 7 5700/Linux, Rust 1.99.0 release,
+predecessor `c80c0ee`. Thread-local counters cover batch construction/walking or
+cursor updates only; fixture creation is excluded. These measure requested heap
+bytes and object sizes, not whole-process peak memory or committed Wasm pages.
+
+| Native runtime measure | Cache-based | Constant-space |
+| --- | ---: | ---: |
+| Normal 20,000-entry batch heap bytes requested | 160,008 | 0 |
+| Normal batch object + requested array bytes | 160,064 | 64 |
+| Normal three-entry batch object + array bytes | 88 | 64 |
+| URI allocations across 20,000 equal-length names | 20,000 | 1 |
+| URI bytes requested across those updates (cumulative) | 360,000 | 18 |
+
+The new normal batch is 64 bytes on this build, independent of playlist length.
+Rare extreme inputs use one 296-byte fallback allocation, also independent of
+length; normal durations allocate none. Allocator headers/padding are excluded.
+Cursor growth may reallocate for longer URIs; it does not promise one allocation
+for arbitrary names. Storage above four times the next URI length (minimum
+256 bytes) is replaced rather than retained indefinitely.
+
+Timing driver retains the predecessor's suffix array and URI cloning beside the
+new path. Each scenario is a fresh process, one warm-up per path then nine
+alternating pairs. Construction and cursor updates are included; parsing, media,
+network, file I/O and playback waits are excluded. CPU/OS/compiler are as above.
+Variable durations cycle through 4.589889, 5.123457 and 5.5 seconds.
+
+| Entries / durations | Before median | After median | Before p95 | After p95 |
+| --- | ---: | ---: | ---: | ---: |
+| 128 / equal | 0.002094 ms | 0.002225 ms | 0.002184 ms | 0.002294 ms |
+| 2,048 / equal | 0.041348 ms | 0.041980 ms | 0.041658 ms | 0.042961 ms |
+| 20,000 / equal | 0.302902 ms | 0.287533 ms | 0.457495 ms | 0.409774 ms |
+| 128 / varying | 0.001954 ms | 0.003066 ms | 0.002044 ms | 0.003477 ms |
+| 2,048 / varying | 0.035567 ms | 0.048312 ms | 0.037771 ms | 0.051086 ms |
+| 20,000 / varying | 0.324584 ms | 0.485528 ms | 0.398252 ms | 0.489355 ms |
+
+Equal-duration timing is broadly unchanged; varying durations cost another
+0.161 ms for 20,000 entries. This is a deliberate memory/allocator tradeoff,
+not a universal CPU win. Linear time is retained rather than improved beyond
+O(n). No end-to-end speed, whole-player peak-memory or FFmpeg claim is made.
+
+Repeat allocation measurements with
+`cargo test --release --test playlist_allocations measure_playlist_allocations -- --ignored --nocapture`.
+To capture the predecessor, copy that test file into an isolated `c80c0ee`
+checkout and run only the ignored measurement; its new zero-allocation assertions
+are intended for the new implementation. Timing:
+
+```sh
+for count in 128 2048 20000; do
+  RSTREAMKIT_BENCH_SEGMENTS=$count cargo test --release --test playlist_batch measure_playlist_bookkeeping -- --ignored --nocapture
+  RSTREAMKIT_BENCH_VARIABLE=1 RSTREAMKIT_BENCH_SEGMENTS=$count cargo test --release --test playlist_batch measure_playlist_bookkeeping -- --ignored --nocapture
+done
+```
+
+Six new regular checks cover exact removable arithmetic, nonfinite restoration,
+bounded URI retention, normal zero allocations, URI reuse and constant fallback
+allocation. The arithmetic oracle checks every suffix in 112 generated cases,
+using Python Decimal at 1600-digit precision. Reproduce with
+`python3 tools/duration_vectors.py --check`; Python is a development tool only.
+Runtime library code adds no dependencies and no unsafe code; the allocation-test
+wrapper alone forwards unsafe System allocator calls for measurement.
+
+| Download, Wasm + JS Brotli bytes | Before | After |
+| --- | ---: | ---: |
+| Live | 111,440 | 112,767 |
+| Live + sound | 208,904 | 210,542 |
+| Movie | 134,520 | 135,739 |
+| Full | 231,450 | 232,785 |
+
+Same wasm-bindgen 0.2.128, wasm-opt 130 and Brotli 1.2.0 recipe. Full download
+grows 1,335 bytes (0.58%) to remove growing runtime storage. All four budgets
+pass: `python3 tools/size.py --check-budgets --output tools/results/size-constant-space.json`.
+Required Rust/native/wasm checks, media/decoder tests and twelve Playwright Chrome
+155.0.8059.39 checks pass. 4K60 soak and real Edge/Safari acceptance remain open.
+
+
+## Allocation-free H.264 scanning (2026-10-13)
+
+The TS parser now borrows one Annex-B NAL unit at a time. Previously it built
+one growing list of offsets and another of borrowed slices for every video PES
+payload. The scan still uses the existing eight-byte zero search and preserves
+three/four-byte start codes, empty units and trailing-zero handling. Input and
+output media storage are unchanged. Only scan bookkeeping changes from O(k)
+heap space to O(1), where k is the number of NAL units; time remains O(bytes).
+No dependencies, runtime unsafe code or public API changes are added.
+
+Baseline: `cb6e2a3` (PR #56). The test-only collected scanner preserves that
+implementation for a side-by-side comparison. Linux x86_64, Ryzen 7 5700,
+Rust 1.99.0, release profile. Synthetic escaped payloads contain 129 bytes per
+NAL and alternate three/four-byte start codes. Inputs are built before measuring;
+both paths consume borrowed slices without collecting the result. Nine alternating
+pairs follow warmup. p95 is the largest of nine batch averages, not per-call latency.
+
+| NAL units | Heap calls before → after¹ | Requested bytes before → after² | Median µs before → after | p95 µs before → after |
+| ---: | ---: | ---: | ---: | ---: |
+| 1 | 2 → 0 | 96 → 0 | 0.118 → 0.100 | 0.119 → 0.104 |
+| 128 | 12 → 0 | 6,048 → 0 | 13.445 → 13.039 | 13.516 → 13.141 |
+| 4,096 | 22 → 0 | 196,512 → 0 | 424.528 → 419.362 | 426.116 → 420.598 |
+
+¹ Allocations plus reallocations. ² Cumulative requested sizes, including each
+reallocation; not peak live memory, whole-app RSS or committed Wasm pages.
+The modest timing difference does not establish faster end-to-end playback or
+an advantage over FFmpeg. The reliable win is removing temporary heap work.
+
+| Player download, Wasm + JS Brotli bytes | Before | After | Change |
+| --- | ---: | ---: | ---: |
+| Live | 112,767 | 112,830 | +63 |
+| Live + sound | 210,542 | 210,259 | −283 |
+| Movie | 135,739 | 135,702 | −37 |
+| Full | 232,785 | 232,817 | +32 |
+
+All four download budgets pass. Compression and code layout can make the same
+source change shrink one feature build and grow another; full grows 0.014%.
+Same recipe as the preceding report: wasm-bindgen 0.2.128, wasm-opt 130,
+Brotli 1.2.0. Reproduce:
+
+```sh
+cargo test --release --lib measure_nal_scan -- --ignored --nocapture --test-threads=1
+python3 tools/size.py --check-budgets --output tools/results/size-nal-scan.json
+```
+
+The zero-allocation regression covers 0, 1, 128 and 4,096 units; existing
+byte-at-a-time oracle tests cover 2,000 generated inputs. Native chunking,
+continuous input and independent FFmpeg output/decoder checks remain required.
+
+Validation: formatting, all eight native/Wasm clippy configurations, default,
+minimal and vod tests, and the vendored decoder suite pass. Five Playwright
+Chrome 155.0.8059.39 checks pass against this exact full-player build: finite
+completion, Dolby fallback, finite 404, stop/new session, and live 404 recovery.
+This is not 4K60 or desktop Edge/Safari acceptance. #48 remains open for the
+broader retained-size/startup audit and build-profile comparisons.
+
+
+## Adaptive bitrate provider acceptance (2026-10-13)
+
+`tools/node/abr-smoke.cjs` uses Playwright Chrome 155.0.8059.39 and the exact
+full player from PR #57. Two fresh-browser runs pass. The fake provider advertises
+100,000 and 1,000,000 bit/s levels. Both return the same committed 206,800-byte
+`bbb_480p.ts` clip, preserving source timing to isolate switching policy.
+Forty finite entries allow time for real MSE appends and buffer backpressure.
+
+| Provider phase | Response delay | Completed variant requests, each run |
+| --- | ---: | --- |
+| Slow | 2,000 ms | high, low, low, low, low |
+| Restored | 100 ms | low, low, low, low, high, high, high |
+| Runtime code/dependencies added | — | 0 / 0 |
+
+The test requires at least three slow low-level responses, three recovered
+high-level responses, continued playback and recovered variant stats, with no
+Failed/Unsupported/browser error. Cancelled requests are recorded separately.
+All shipped bytes are unchanged. This models delayed complete-body throughput,
+not packet loss, a shared bandwidth cap, perceptual quality or resolution changes.
+It does not prove 4K60, Edge/Safari or dropped-frame acceptance. #9's provider
+acceptance is covered; close after this test lands.
+
+```sh
+NODE_PATH=tools/browser/node_modules node tools/node/abr-smoke.cjs
+```
+
+Serve a built full player first; set `RSTREAMKIT_URL` for an alternate local URL.
+
+
+## Mono AC-3 sound correction (2026-10-13)
+
+Issue #59: the committed four-second `h264_ac3.ts` clip is mono and has audible
+source sound (FFmpeg volumedetect mean −21.1 dB). Its original decoded stereo
+checksum, `b928f2d0e7a08325`, was exactly the checksum of 768,000 zero bytes.
+The old decoder-equality check therefore pinned silence. Earlier documentation
+called this fixture stereo; its historical silent-output timing is not valid
+evidence of correct audio processing speed.
+
+LoRo and LtRt placed their mono gains in slot 0, while the mixer mapped the
+source to center slot 1. Both now use slot 1. The existing gain stays unchanged.
+Mono PCM intentionally changes; corrected checksum is `2f95f6c00b945b35`.
+Other existing checksum gates remain unchanged. No dependency, unsafe code or
+public API change is added; optional `sound` builds retain the same capabilities.
+
+| Validation | Result |
+| --- | ---: |
+| Mono source duration | 4 seconds |
+| Corrected mono vs FFmpeg score | 66.6 dB |
+| Corrected mono correlation / level difference | 1.000 / about 0.0 dB |
+| Chrome peak observed RMS, left / right | 0.064183 / 0.064183 |
+| Chrome largest left/right sample difference | 0 |
+| Chrome audio analyzer polls | 197 |
+
+Native tests exercise positive/negative mono inputs in LoRo and LtRt and add
+mono to the existing independent FFmpeg pipeline comparison. Stereo, 5.1 AC-3,
+E-AC-3 and MP2 checks continue to pass. `tools/node/mono-smoke.cjs` uses Playwright
+Chrome 155.0.8059.39 and Web Audio to require non-silent, equal channels from
+actual MSE playback; completion alone would pass for silent sound too. The
+analyzer feeds a zero-gain output to avoid playing test tones through speakers.
+This observes decoded PCM, not physical speaker output or Edge/Safari support.
+
+| Player download, Wasm + JS Brotli bytes | Before (0450007) | After | Change |
+| --- | ---: | ---: | ---: |
+| Live | 112,830 | 112,830 | 0 |
+| Live + sound | 210,259 | 210,303 | +44 |
+| Movie | 135,702 | 135,702 | 0 |
+| Full | 232,817 | 232,654 | −163 |
+
+All budgets pass with the same size recipe. Compression/layout differences do
+not imply less CPU. Correct mono sound necessarily does more useful encoding
+work than the prior silent output; no speedup claim is made for this fix.
+
+```sh
+cargo test --release --test pipeline ac3_eac3_and_mp2_sound_is_decoded_to_flac_that_matches_ffmpeg -- --nocapture
+cargo test --release --manifest-path ac3/Cargo.toml stereo_from_mono
+NODE_PATH=tools/browser/node_modules node tools/node/mono-smoke.cjs
+python3 tools/size.py --check-budgets --output tools/results/size-mono-audio.json
+```
+
+FLAC experiment decision: do not retain the attempted constant-space residual
+search. On the same nonconstant two-second 5.1 AC-3 corpus, an early native
+variant reduced allocations from 378 to 126 but slowed median encoder time from
+2.168 to 4.483 ms. Borrowing channel samples while retaining a residual vector
+still measured 2.239 → 2.389 ms. These are targeted native experiments, not final
+shipped-code or Wasm benchmarks. The original FLAC writer remains unchanged;
+its speed/space tradeoff needs more profiling under #45/#48.
+
+Mono validation also passes formatting, all eight native/Wasm clippy builds,
+default/minimal/vod tests, the complete vendored decoder suite and five existing
+Playwright playback/recovery checks.
+
+
+## Live provider recovery acceptance (2026-10-13)
+
+Playwright Chrome 155.0.8059.39, exact full build from PR #60. The provider uses
+the committed `bbb_480p.ts` clip so repeated media isolates transport and playlist
+policy. Tests add zero runtime code, dependencies or download bytes.
+
+| Case | Real browser result |
+| --- | --- |
+| One segment returns 404 | One request for the bad segment, following good segment fetched; playback passes 5.8 s, beyond the first 4.59 s segment |
+| One segment returns HTML with HTTP 200 | Skipped as invalid TS; following good segment fetched; playback passes 5.8 s |
+| Ten-second HTTP 503 outage | Five attempts at about 0, 1, 3, 7 and 15 s; four Reconnecting states, then playback |
+| Pause with eviction | 50.024 s paused across a 9.179778 s window (5.449 windows); old resource probe returns 404; fresh segments 10 and 11 fetched |
+| Resume after eviction | Continued playback after the seek and latency below 17 s observed within 2.237 s; reported latency 9.551 s |
+
+All four cases have no Failed/Unsupported/browser error. The outage and pause
+were each run twice; final tests strengthen acceptance by requiring playback
+past the bad-segment boundary and real advancement after the live-edge seek.
+The first pause run took 50.009 s and reached the target after a seek in 0.360 s;
+that earlier timing is not evidence of continued post-seek playback. The final
+2.237 s result includes that stronger check. Latency is a player snapshot at
+append time, not a continuously sampled wall-clock live-edge measurement.
+
+Old resources are actually evicted in the pause provider, closing the retained-
+file gap in the earlier test. HTTP 503 responses simulate an outage; this does
+not reproduce physical network disconnection, codec changes or real provider
+content. #2 and #3 acceptance are covered; close after the test PR merges.
+
+```sh
+NODE_PATH=tools/browser/node_modules node tools/node/resilience-smoke.cjs
+NODE_PATH=tools/browser/node_modules node tools/node/pause-smoke.cjs
+```
+
+Serve the built full player first; `RSTREAMKIT_URL` can select another local URL.
+These are standalone Playwright checks, not yet CI jobs or a real-time 4K soak.
+
+
+## Stereo conversion buffer reduction (2026-10-13)
+
+`decode::stereo` always allocated an output vector, then replaced it with the
+already converted PCM when input was stereo. Return that PCM before allocating
+the other-layout buffer. This changes no samples or public API; it reduces a
+constant factor, not the O(n) time/space class. No runtime dependency is added.
+
+Baseline `9da40bf` (PR #61). Release/native, Linux Ryzen 7 5700 / Rust 1.99.0.
+The preserved old helper and new helper receive the same 1,536-sample, two-channel
+byte buffer. Fixture construction is excluded. Nine alternating pairs of 10,000
+calls follow 100-call warmups; p95 is the largest batch average. The test allocator
+forwards System calls and checks a disabled thread-local counter during timing;
+these sub-microsecond helper timings include that instrumentation and do not
+measure full decoder CPU or a Wasm speedup.
+
+| Stereo conversion only | Before | After |
+| --- | ---: | ---: |
+| Heap allocations | 2 | 1 |
+| Requested buffer bytes | 12,288 | 6,144 |
+| Median microseconds, final repeat | 0.125686 | 0.110222 |
+| p95 microseconds, final repeat | 0.171303 | 0.137672 |
+| Chrome mono-run committed Wasm bytes | 2,490,368 | 2,490,368 |
+
+Requested bytes exclude input, other decoder state and allocator overhead.
+The first native run measured medians 0.125723 / 0.108664 µs. The reliable win
+is one fewer 6,144-byte buffer per normal AC-3 stereo frame; committed Wasm
+memory did not decrease in this short browser run. Output-equivalence tests
+cover mono/stereo/three/six/eight-channel inputs, short inputs and trailing bytes;
+allocation tests cover 1, 32, 1,536 and 4,096 samples. Existing decoder checksum
+and independent media gates all pass. The production FLAC search is unchanged.
+
+| Player download, Wasm + JS Brotli bytes | Before | After | Change |
+| --- | ---: | ---: | ---: |
+| Live | 112,830 | 112,778 | −52 |
+| Live + sound | 210,303 | 210,311 | +8 |
+| Movie | 135,702 | 135,683 | −19 |
+| Full | 232,654 | 232,807 | +153 |
+
+All budgets pass; code-generation/compression layout can change artifact bytes
+even when a feature's runtime path is unchanged. Full grows 0.066% for the buffer
+reduction. The mono correction and this change together leave full download
+10 bytes smaller than PR #57, with the same features and size recipe.
+
+Formatting, all eight native/Wasm clippy builds, default/minimal/vod tests, the
+vendored decoder suite, four Node Wasm audio checks and five existing Playwright
+Chrome playback checks pass. The mono check exposed a test timing race: separate
+AnalyserNode snapshots can straddle audio render blocks. It now compares both
+channels within one AudioWorklet block. Two fresh runs each observe 1,824 blocks,
+peak RMS 0.066115 in both channels and zero sample difference. The worklet sends
+silent output; no sound is played through physical speakers. Test-only code adds
+no shipped audio worker or UI framework.
+
+```sh
+cargo test --release --lib measure_stereo_conversion -- --ignored --nocapture --test-threads=1
+python3 tools/size.py --check-budgets --output tools/results/size-stereo-allocation.json
+NODE_PATH=tools/browser/node_modules node tools/node/mono-smoke.cjs
+```
+
+
+## Per-package browser profile tuning (2026-10-13)
+
+The supplied small player now uses Rust `z` for the core, `s` for the Dolby
+and codec-support crates, and `3` for MP2. Native library/CLI release settings
+are unchanged. No dependency, feature or runtime API is added. This is a compiler
+profile change, not a new decoder or renderer.
+
+All candidates use identical source, Rust 1.99.0, wasm-bindgen 0.2.128,
+wasm-opt 130 `-Oz` and Brotli 1.2.0 quality 11. Same advertised features.
+The full-player payload tradeoff determined which candidates to reject:
+
+| Core / codec settings | Full Wasm + JS Brotli bytes | Decision |
+| --- | ---: | --- |
+| All `s` (before) | 232,807 | Reference |
+| All `z` | 224,704 | Reject as default: 5.1 AC-3 processing slows about 22% |
+| All `3` | 282,946 | Reject: download budgets exceeded |
+| Core `z`, all codecs `s` | 227,367 | Lean option; modest processing gains |
+| Core `z`, all codecs `3` | 249,364 | Reject as default: full and sound budgets exceeded |
+| Core `z`, Dolby/core `s`, MP2 `3` | 232,290 | Selected: fits budgets and improves MP2 processing about 18% |
+
+The selected MP2 setting costs 4,923 full-player bytes over the lean option.
+Compared with all-s, full is still 517 bytes smaller; sound-only grows 1,108.
+Hosts that value those 4.9 KB over MP2 processing can reproduce the lean setting
+with `--opt-level z --codec-opt-level s`. This trades CPU for download size without
+removing codec support.
+
+| Player download, Wasm + JS Brotli bytes | All-s before | Selected after |
+| --- | ---: | ---: |
+| Live | 112,778 | 107,969 |
+| Live + sound | 210,311 | 211,419 |
+| Movie | 135,683 | 128,972 |
+| Full | 232,807 | 232,290 |
+
+All four existing budgets pass. `size.py` reads defaults from the player manifest
+and records effective per-package settings; environment variables no longer
+silently change the four documented release settings. Python 3.11+ is needed for
+the standard-library TOML reader. Reports still count Wasm + generated JS, not
+the diagnostic HTML page or media downloads; whole-app startup remains #48 work.
+
+CPU: Linux x86_64 Ryzen 7 5700, Node 26.11.1, identical development harnesses
+optimized with `wasm-opt -Oz`. Each comparison runs in a fresh process with both
+modules present, five warmups, then nine alternating pairs of five-call batches.
+p95 below is the largest batch average, not individual-call tail latency. Two
+fresh comparisons per candidate pass PCM-checksum and output-length gates.
+Transmux timings include input copying and fresh decoder construction per call;
+FLAC uses predecoded PCM. The harness is not the minimal player's exact call path.
+
+| Selected-profile workload | Median ms before → after | p95 batch ms before → after |
+| --- | ---: | ---: |
+| AAC TS, 4.59 s | 0.1268 → 0.1306 | 0.2045 → 0.2248 |
+| Stereo AC-3 TS, 2 s | 7.2707 → 6.8162 | 7.8906 → 7.0313 |
+| 5.1 AC-3 TS, 2 s | 10.8378 → 10.2926 | 11.1078 → 10.6257 |
+| 5.1 E-AC-3 TS, 2 s | 12.4971 → 11.9587 | 13.0465 → 13.0805 |
+| MP2 TS, 2 s | 16.3837 → 13.3651 | 16.6666 → 13.5365 |
+| FLAC from AC-3 5.1 PCM | 4.1267 → 3.6480 | 4.1427 → 3.8399 |
+
+AAC is slightly slower in this run; E-AC-3's measured tail is slightly higher.
+This is not a universal speedup. The first selected-profile comparison measured
+MP2 medians 16.4191 / 13.4112 ms (see JSON for exact results if regenerated);
+CPU ratios are meaningful only within each alternating pair. Committed harness
+memory matches within each pair (1,900,544 bytes after AAC; 2,621,440 after the
+audio workloads). No overall memory or FFmpeg advantage is claimed.
+
+A headless Chrome 155.0.8059.39 control uses the same existing 18-second,
+3840×2160/60 SDR, 40 Mbps clip, viewport 1440×900 and visible document state.
+Both all-s and selected-profile runs finish with zero waiting events and zero
+reported dropped frames. The source has 1,080 frames; Chrome reports 1,081 in
+both runs, so that counter is not proof of 1,081 unique source frames. Short
+checks do not settle the long-run target-device matrix. Peak sampled committed
+Wasm is 39,059,456 bytes for all-s and 38,010,880 for selected. Each is only one
+run; chunk delivery/allocator variation prevents treating the difference as a
+proven profile memory saving. Long-task observations are two at 52/53 ms versus
+one at 58 ms; they do not establish a general responsiveness improvement.
+
+All required root Rust checks, decoder/media tests, harness clippy and four
+size budgets pass. Playback/audio/ABR checks run against the exact selected
+player; Edge/Safari and real-time 4K endurance remain open.
+
+```sh
+python3 tools/size.py --check-budgets --output tools/results/size-balanced-profile.json
+python3 tools/profile_harness.py --profile s --profile balanced
+node tools/node/opt-compare.cjs tools/results/profiles/s/rstreamkit_harness.js tools/results/profiles/balanced/rstreamkit_harness.js
+```
+
+The builder saves tool versions, source/artifact hashes, dirty state and the
+resolved harness lockfile. The comparison records hardware, input hashes, PCM
+checksums, memory and timings. Reproducing the selected harness yielded the same
+Wasm artifact hash as the measured candidate. Module load/init numbers in the
+Node report are diagnostic; this is not a browser cold-start benchmark.
+
+
+## Adaptive bitrate failure fallback (2026-10-13)
+
+Issue #9 also required fallback when a selected level repeatedly fails. The old
+player skipped every bad segment but never called bitrate selection on that path.
+Two consecutive unusable live segments now select the nearest lower compatible
+level. A healthy segment resets the streak even if no usable timing sample exists.
+Eight healthy segments delay reconsidering an upward retry; the existing three
+headroom checks then apply. Further downward steps remain available during recovery.
+Manual locks suppress automatic fallback, and a new manual quality request can
+apply even when the current level has no usable segment. Finite errors still fail.
+
+Variant changes use one existing apply/fetch/rendition path after the batch, rather
+than duplicating it for errors. Counters fit in the previous state padding by using
+bounded u8 fields. Policy state remains 16 bytes on this x86_64 target; the regression
+compares against the previous field layout so it is portable to different ABIs.
+No extra heap storage or dependency is added. Selection remains O(variant count)
+when needed; normal per-segment counter work is constant.
+
+| Failed-encoder provider case | Before | After |
+| --- | ---: | ---: |
+| Healthy lower-level segment requests | 0 | 4 |
+| Failed higher-level requests before fallback | No fallback | 2 |
+| New native failure/control cases | 0 | 4 |
+| Policy state on x86_64, bytes | 16 | 16 |
+
+The exact final Playwright fixture fails on preserved PR #63 artifacts (zero
+lower requests) and passes on the fixed full build. High sequences 37 and 38
+return 404; the healthy encoder has published through 42, and low sequences
+39–42 play. This preserves sequence progress rather than replaying skipped
+segments. Playback passes 6 seconds, stats report low quality and two skipped
+segments, and no Failed/Unsupported/browser error occurs. Four native cases cover
+nearest compatible fallback, lowest/empty sets, successful streak reset without
+timing, recovery hysteresis and manual choices (some cases combine related checks).
+Manual controls are tested in native policy; the small JS demo does not expose them.
+
+| Wasm + JS Brotli download bytes | Before (PR #63) | After |
+| --- | ---: | ---: |
+| Live | 107,969 | 108,210 |
+| Live + sound | 211,419 | 211,787 |
+| Movie | 128,972 | 129,224 |
+| Full | 232,290 | 232,741 |
+
+All four budgets pass. Full adds 451 bytes (0.19%) for the reliability fix. Native
+and Wasm lint/feature gates, media/decoder tests, normal provider downshift/upshift
+and five existing Chrome playback cases pass. This is live-segment recovery;
+it does not promise recovery from every manifest, source-close or unlimited outage.
+No CPU speedup or broad 4K/Edge/Safari claim is made.
+
+```sh
+NODE_PATH=tools/browser/node_modules node tools/node/abr-failure-smoke.cjs
+NODE_PATH=tools/browser/node_modules node tools/node/abr-smoke.cjs
+```
+
+The failure check uses repeated committed media with advancing lower-level
+availability to isolate policy. For the before case, set `RSTREAMKIT_PLAYER_DIR`
+to a directory containing PR #63's full-player JS and Wasm artifacts.
+
+
+## Parser integration check (2026-10-13)
+
+The bounded parser fixes were integrated with the merged retry/session, audio,
+profile and ABR work. Exact integration commit `de1964e`: all required native/
+Wasm feature checks, native feature test sets, decoder suite, coverage-target
+compilation/lints and a fresh seeded 5,000-case campaign pass. Seed 20261013;
+1,000 cases per target, no failure or limit breach in the tested corpus.
+Earlier 55,000 cases remain historical evidence for the earlier parser branch.
+
+| Target | Fresh cases passed | Child wall seconds |
+| --- | ---: | ---: |
+| HLS | 1,000 | 0.033 |
+| TS | 1,000 | 0.165 |
+| MP4 | 1,000 | 0.065 |
+| Matroska | 1,000 | 0.266 |
+| CMAF | 1,000 | 0.066 |
+
+Limits remain 1 MiB input, 512 MiB address space, 30 CPU seconds and 45 wall
+seconds per target campaign, with at most 32 MKV probe requests per input.
+No audio decoding or coverage-guided/ASan campaign is claimed here. Four normal
+regressions preserve the original findings; parser tooling adds zero library
+runtime dependencies and stays outside the default test path.
+
+| Wasm + JS Brotli bytes | Main before parser integration | Integrated |
+| --- | ---: | ---: |
+| Live | 108,210 | 108,210 |
+| Live + sound | 211,787 | 211,787 |
+| Movie | 129,224 | 129,283 |
+| Full | 232,741 | 232,644 |
+
+All budgets pass. Small code-generation/compression differences are not evidence
+that bounds checking universally shrinks programs. Five Chrome playback cases
+pass on the exact integrated full build. Refresh PR #51 CI before merging; #43
+closes only after its seeded CI run and integration are confirmed on main.

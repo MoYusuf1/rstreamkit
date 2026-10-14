@@ -121,3 +121,23 @@ jobs:
         with:
           name: wasm-profile
           path: profile.jsonl
+
+  parser-fuzz:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check development-only fuzz targets
+        run: |
+          rustup component add rustfmt clippy
+          cargo fmt --manifest-path tools/fuzz/Cargo.toml --check
+          cargo clippy --manifest-path tools/fuzz/Cargo.toml --all-targets --features coverage -- -D warnings
+      - name: Seeded bounded parser smoke (5,000 cases)
+        run: python3 tools/fuzz/run.py --cases 1000 --seed 20261010
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: parser-fuzz
+          path: |
+            tools/results/fuzz/*.json
+            tools/results/fuzz/*.log
+            tools/results/fuzz/*-pending.bin

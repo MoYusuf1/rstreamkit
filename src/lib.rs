@@ -26,6 +26,7 @@ pub mod body;
 #[cfg(any(target_arch = "wasm32", test))]
 mod cancel;
 pub mod cmaf;
+mod duration;
 pub mod fmp4;
 pub mod hls;
 #[cfg(any(target_arch = "wasm32", test))]
@@ -37,7 +38,10 @@ pub mod mp4;
 #[cfg(target_arch = "wasm32")]
 pub mod mse;
 pub mod net;
+pub mod session;
 pub mod sound;
+#[cfg(test)]
+mod test_alloc;
 pub mod ts;
 #[cfg(feature = "vod")]
 pub mod vod;

@@ -350,10 +350,12 @@ mod decode {
             .iter()
             .map(|&b| i16::from_le_bytes(b))
             .collect();
+        if channels == 2 {
+            return Some(pcm);
+        }
         let mut out = Vec::with_capacity(samples * 2);
         match channels {
             1 => pcm.iter().for_each(|&x| out.extend([x, x])),
-            2 => out = pcm,
             // 5.1 in WAVE order: front left and right, centre, LFE, back left and right. The gain keeps
             // the loudest case (everything at full scale in one place) from clipping.
             6 => {
@@ -734,7 +736,7 @@ mod tests {
     /// single sample fails here.
     #[cfg(feature = "sound")]
     #[test]
-    fn the_absorbed_dolby_decoder_still_decodes_exactly_what_the_original_did() {
+    fn dolby_outputs_preserve_original_samples_except_corrected_mono_routing() {
         fn fnv1a(samples: &[i16]) -> u64 {
             samples
                 .iter()
@@ -746,7 +748,8 @@ mod tests {
         let fixtures: [(&[u8], u64); 3] = [
             (
                 include_bytes!("../tests/fixtures/h264_ac3.ts"),
-                0xb928_f2d0_e7a0_8325,
+                // Mono intentionally differs: the original center-slot mismatch produced silence.
+                0x2f95f6c00b945b35,
             ),
             (
                 include_bytes!("../tests/fixtures/h264_ac3_51.ts"),
@@ -780,3 +783,7 @@ mod tests {
         }
     }
 }
+
+#[cfg(all(test, feature = "sound"))]
+#[path = "stereo_tests.rs"]
+mod stereo_tests;

@@ -100,3 +100,70 @@ These are diagnostic controls; no generated media is sent outside localhost.
 `node tools/node/soak.cjs` runs five batches of 2,000 short segments and checks
 that committed wasm memory stops growing after the first batch. This accelerated
 pipeline check is separate from a real-time browser/network soak.
+
+## Shared control checks
+
+Build with `python3 tools/size.py`, serve with `python3 tools/server.py`, and
+install `@playwright/test@1.64.0` plus Chrome in a development directory. Set
+`NODE_PATH` to its `node_modules`, then run:
+
+```sh
+node tools/node/retry-smoke.cjs
+node tools/node/buffer-smoke.cjs
+node tools/node/session-smoke.cjs
+node tools/node/abr-smoke.cjs
+node tools/node/abr-failure-smoke.cjs
+node tools/node/mono-smoke.cjs
+node tools/node/resilience-smoke.cjs
+node tools/node/pause-smoke.cjs
+```
+
+These use routes and committed fixtures; no generated media is needed.
+`RSTREAMKIT_URL` can point at another local full-player URL. They check retries,
+source failures and go-live request counts, not speed or 4K performance.
+
+The ABR check starts at the higher advertised level, slows complete segment
+responses for at least three lower-level downloads, then restores speed and
+requires three higher-level downloads plus continued playback. Both levels use
+the same committed clip to isolate policy; this is not a resolution/quality test.
+
+The mono check observes decoded PCM with Web Audio and requires non-silent,
+equal left/right channels; it sends no sound to physical speakers.
+
+Resilience checks exercise a real ten-second HTTP 503 outage, one missing body
+and one HTML body. The pause check takes about a minute: pause for 50 seconds,
+prove old resources return 404, then require fresh downloads and continued playback.
+
+
+## Compare player build settings
+
+`tools/size.py` uses the small player's release settings: `z` for the core,
+`s` for Dolby and codec support, and `3` for MP2. It records effective package
+settings and enforces the existing budgets. Python 3.11 or newer is required.
+Override settings for a measured comparison, without changing defaults:
+
+```sh
+python3 tools/size.py --opt-level s --codec-opt-level s --output tools/results/size-s.json
+python3 tools/size.py --opt-level z --codec-opt-level z --output tools/results/size-z.json
+python3 tools/size.py --opt-level 3 --codec-opt-level 3 --output tools/results/size-3.json
+python3 tools/size.py --opt-level z --codec-opt-level s --output tools/results/size-lean.json
+python3 tools/size.py --check-budgets
+```
+
+For CPU/output checks, build identical development harnesses, then compare them
+in one fresh Node process after other builds finish:
+
+```sh
+python3 tools/profile_harness.py --profile s --profile balanced
+node tools/node/opt-compare.cjs tools/results/profiles/s/rstreamkit_harness.js tools/results/profiles/balanced/rstreamkit_harness.js
+```
+
+`z`, `3`, `lean` and `fast-codecs` are other harness profile choices. The helper
+uses `wasm-opt -Oz` and saves compiler settings, dependency locks and source/artifact
+hashes. Comparison checks decoded PCM checksums and output lengths before timing.
+CPU measurements are Node harness processing, not browser startup or frame rates.
+
+The ABR failure check stops the higher encoder and keeps the lower encoder
+advancing. It requires fallback after two failures and playback past the first
+healthy segment. `RSTREAMKIT_PLAYER_DIR` can load preserved full-player artifacts
+for a before/after regression check.

@@ -1,99 +1,14 @@
 //! Platform-neutral live scheduling and memory policy, shared by the browser and tests.
-use crate::hls::{Media, Segment};
 
-/// Approximate compressed media budget; browsers account buffers differently.
-pub const BUFFER_BUDGET: usize = 32 << 20;
-
-#[derive(Default)]
-pub(crate) struct Window {
-    last: Option<(u64, String, Option<std::ops::Range<u64>>)>,
-    stalled_since: Option<f64>,
-}
-
-impl Window {
-    pub fn finished(&self, media: &Media) -> bool {
-        media.ended && self.next(media).is_none()
-    }
-
-    pub fn next<'a>(&self, media: &'a Media) -> Option<&'a Segment> {
-        let start = match &self.last {
-            None => {
-                if media.ended {
-                    0
-                } else {
-                    media.segments.len().saturating_sub(3)
-                }
-            }
-            Some((seq, uri, range)) => {
-                // URI anchors survive broken providers that slide without advancing sequence.
-                // Parsed HLS sequences are consecutive. Verify the full identity at
-                // the sequence offset before using it; changed/broken playlists still
-                // take the URI-anchor recovery path below. Walking a long unchanged
-                // playlist then needs one lookup per segment instead of scanning it.
-                let offset = media
-                    .segments
-                    .first()
-                    .and_then(|first| usize::try_from(seq.checked_sub(first.seq)?).ok());
-                let anchor = offset.filter(|&at| {
-                    media
-                        .segments
-                        .get(at)
-                        .is_some_and(|s| s.seq == *seq && s.uri == *uri && s.byte_range == *range)
-                });
-                if let Some(at) = anchor.or_else(|| {
-                    media
-                        .segments
-                        .iter()
-                        .position(|s| s.seq == *seq && s.uri == *uri && s.byte_range == *range)
-                }) {
-                    at + 1
-                } else if let Some(at) = media
-                    .segments
-                    .iter()
-                    .rposition(|s| s.uri == *uri && s.byte_range == *range)
-                {
-                    if media.segments[at].seq == *seq
-                        || media.segments.iter().any(|s| s.seq <= *seq)
-                    {
-                        at + 1
-                    } else {
-                        0
-                    }
-                } else if media.segments.first().is_some_and(|s| s.seq > *seq) {
-                    0
-                } else if media.segments.last().is_some_and(|s| s.seq > *seq) {
-                    media
-                        .segments
-                        .iter()
-                        .position(|s| s.seq > *seq)
-                        .unwrap_or(media.segments.len())
-                } else {
-                    media.segments.len().saturating_sub(3)
-                }
-            }
-        };
-        media.segments.get(start)
-    }
-
-    pub fn consumed(&mut self, segment: &Segment) {
-        self.last = Some((segment.seq, segment.uri.clone(), segment.byte_range.clone()));
-        self.stalled_since = None;
-    }
-
-    pub fn discontinuous(&self, segment: &Segment) -> bool {
-        self.last
-            .as_ref()
-            .is_some_and(|(seq, _, _)| segment.seq < *seq || segment.seq > seq.saturating_add(1))
-    }
-
-    pub fn frozen(&mut self, now: f64, target: f64) -> bool {
-        now - *self.stalled_since.get_or_insert(now) >= 3.0 * target.max(1.0)
-    }
-}
+pub(crate) use crate::session::{BUFFER_BUDGET, Session as Window, buffer_limits};
 
 /// Cross a nearby gap only after the current range is exhausted, never over playable media.
-pub(crate) fn gap_target(ranges: &[(f64, f64)], time: f64, limit: f64) -> Option<f64> {
-    for &(start, end) in ranges {
+pub(crate) fn gap_target(
+    ranges: impl IntoIterator<Item = (f64, f64)>,
+    time: f64,
+    limit: f64,
+) -> Option<f64> {
+    for (start, end) in ranges {
         if time >= start && time < end - 0.15 {
             return None;
         }
@@ -102,28 +17,6 @@ pub(crate) fn gap_target(ranges: &[(f64, f64)], time: f64, limit: f64) -> Option
         }
     }
     None
-}
-
-/// Duration limits derived from bytes actually appended, including decoded sound.
-/// Reserve the next segment before assigning rewind/ahead space. Keep at least
-/// one segment behind: removing part of the current GOP can also remove its future
-/// dependent frames. Long GOPs can exceed the budget; this is not a process-memory cap.
-pub(crate) fn buffer_limits(bytes_per_second: f64, segment_seconds: f64) -> (f64, f64) {
-    let total = if bytes_per_second > 0.0 && bytes_per_second.is_finite() {
-        BUFFER_BUDGET as f64 / bytes_per_second
-    } else {
-        40.0
-    };
-    let segment = if segment_seconds.is_finite() {
-        segment_seconds.max(1.0)
-    } else {
-        1.0
-    };
-    let available = (total - segment).max(0.0);
-    let behind = (available * 0.2).min(10.0).max(segment);
-    // Keep a little time for fetch, append and decoder startup at a segment boundary.
-    // A positive threshold also avoids waiting forever on the final frame of a range.
-    ((available - behind).clamp(0.5, 30.0), behind)
 }
 
 /// Speculative input shares the compressed-media estimate with buffered media and
@@ -157,21 +50,45 @@ pub(crate) fn buffer_rate(previous: f64, appended: usize, seconds: f64) -> f64 {
     measured.max(0.8 * previous + 0.2 * measured)
 }
 
-/// Wake near the buffer threshold instead of overshooting it by a fixed timer
-/// tick. Bound wake frequency and tolerate a paused/invalid playback clock.
-pub(crate) fn throttle_delay_ms(buffered: f64, ahead: f64, rate: f64) -> u64 {
-    if !buffered.is_finite() || !ahead.is_finite() || !rate.is_finite() || rate <= 0.0 {
-        return 250;
-    }
-    ((buffered - ahead) * 1000.0 / rate).clamp(10.0, 250.0) as u64
-}
-
 #[derive(Default)]
 pub(crate) struct Abr {
     throughput: f64,
-    headroom: u32,
+    headroom: u8,
+    failures: u8,
+    recovery: u8,
 }
 impl Abr {
+    pub fn succeeded(&mut self) {
+        self.failures = 0;
+        self.recovery = self.recovery.saturating_sub(1);
+    }
+
+    /// Two consecutive unusable segments try the next lower compatible level.
+    pub fn failed<'a>(
+        &mut self,
+        variants: &'a [crate::hls::Variant],
+        current: &str,
+        requested: Option<&str>,
+    ) -> Option<&'a crate::hls::Variant> {
+        if let Some(uri) = requested {
+            return variants.iter().find(|v| v.uri == uri && v.uri != current);
+        }
+        self.headroom = 0;
+        self.failures = self.failures.saturating_add(1);
+        if self.failures < 2 {
+            return None;
+        }
+        self.failures = 0;
+        let now = variants.iter().find(|v| v.uri == current)?;
+        let lower = crate::hls::pick_variant_for(variants, now.bandwidth.saturating_sub(1))?;
+        if lower.bandwidth >= now.bandwidth {
+            return None;
+        }
+        // Do not immediately retry a broken higher level based on fast low-level downloads.
+        self.recovery = 8;
+        Some(lower)
+    }
+
     pub fn observe(&mut self, bytes: usize, seconds: f64) {
         if seconds > 0.0 && seconds.is_finite() {
             let sample = bytes as f64 * 8.0 / seconds;
@@ -195,6 +112,10 @@ impl Abr {
             self.headroom = 0;
             return Some(candidate);
         }
+        if self.recovery != 0 {
+            self.headroom = 0;
+            return None;
+        }
         if candidate.bandwidth > now.bandwidth && buffered >= target * 2.0 {
             self.headroom += 1;
             if self.headroom >= 3 {
@@ -208,22 +129,11 @@ impl Abr {
     }
 }
 
-/// Bounded retries tolerate a ten-second outage without an unbounded retry loop.
-pub(crate) fn retry_delay(attempt: u32) -> Option<u64> {
-    match attempt {
-        0 => Some(0),
-        1 => Some(1),
-        2 => Some(2),
-        3 => Some(4),
-        4..=6 => Some(8),
-        _ => None,
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::hls::{self, Parsed};
+    use crate::hls::{self, Media, Parsed};
+    use crate::net::{buffer_delay_ms as throttle_delay_ms, retry_delay};
     #[test]
     #[ignore = "manual scheduling benchmark; run in release mode"]
     fn playlist_walk_measurement() {
@@ -251,10 +161,10 @@ mod tests {
     #[test]
     fn recovered_live_gaps_do_not_block_a_full_buffer_or_skip_playable_media() {
         let ranges = [(0.0, 18.026), (20.0, 48.021)];
-        assert_eq!(gap_target(&ranges, 17.944, 4.0), Some(20.0));
-        assert_eq!(gap_target(&ranges, 12.0, 10.0), None);
-        assert_eq!(gap_target(&ranges, 17.944, 0.5), None);
-        assert_eq!(gap_target(&ranges, 48.021, 4.0), None);
+        assert_eq!(gap_target(ranges, 17.944, 4.0), Some(20.0));
+        assert_eq!(gap_target(ranges, 12.0, 10.0), None);
+        assert_eq!(gap_target(ranges, 17.944, 0.5), None);
+        assert_eq!(gap_target(ranges, 48.021, 4.0), None);
         let mut window = Window::default();
         window.consumed(&playlist(100, &["old"]).segments[0]);
         assert!(window.discontinuous(&playlist(103, &["new"]).segments[0]));
@@ -403,6 +313,80 @@ mod tests {
             assert_eq!(throttle_delay_ms(1.0, 0.25, rate), 250);
         }
     }
+    fn fallback_variants() -> Vec<crate::hls::Variant> {
+        [("high", 2_000_000), ("low", 200_000), ("middle", 800_000)]
+            .into_iter()
+            .map(|(uri, bandwidth)| crate::hls::Variant {
+                uri: uri.into(),
+                bandwidth,
+                ..Default::default()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn repeated_failures_choose_the_nearest_lower_supported_variant() {
+        let mut variants = fallback_variants();
+        let mut abr = Abr::default();
+        assert!(abr.failed(&variants, "high", None).is_none());
+        assert_eq!(abr.failed(&variants, "high", None).unwrap().uri, "middle");
+        variants[2].codecs = Some("hvc1.1.6.L120.B0".into());
+        assert!(abr.failed(&variants, "high", None).is_none());
+        assert_eq!(abr.failed(&variants, "high", None).unwrap().uri, "low");
+        assert!(abr.failed(&variants, "low", None).is_none());
+        assert!(abr.failed(&variants, "low", None).is_none());
+        assert!(abr.failed(&[], "unknown", None).is_none());
+        assert!(abr.failed(&[], "unknown", None).is_none());
+    }
+
+    #[test]
+    fn failures_respect_a_manual_lock_and_apply_a_new_manual_request() {
+        let variants = fallback_variants();
+        let mut abr = Abr::default();
+        for _ in 0..10 {
+            assert!(abr.failed(&variants, "high", Some("high")).is_none());
+        }
+        assert_eq!(
+            abr.failed(&variants, "high", Some("low")).unwrap().uri,
+            "low"
+        );
+        assert!(abr.failed(&variants, "high", None).is_none());
+    }
+
+    #[test]
+    fn a_good_segment_resets_the_failure_streak_without_a_timing_sample() {
+        let variants = fallback_variants();
+        let mut abr = Abr::default();
+        assert!(abr.failed(&variants, "high", None).is_none());
+        abr.succeeded();
+        assert!(abr.failed(&variants, "high", None).is_none());
+        assert_eq!(abr.failed(&variants, "high", None).unwrap().uri, "middle");
+    }
+
+    #[test]
+    fn failure_recovery_waits_for_healthy_segments_before_retrying_upward() {
+        let variants = fallback_variants();
+        let mut abr = Abr::default();
+        abr.failed(&variants, "high", None);
+        assert_eq!(abr.failed(&variants, "high", None).unwrap().uri, "middle");
+        abr.observe(2_000_000, 1.0);
+        for _ in 0..7 {
+            abr.succeeded();
+            assert!(abr.choose(&variants, "middle", 20.0, 2.0).is_none());
+        }
+        abr.succeeded();
+        assert!(abr.choose(&variants, "middle", 20.0, 2.0).is_none());
+        assert!(abr.choose(&variants, "middle", 20.0, 2.0).is_none());
+        assert_eq!(
+            abr.choose(&variants, "middle", 20.0, 2.0).unwrap().uri,
+            "high"
+        );
+        assert_eq!(
+            std::mem::size_of::<Abr>(),
+            std::mem::size_of::<(f64, u32)>()
+        );
+    }
+
     #[test]
     fn adaptive_selection_steps_down_then_recovers_with_headroom() {
         let variants = vec![

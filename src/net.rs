@@ -4,7 +4,75 @@ use crate::{
     body::{self, Capped},
 };
 use futures_core::Stream;
-use std::{ops::Range, pin::Pin};
+use std::{future::Future, ops::Range, pin::Pin, time::Duration};
+
+/// Host-provided timer. Native hosts may use their executor; tests can advance a fake clock.
+/// Dropping the sleep future must release its pending work. No `Send` bound is required.
+#[allow(async_fn_in_trait)]
+pub trait Clock {
+    async fn sleep(&self, duration: Duration);
+}
+
+/// A retry operation either failed with its original error or was cancelled between attempts.
+#[derive(Debug, PartialEq)]
+#[non_exhaustive]
+pub enum RetryError<E> {
+    Failed(E),
+    Cancelled,
+}
+
+/// Run at most seven attempts, with delays of 0, 1, 2, 4, 8, 8 and 8 seconds.
+/// Only errors accepted by `retryable` are retried. Report reconnecting before each
+/// retry delay, keeping callbacks and transport errors owned by the host.
+///
+/// Cancellation is checked before callbacks, timers and requests, and after timers.
+/// To interrupt a request or timer already pending, drop this future; the host's
+/// `Fetch` and `Clock` implementations must cancel their work on drop.
+pub async fn retry<T, E, F: Future<Output = Result<T, E>>>(
+    clock: &impl Clock,
+    cancelled: impl Fn() -> bool,
+    mut once: impl FnMut() -> F,
+    retryable: impl Fn(&E) -> bool,
+    mut reconnecting: impl FnMut(u32),
+) -> Result<T, RetryError<E>> {
+    let mut attempt = 0;
+    loop {
+        if cancelled() {
+            return Err(RetryError::Cancelled);
+        }
+        if attempt > 0 {
+            reconnecting(attempt);
+        }
+        if cancelled() {
+            return Err(RetryError::Cancelled);
+        }
+        clock
+            .sleep(Duration::from_secs(retry_delay(attempt).unwrap_or(0)))
+            .await;
+        if cancelled() {
+            return Err(RetryError::Cancelled);
+        }
+        match once().await {
+            Ok(value) => return Ok(value),
+            Err(error) if attempt == 6 || !retryable(&error) => {
+                return Err(RetryError::Failed(error));
+            }
+            Err(_) => attempt += 1,
+        }
+    }
+}
+
+/// Bounded backoff shared by native and browser playback.
+pub(crate) fn retry_delay(attempt: u32) -> Option<u64> {
+    match attempt {
+        0 => Some(0),
+        1 => Some(1),
+        2 => Some(2),
+        3 => Some(4),
+        4..=6 => Some(8),
+        _ => None,
+    }
+}
 
 /// How the player reaches the network. The app supplies it, so rstreamkit knows nothing about proxies,
 /// credentials or headers: the browser’s `mse::Direct` adapter is the plain case, and an app that has to go through a proxy
@@ -46,6 +114,111 @@ pub enum FetchError {
 #[allow(async_fn_in_trait)]
 pub trait Sink {
     async fn append(&mut self, bytes: &mut [u8]) -> Result<(), String>;
+}
+
+/// Host playback buffer. Only I/O and playback-clock access belong here;
+/// [`trim_buffer`] and [`wait_for_room`] own the shared removal/wait policy.
+/// Pending operations must release their work when dropped. No `Send` bound is required.
+#[allow(async_fn_in_trait)]
+pub trait PlaybackBuffer {
+    fn position(&self) -> f64;
+    fn ahead(&self) -> f64;
+    fn playback_rate(&self) -> f64;
+    /// Cross an exhausted range's nearby gap, respecting the host's paused state.
+    fn cross_gap(&mut self, target_seconds: f64);
+    /// Wait for outstanding writes/removals, then return the oldest buffered time.
+    async fn oldest(&mut self) -> Result<Option<f64>, String>;
+    /// Remove this time range and wait for completion; report host errors.
+    async fn remove(&mut self, range: Range<f64>) -> Result<(), String>;
+}
+
+/// Drop old media only when more than one second can be removed.
+/// The host must preserve dependent frames according to its buffer semantics.
+pub async fn trim_buffer(buffer: &mut impl PlaybackBuffer, keep: f64) -> Result<(), String> {
+    if !keep.is_finite() || keep < 0.0 {
+        return Err("invalid buffer retention".into());
+    }
+    if let Some(start) = buffer.oldest().await? {
+        let cut = buffer.position() - keep;
+        if start.is_finite() && cut.is_finite() && cut - start > 1.0 {
+            buffer.remove(start..cut).await?;
+        }
+    }
+    Ok(())
+}
+
+#[derive(Debug, PartialEq)]
+#[non_exhaustive]
+pub enum BufferWait {
+    Ready { waited: bool },
+    Interrupted,
+    Cancelled,
+}
+
+/// Apply backpressure before requesting more media. `limits` is (ahead, behind)
+/// in seconds. A live host should refresh its playlist after any wait or interrupt;
+/// finite input must keep its place and continue to the last segment.
+/// Stop checks happen between awaits. Drop this future to cancel pending host work.
+pub async fn wait_for_room(
+    clock: &impl Clock,
+    buffer: &mut impl PlaybackBuffer,
+    limits: (f64, f64),
+    target_seconds: f64,
+    cancelled: impl Fn() -> bool,
+    interrupted: impl Fn() -> bool,
+) -> Result<BufferWait, String> {
+    let (ahead, behind) = limits;
+    if !ahead.is_finite() || ahead < 0.0 || !behind.is_finite() || behind < 0.0 {
+        return Err("invalid buffer limits".into());
+    }
+    let mut waited = false;
+    loop {
+        if cancelled() {
+            return Ok(BufferWait::Cancelled);
+        }
+        if interrupted() {
+            return Ok(BufferWait::Interrupted);
+        }
+        let buffered = buffer.ahead();
+        if !buffered.is_finite() {
+            return Err("invalid buffered duration".into());
+        }
+        if buffered <= ahead {
+            return Ok(BufferWait::Ready { waited });
+        }
+        buffer.cross_gap(target_seconds);
+        trim_buffer(buffer, behind).await?;
+        if cancelled() {
+            return Ok(BufferWait::Cancelled);
+        }
+        if interrupted() {
+            return Ok(BufferWait::Interrupted);
+        }
+        // Gap recovery can create room without a timer tick.
+        let buffered = buffer.ahead();
+        if !buffered.is_finite() {
+            return Err("invalid buffered duration".into());
+        }
+        if buffered <= ahead {
+            return Ok(BufferWait::Ready { waited: true });
+        }
+        clock
+            .sleep(Duration::from_millis(buffer_delay_ms(
+                buffered,
+                ahead,
+                buffer.playback_rate(),
+            )))
+            .await;
+        waited = true;
+    }
+}
+
+/// Wake near the threshold, bounded to 10–250 ms even with a paused/invalid clock.
+pub(crate) fn buffer_delay_ms(buffered: f64, ahead: f64, rate: f64) -> u64 {
+    if !buffered.is_finite() || !ahead.is_finite() || !rate.is_finite() || rate <= 0.0 {
+        return 250;
+    }
+    ((buffered - ahead) * 1000.0 / rate).clamp(10.0, 250.0) as u64
 }
 /// Deliver fragments in order without concatenating or copying their media payloads.
 pub async fn append_fragments(

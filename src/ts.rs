@@ -111,11 +111,10 @@ fn codec_name(stream_type: u8) -> String {
     }
 }
 
-/// Splits a PES payload of Annex-B data into NAL units (without start codes).
-fn nal_units(es: &[u8]) -> Vec<&[u8]> {
+/// Byte after the first Annex-B start code, using the existing word-at-a-time scan.
+fn start_code(es: &[u8]) -> Option<usize> {
     const ONES: u64 = 0x0101_0101_0101_0101;
     const HIGHS: u64 = 0x8080_8080_8080_8080;
-    let mut starts = vec![];
     let mut i = 0;
     while i + 3 <= es.len() {
         // A start code begins with a zero byte, and compressed pictures have few: look at eight
@@ -133,24 +132,32 @@ fn nal_units(es: &[u8]) -> Vec<&[u8]> {
             }
         }
         if es[i] == 0 && es[i + 1] == 0 && es[i + 2] == 1 {
-            starts.push(i + 3);
-            i += 3;
+            return Some(i + 3);
         } else {
             i += 1;
         }
     }
-    let mut out = vec![];
-    for (n, &s) in starts.iter().enumerate() {
-        let mut e = starts.get(n + 1).map_or(es.len(), |&next| next - 3);
-        // A 4-byte start code leaves one extra zero on the previous NAL; trailing zeros are never payload.
-        while e > s && es[e - 1] == 0 {
-            e -= 1;
+    None
+}
+
+/// Borrows one NAL at a time: no list of offsets or payload slices is allocated.
+fn nal_units(es: &[u8]) -> impl Iterator<Item = &[u8]> {
+    let mut pending = start_code(es).map(|start| &es[start..]);
+    std::iter::from_fn(move || {
+        while let Some(payload) = pending.take() {
+            let next = start_code(payload);
+            let mut end = next.map_or(payload.len(), |start| start - 3);
+            pending = next.map(|start| &payload[start..]);
+            // Four-byte start codes and trailing padding leave extra zero bytes.
+            while end > 0 && payload[end - 1] == 0 {
+                end -= 1;
+            }
+            if end > 0 {
+                return Some(&payload[..end]);
+            }
         }
-        if e > s {
-            out.push(&es[s..e]);
-        }
-    }
-    out
+        None
+    })
 }
 
 pub(crate) fn read_ts(b: &[u8]) -> u64 {
@@ -738,7 +745,7 @@ mod tests {
                     [0, 0, 0, 1, 3, 0x65, (seed >> 8) as u8][(seed >> 24) as usize % 7]
                 })
                 .collect();
-            assert_eq!(nal_units(&es), slow(&es), "{es:?}");
+            assert_eq!(nal_units(&es).collect::<Vec<_>>(), slow(&es), "{es:?}");
         }
     }
 
@@ -747,7 +754,7 @@ mod tests {
         let es = [
             0, 0, 0, 1, 0x67, 1, 2, 0, 0, 1, 0x68, 3, 0, 0, 0, 1, 0x65, 9, 9,
         ];
-        let n: Vec<_> = nal_units(&es).into_iter().map(|n| n.to_vec()).collect();
+        let n: Vec<_> = nal_units(&es).map(|n| n.to_vec()).collect();
         assert_eq!(n, vec![vec![0x67, 1, 2], vec![0x68, 3], vec![0x65, 9, 9]]);
     }
 
@@ -880,3 +887,7 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+#[path = "nal_scan_tests.rs"]
+mod nal_scan_tests;

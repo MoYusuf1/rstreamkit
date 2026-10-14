@@ -305,8 +305,23 @@ pub fn plays_hls_natively() -> bool {
     can_play("application/vnd.apple.mpegurl")
 }
 
-/// Resolves after `d`, via the browser's timer.
+struct BrowserTimer(Option<JsValue>);
+impl Drop for BrowserTimer {
+    fn drop(&mut self) {
+        if let Some(id) = self.0.take() {
+            let global = js_sys::global();
+            if let Ok(clear) = js_sys::Reflect::get(&global, &"clearTimeout".into())
+                .and_then(|f| f.dyn_into::<js_sys::Function>())
+            {
+                let _ = clear.call1(&global, &id);
+            }
+        }
+    }
+}
+
+/// Resolves after `d`, via the browser's timer. Dropping the future clears the timer.
 pub async fn sleep(d: Duration) {
+    let mut timer = BrowserTimer(None);
     let p = js_sys::Promise::new(&mut |resolve, reject| {
         let global = js_sys::global();
         let result = js_sys::Reflect::get(&global, &"setTimeout".into())
@@ -318,11 +333,15 @@ pub async fn sleep(d: Duration) {
                     &(d.as_millis().min(i32::MAX as u128) as i32).into(),
                 )
             });
-        if let Err(e) = result {
-            let _ = reject.call1(&JsValue::UNDEFINED, &e);
+        match result {
+            Ok(id) => timer.0 = Some(id),
+            Err(e) => {
+                let _ = reject.call1(&JsValue::UNDEFINED, &e);
+            }
         }
     });
     let _ = JsFuture::from(p).await;
+    drop(timer);
 }
 
 pub use crate::net::{Body, Fetch, FetchError, Response};
@@ -468,32 +487,33 @@ impl From<FetchError> for Fail {
     }
 }
 
-/// Retries transient failures with bounded exponential backoff.
+/// Browser timer adapter for the shared retry loop.
+struct BrowserClock;
+impl crate::net::Clock for BrowserClock {
+    async fn sleep(&self, duration: Duration) {
+        sleep(duration).await;
+    }
+}
+
 async fn with_retries<T, F: Future<Output = Result<T, Fail>>>(
     stop: &Cell<bool>,
-    mut once: impl FnMut() -> F,
+    once: impl FnMut() -> F,
     report: &mut dyn FnMut(Status),
 ) -> Result<T, Failure> {
-    let mut last = String::new();
-    for attempt in 0..7 {
-        if attempt > 0 && !stop.get() {
-            report(Status::Reconnecting { attempt });
-        }
-        if let Some(delay) = crate::live::retry_delay(attempt) {
-            sleep(Duration::from_secs(delay)).await;
-        }
-        if stop.get() {
-            break;
-        }
-        match once().await {
-            Ok(v) => return Ok(v),
-            // A refusal, or something that isn't what was asked for, won't get better by asking again.
-            Err(Fail::Final(e)) => return Err(e.into()),
-            Err(Fail::Unsupported(why)) => return Err(why.into()),
-            Err(Fail::Retry(e)) => last = e,
-        }
+    match crate::net::retry(
+        &BrowserClock,
+        || stop.get(),
+        once,
+        |error| matches!(error, Fail::Retry(_)),
+        |attempt| report(Status::Reconnecting { attempt }),
+    )
+    .await
+    {
+        Ok(value) => Ok(value),
+        Err(crate::net::RetryError::Failed(Fail::Retry(why) | Fail::Final(why))) => Err(why.into()),
+        Err(crate::net::RetryError::Failed(Fail::Unsupported(why))) => Err(why.into()),
+        Err(crate::net::RetryError::Cancelled) => Err("playback stopped".into()),
     }
-    Err(last.into())
 }
 
 async fn fetch_once(http: &impl Fetch, url: &str, limit: usize) -> Result<Fetched, Fail> {
@@ -823,11 +843,9 @@ fn cross_live_gap(video: &HtmlVideoElement, target: f64) {
         return;
     }
     let b = video.buffered();
-    let ranges: Vec<_> = (0..b.length())
-        .filter_map(|i| Some((b.start(i).ok()?, b.end(i).ok()?)))
-        .collect();
+    let ranges = (0..b.length()).filter_map(|i| Some((b.start(i).ok()?, b.end(i).ok()?)));
     if let Some(start) =
-        crate::live::gap_target(&ranges, video.current_time(), target.max(1.0) * 2.0)
+        crate::live::gap_target(ranges, video.current_time(), target.max(1.0) * 2.0)
     {
         video.set_current_time(start);
     }
@@ -883,25 +901,86 @@ async fn wait_idle(sb: &SourceBuffer, ms: &MediaSource) -> Result<(), String> {
     }
 }
 
-/// Drops buffered media far behind the playhead so a long live session doesn't fill memory.
+/// Browser transport and status callbacks around shared playlist control.
+struct BrowserPlaylist<'a, F> {
+    http: &'a F,
+    url: &'a str,
+    stop: &'a Cell<bool>,
+    latest: &'a mut Fetched,
+    video: &'a HtmlVideoElement,
+    report: &'a mut dyn FnMut(Status),
+}
+impl<F: Fetch> crate::session::PlaylistSource for BrowserPlaylist<'_, F> {
+    type Error = Failure;
+    async fn refresh(&mut self) -> Result<hls::Media, Failure> {
+        let next = fetch(self.http, self.url, PLAYLIST_LIMIT, self.stop, self.report).await?;
+        let media = parse_media(&next)?;
+        *self.latest = next;
+        Ok(media)
+    }
+    fn waiting(&mut self, stalled: bool) {
+        if stalled {
+            (self.report)(Status::Reconnecting { attempt: 1 });
+        } else if buffered_ahead(self.video) < 0.5 {
+            (self.report)(Status::Buffering);
+        }
+    }
+}
+
+/// Browser I/O for shared buffer control. No media bytes or range lists are copied.
+struct BrowserBuffer<'a> {
+    video: &'a HtmlVideoElement,
+    sb: Option<&'a SourceBuffer>,
+    ms: &'a MediaSource,
+}
+impl crate::net::PlaybackBuffer for BrowserBuffer<'_> {
+    fn position(&self) -> f64 {
+        self.video.current_time()
+    }
+    fn ahead(&self) -> f64 {
+        buffered_ahead(self.video)
+    }
+    fn playback_rate(&self) -> f64 {
+        self.video.playback_rate()
+    }
+    fn cross_gap(&mut self, target: f64) {
+        cross_live_gap(self.video, target);
+    }
+    async fn oldest(&mut self) -> Result<Option<f64>, String> {
+        let Some(sb) = self.sb else {
+            return Ok(None);
+        };
+        wait_idle(sb, self.ms).await?;
+        let ranges = sb.buffered().map_err(js_err)?;
+        if ranges.length() == 0 {
+            Ok(None)
+        } else {
+            ranges.start(0).map(Some).map_err(js_err)
+        }
+    }
+    async fn remove(&mut self, range: Range<f64>) -> Result<(), String> {
+        let sb = self.sb.ok_or("no media buffer")?;
+        sb.remove(range.start, range.end).map_err(js_err)?;
+        wait_idle(sb, self.ms).await
+    }
+}
+
+/// Drops buffered media far behind the playhead using shared Rust policy.
 async fn trim(
     video: &HtmlVideoElement,
     sb: &SourceBuffer,
     ms: &MediaSource,
     keep: f64,
 ) -> Result<(), String> {
-    wait_idle(sb, ms).await?;
-    let b = sb.buffered().map_err(js_err)?;
-    if b.length() == 0 {
-        return Ok(());
-    }
-    let start = b.start(0).map_err(js_err)?;
-    let cut = video.current_time() - keep;
-    if cut - start > 1.0 {
-        let _ = sb.remove(start, cut);
-        wait_idle(sb, ms).await?;
-    }
-    Ok(())
+    crate::net::trim_buffer(
+        &mut BrowserBuffer {
+            video,
+            sb: Some(sb),
+            ms,
+        },
+        keep,
+    )
+    .await
 }
 
 /// Hands `bytes` to the browser, which copies what it needs before returning: they are lent as a
@@ -1040,42 +1119,39 @@ async fn run(
                 audio_state = RenditionState::default();
             }
         }
-        if go_live.replace(false) {
-            latest = fetch(http, &media_url, PLAYLIST_LIMIT, stop, &mut say).await?;
-            media = parse_media(&latest)?;
-            window = crate::live::Window::default();
-            jump_requested = true;
-        }
-        // Refresh after throttling: old playlist entries may have expired during a pause.
-        let (ahead, behind) = crate::live::buffer_limits(bytes_per_second, media.target_duration);
-        let mut throttled = false;
-        while buffered_ahead(video) > ahead {
-            if go_live.get() {
-                throttled = true;
-                break;
-            }
-            cross_live_gap(video, media.target_duration);
-            if let Some(buffer) = &sb {
-                trim(video, buffer, &ms, behind).await?;
-            }
-            throttled = true;
-            sleep(Duration::from_millis(crate::live::throttle_delay_ms(
-                buffered_ahead(video),
-                ahead,
-                video.playback_rate(),
-            )))
-            .await;
-        }
-        if throttled && !media.ended {
-            prefetch = None;
-            latest = fetch(http, &media_url, PLAYLIST_LIMIT, stop, &mut say).await?;
-            media = parse_media(&latest)?;
-            if go_live.replace(false) {
-                window = crate::live::Window::default();
-                jump_requested = true;
+        let prepared = window
+            .prepare(
+                &BrowserClock,
+                &mut BrowserBuffer {
+                    video,
+                    sb: sb.as_ref(),
+                    ms: &ms,
+                },
+                &mut BrowserPlaylist {
+                    http,
+                    url: &media_url,
+                    stop,
+                    latest: &mut latest,
+                    video,
+                    report: &mut say,
+                },
+                &mut media,
+                bytes_per_second,
+                crate::session::Controls::new(stop, go_live),
+            )
+            .await?;
+        match prepared {
+            crate::session::Preparation::Cancelled => return Ok(()),
+            crate::session::Preparation::Ready { refreshed, jump } => {
+                if refreshed {
+                    prefetch = None;
+                }
+                jump_requested |= jump;
             }
         }
-        while let Some(seg) = window.next(&media) {
+        let mut next_variant = None;
+        for scheduled in window.batch(&media) {
+            let seg = scheduled.segment;
             let url = resolve(&latest.url, &seg.uri)?;
             let fetch_started = js_sys::Date::now() / 1000.0;
             if seg.discontinuity || window.discontinuous(seg) {
@@ -1135,10 +1211,21 @@ async fn run(
                     stats.borrow_mut().dropped_segments += 1;
                     tx.borrow_mut().discontinuity();
                     say(Status::Note(format!("skipping unavailable segment: {why}")));
+                    if master_base.is_some() {
+                        next_variant = abr.failed(
+                            &variants,
+                            &variant_uri,
+                            variant_request.borrow().as_deref(),
+                        );
+                        if next_variant.is_some() {
+                            break;
+                        }
+                    }
                     continue;
                 }
                 Err(e) => return Err(e),
             };
+            abr.succeeded();
             if stop.get() {
                 return Ok(());
             }
@@ -1222,13 +1309,7 @@ async fn run(
             bytes_per_second = crate::live::buffer_rate(bytes_per_second, appended, seconds);
             if !video.paused()
                 && prefetch.is_none()
-                && let Some(next) = media
-                    .segments
-                    .iter()
-                    .position(|s| {
-                        s.seq == seg.seq && s.uri == seg.uri && s.byte_range == seg.byte_range
-                    })
-                    .and_then(|i| media.segments.get(i + 1))
+                && let Some(next) = scheduled.next
                 && next.key.is_none()
                 && next.map.is_none()
                 && next.byte_range.is_none()
@@ -1308,15 +1389,7 @@ async fn run(
             out.fragments.clear();
             window.consumed(seg);
             frontier += seconds;
-            let remaining: f64 = media
-                .segments
-                .iter()
-                .skip_while(|s| {
-                    s.seq != seg.seq || s.uri != seg.uri || s.byte_range != seg.byte_range
-                })
-                .skip(1)
-                .map(|s| s.duration)
-                .sum();
+            let remaining = scheduled.remaining_seconds;
             let ranges = video.buffered();
             let end = ranges
                 .length()
@@ -1330,7 +1403,11 @@ async fn run(
                 state.buffered_seconds = buffered_ahead(video);
                 state.latency_seconds = latency.max(0.0);
                 state.current_variant = Some(variant_uri.clone());
-                state.live_window_seconds = if media.ended { 0.0 } else { media.duration() };
+                state.live_window_seconds = if media.ended {
+                    0.0
+                } else {
+                    scheduled.window_seconds
+                };
             }
             if !media.ended {
                 let target = (media.target_duration * 3.0).max(3.0);
@@ -1338,7 +1415,7 @@ async fn run(
                 if !video.paused() {
                     video.set_playback_rate(if latency > target + 2.0 { 1.05 } else { 1.0 });
                 }
-                let _ = ms.set_live_seekable_range((end - media.duration()).max(0.0), end);
+                let _ = ms.set_live_seekable_range((end - scheduled.window_seconds).max(0.0), end);
             }
             if jump_requested && !media.ended {
                 video.set_current_time((end - media.target_duration.max(1.0)).max(0.0));
@@ -1360,9 +1437,9 @@ async fn run(
             let (ahead, behind) =
                 crate::live::buffer_limits(bytes_per_second, media.target_duration);
             trim(video, buffer, &ms, behind).await?;
-            if let Some(base) = &master_base {
+            if master_base.is_some() {
                 let requested = variant_request.borrow().clone();
-                let candidate = if let Some(uri) = requested {
+                next_variant = if let Some(uri) = requested {
                     variants
                         .iter()
                         .find(|v| v.uri == uri && v.uri != variant_uri)
@@ -1374,34 +1451,63 @@ async fn run(
                         media.target_duration,
                     )
                 };
-                if let Some(candidate) = candidate {
-                    prefetch = None;
-                    variant_uri = candidate.uri.clone();
-                    let selected = candidate
-                        .renditions
-                        .iter()
-                        .filter(|r| r.uri.is_some())
-                        .max_by_key(|r| r.default)
-                        .and_then(|r| r.uri.as_deref())
-                        .map(|uri| resolve(base, uri))
-                        .transpose()?;
-                    if selected != audio_url {
-                        audio_state = RenditionState::default();
-                        audio_url = selected;
-                    }
-                    media_url = resolve(base, &variant_uri)?;
-                    say(Status::Note(format!(
-                        "switching variant to {}",
-                        candidate.bandwidth
-                    )));
-                    latest = fetch(http, &media_url, PLAYLIST_LIMIT, stop, &mut say).await?;
-                    media = parse_media(&latest)?;
+                if next_variant.is_some() {
                     break;
                 }
             }
-            if buffered_ahead(video) > ahead {
-                break;
+            if buffered_ahead(video) > ahead && scheduled.next.is_some() {
+                if !media.ended {
+                    break;
+                }
+                // Keep this finite snapshot's duration cache across buffer waits.
+                // Live snapshots still refresh before selecting more input.
+                let waited = crate::net::wait_for_room(
+                    &BrowserClock,
+                    &mut BrowserBuffer {
+                        video,
+                        sb: Some(buffer),
+                        ms: &ms,
+                    },
+                    (ahead, behind),
+                    media.target_duration,
+                    || stop.get(),
+                    || go_live.get(),
+                )
+                .await?;
+                if waited == crate::net::BufferWait::Cancelled {
+                    return Ok(());
+                }
+                if waited == crate::net::BufferWait::Interrupted
+                    || *audio_request.borrow() != selected_audio
+                {
+                    break;
+                }
             }
+        }
+
+        if let (Some(base), Some(candidate)) = (&master_base, next_variant) {
+            prefetch = None;
+            variant_uri = candidate.uri.clone();
+            let selected = candidate
+                .renditions
+                .iter()
+                .filter(|r| r.uri.is_some())
+                .max_by_key(|r| r.default)
+                .and_then(|r| r.uri.as_deref())
+                .map(|uri| resolve(base, uri))
+                .transpose()?;
+            if selected != audio_url {
+                audio_state = RenditionState::default();
+                audio_url = selected;
+            }
+            media_url = resolve(base, &variant_uri)?;
+            say(Status::Note(format!(
+                "switching variant to {}",
+                candidate.bandwidth
+            )));
+            latest = fetch(http, &media_url, PLAYLIST_LIMIT, stop, &mut say).await?;
+            media = parse_media(&latest)?;
+            continue;
         }
 
         if media.ended {
@@ -1425,23 +1531,29 @@ async fn run(
             return Ok(());
         }
 
-        // Live: wait about half a segment, then look for new ones.
-        sleep(Duration::from_secs_f64(
-            (media.target_duration / 2.0).clamp(1.0, 5.0),
-        ))
-        .await;
-        if stop.get() {
-            return Ok(());
+        let refreshed = window
+            .wait_and_refresh(
+                &BrowserClock,
+                &mut BrowserPlaylist {
+                    http,
+                    url: &media_url,
+                    stop,
+                    latest: &mut latest,
+                    video,
+                    report: &mut say,
+                },
+                &mut media,
+                crate::session::Controls::new(stop, go_live),
+                || js_sys::Date::now() / 1000.0,
+            )
+            .await?;
+        match refreshed {
+            crate::session::Preparation::Cancelled => return Ok(()),
+            crate::session::Preparation::Ready { jump, .. } => {
+                prefetch = None;
+                jump_requested |= jump;
+            }
         }
-        if window.next(&media).is_none()
-            && window.frozen(js_sys::Date::now() / 1000.0, media.target_duration)
-        {
-            say(Status::Reconnecting { attempt: 1 });
-        } else if buffered_ahead(video) < 0.5 {
-            say(Status::Buffering);
-        }
-        latest = fetch(http, &media_url, PLAYLIST_LIMIT, stop, &mut say).await?;
-        media = parse_media(&latest)?;
         cross_live_gap(video, media.target_duration);
     }
 }

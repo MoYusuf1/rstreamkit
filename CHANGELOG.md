@@ -9,6 +9,23 @@ Breaking changes:
 - Additional public enums are non-exhaustive; Demuxed gains passthrough metadata.
 
 Changes:
+- Fall back after two unusable live segments; respect manual quality choices and delay automatic upward retry.
+- Tune the small player per package: measured MP2 Wasm packaging falls 16.38 → 13.37 ms, with a slightly smaller full download.
+- Return stereo PCM directly instead of allocating an unused second output buffer.
+- Restore mono AC-3 sound in stereo output by routing its gain to the center slot; mono PCM intentionally changes from silence.
+- Scan H.264 units without temporary heap lists; preserve media output and keep all size budgets.
+- Replace the growing duration cache with bounded storage while retaining linear playlist walks.
+- Reuse cursor URI storage and release oversized buffers after shorter replacements.
+- Prepare playlist walks once; reuse next-segment and duration metadata across finite buffer waits.
+- Reduce measured native 20,000-entry bookkeeping from 573 ms to 0.339 ms, with a 160 KB cache.
+- Share HLS playlist selection, refresh and restart control; add thirteen native session scenarios.
+- Reuse the periodic refresh when go-live is requested during its wait.
+- Share buffer trimming and backpressure with native hosts; add twelve control tests.
+- Report failed browser removals and inspect live gaps without a temporary range vector.
+- Share the retry loop between native and browser hosts; test nine outage/cancellation cases with fake time.
+- Clear browser timers when their waiting future is dropped.
+- Reject oversized MP4 timing runs, bound malformed edit counts and check file-offset arithmetic.
+- Clamp extreme negative Matroska seeks; add five bounded parser fuzz targets and four regression tests.
 - Cancel player tasks and Direct fetches on stop/drop; release buffer listeners.
 - Handle source closure/removal while waiting for appends and removals.
 - Retain HLS durations, source dates and discontinuities; prefer supported codecs.

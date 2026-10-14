@@ -13,3 +13,7 @@ Cargo.lock
 /tools/browser/__pycache__/
 /tools/__pycache__/
 /ac3/target/
+/tools/fuzz/target/
+/tools/fuzz/artifacts/
+/tools/fuzz/corpus/
+/tools/fuzz/__pycache__/

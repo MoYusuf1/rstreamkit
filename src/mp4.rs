@@ -83,18 +83,21 @@ pub enum Moov {
 pub fn find_moov(bytes: &[u8], at: u64) -> Moov {
     let mut pos = 0usize;
     loop {
+        let Some(offset) = at.checked_add(pos as u64) else {
+            return Moov::Missing;
+        };
         let Some((kind, size, _)) = box_header(&bytes[pos.min(bytes.len())..]) else {
-            return Moov::Next(at + pos as u64);
+            return Moov::Next(offset);
         };
         if &kind == b"moov" {
-            return Moov::At(at + pos as u64, size);
+            return Moov::At(offset, size);
         }
         if size == u64::MAX {
             return Moov::Missing;
         }
         match usize::try_from(size).ok().and_then(|s| pos.checked_add(s)) {
             Some(next) if next < bytes.len() => pos = next,
-            _ => return Moov::Next((at + pos as u64).saturating_add(size)),
+            _ => return offset.checked_add(size).map_or(Moov::Missing, Moov::Next),
         }
     }
 }
@@ -216,6 +219,9 @@ fn samples(stbl: &[u8]) -> R<(Vec<Sample>, u32)> {
     let (mut i, mut t, mut last_dur) = (0, 0i64, 0);
     for e in 0..be32(stts, 4)? as usize {
         let (n, delta) = (be32(stts, 8 + 8 * e)?, be32(stts, 12 + 8 * e)?);
+        if n as usize > out.len() - i {
+            return Err(damaged());
+        }
         for _ in 0..n {
             let Some(s) = out.get_mut(i) else { break };
             s.dts = t;
@@ -223,17 +229,26 @@ fn samples(stbl: &[u8]) -> R<(Vec<Sample>, u32)> {
             i += 1;
         }
     }
+    if i != out.len() {
+        return Err(damaged());
+    }
     // Picture-order offsets (only video with B-frames has them).
     if let Some(ctts) = child(stbl, b"ctts") {
         let mut i = 0;
         for e in 0..be32(ctts, 4)? as usize {
             let (n, offset) = (be32(ctts, 8 + 8 * e)?, be32(ctts, 12 + 8 * e)? as i32);
+            if n as usize > out.len() - i {
+                return Err(damaged());
+            }
             for _ in 0..n {
                 if let Some(s) = out.get_mut(i) {
                     s.cts = offset;
                 }
                 i += 1;
             }
+        }
+        if i != out.len() {
+            return Err(damaged());
         }
     }
     // Sync samples; a track with no list (sound) is all sync.
@@ -272,7 +287,12 @@ fn edit(trak: &[u8]) -> i64 {
             Ok(i64::from(be32(elst, 8 + 12 * i + 4)? as i32))
         }
     };
-    (0..be32(elst, 4).unwrap_or(0) as usize)
+    let count = be32(elst, 4).unwrap_or(0) as usize;
+    let width = if v1 { 20 } else { 12 };
+    if count > elst.len().saturating_sub(8) / width {
+        return 0;
+    }
+    (0..count)
         .filter_map(|i| entry(i).ok())
         .find(|&t| t >= 0)
         .unwrap_or(0)
