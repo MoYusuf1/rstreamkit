@@ -22,6 +22,8 @@ def main():
     parser.add_argument("--profile", choices=PROFILES, action="append",
                         help="repeat to build several; default builds s and balanced")
     parser.add_argument("--output", type=Path, default=ROOT / "tools/results/profiles")
+    parser.add_argument("--retain-names", action="store_true",
+                        help="keep development-only Wasm function names for CPU sampling")
     args = parser.parse_args()
     for name in args.profile or ["s", "balanced"]:
         level, packages = PROFILES[name]
@@ -40,10 +42,12 @@ def main():
         subprocess.run(["wasm-bindgen", str(ROOT / "tools/harness/target/wasm32-unknown-unknown/release/rstreamkit_harness.wasm"),
                         "--target", "nodejs", "--out-dir", str(output)], check=True)
         wasm = output / "rstreamkit_harness_bg.wasm"
-        subprocess.run(["wasm-opt", str(wasm), "-Oz", "-o", str(wasm)], check=True)
+        wasm_opt = ["-Oz"] + (["-g"] if args.retain_names else [])
+        subprocess.run(["wasm-opt", str(wasm), *wasm_opt, "-o", str(wasm)], check=True)
         tools = {tool: subprocess.check_output([tool, "--version"], text=True).strip()
                  for tool in ["rustc", "cargo", "wasm-bindgen", "wasm-opt"]}
         report = {"profile": name, "overrides": overrides, "packages": packages, "tools": tools,
+                  "wasm_opt": wasm_opt, "retain_names": args.retain_names,
                   "revision": subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=ROOT, text=True).strip(),
                   "wasm_sha256": hashlib.sha256(wasm.read_bytes()).hexdigest(),
                   "working_tree": subprocess.check_output(["git", "status", "--porcelain"], cwd=ROOT, text=True),
