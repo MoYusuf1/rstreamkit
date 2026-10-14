@@ -39,7 +39,12 @@ const os=require('node:os'),{execFileSync}=require('node:child_process');
    throw error;
   });
   await expect.poll(()=>page.locator('#video').evaluate(v=>v.ended),{timeout:10000}).toBe(true);
-  const report=await page.evaluate(()=>({sample:sample(),audio:rawAudio}));
+  const report=await page.evaluate(()=>{
+   const q=document.querySelector('#video').getVideoPlaybackQuality();
+   return {sample:sample(),audio:rawAudio,raw_quality:{total:q.totalVideoFrames,dropped:q.droppedVideoFrames}};
+  });
+  if(report.sample.playback.frames.total < (process.env.RSTREAMKIT_REPEAT_RAW==='1'?149:179))
+   console.error(JSON.stringify(report));
   assert(report.sample.playback.frames.total >= (process.env.RSTREAMKIT_REPEAT_RAW==='1'?149:179), 'all source pictures reach playback');
   assert(report.audio.max_rms>.005,'raw Dolby produces decoded sound');
   assert(report.sample.session.statuses.some(s=>s.status==='Ended'));
