@@ -1186,3 +1186,22 @@ Changing quality now keeps the selected external audio language. Changing track 
 All budgets pass. A mixed master advertises a higher-bandwidth HEVC variant; Chrome fetches none of its playlists and plays H.264. After six seconds, the test changes English (440 Hz) to Spanish (880 Hz), then selects the lower variant. Sequence 10 is the first lower-level audio; its playback begins around 14 seconds, and the test observes Spanish tone samples after 14.5 seconds. The standalone final run reached 15.36 seconds with 17 matching lower-level tone samples, no English tone after that boundary, and no failed status. A second run inside the six-test Playwright suite also passes. The same final test fails against main's runtime at the language-preservation assertion.
 
 Fixtures are generated continuous TS segments; both quality levels share video bytes to isolate routing. An earlier repeated-clip experiment had artificial clock resets and is not acceptance evidence. Web Audio verifies decoded PCM, not speaker hardware. This covers the software routing acceptance for #8; Edge/Safari and long high-resolution acceptance remain separate.
+
+### Real-time live catch-up acceptance — 2026-10-13
+
+`tools/node/catchup-smoke.cjs` with installed Chrome 155 tests issue #14 using real wall time. The provider publishes a repeated generated two-second TS clip every two seconds and retains 120 seconds of input, so recovery can download every missed segment. Segment 4 is held for 12.501 seconds; playback genuinely waits after segment 3 has drained.
+
+| Measure | Observed |
+| --- | ---: |
+| Actual playback stall | 10.474 s |
+| Largest sampled latency | 16.196 s |
+| Final reported latency | 7.961 s |
+| Configured target / upper control band | 6 / 8 s |
+| Recovery after playback resumes | 220.878 s |
+| Catch-up / final playback rate | 1.05 / 1.00 |
+| Seeks during catch-up | 0 |
+| Largest currentTime step above elapsed wall time | 0.008688 s |
+| Final committed Wasm memory | 2,293,760 B |
+| Runtime code or download bytes added | 0 |
+
+The bounded acceptance is 240 seconds after resumption to reach the existing target-plus-two-second band and restore 1× playback. This is not a claim that latency reaches exactly six seconds: the existing controller has a two-second deadband. With only 5% extra playback speed, ten seconds of delay takes roughly 200 seconds to remove. The test checks no seek or abrupt timeline jump, not physical display quality. Its headless report has 374 dropped frames out of 6,940 (5.39%); do not use it as smooth-rendering or 4K60 evidence. Repeated media isolates the policy, and this four-minute run is not a soak test. Reports stay in ignored `tools/results/catchup-smoke.json`.
