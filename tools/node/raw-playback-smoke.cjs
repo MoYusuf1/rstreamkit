@@ -7,7 +7,7 @@ const os=require('node:os'),{execFileSync}=require('node:child_process');
  let browser;
  try{
   const file=path.join(temporary,'six-seconds.ts');
-  execFileSync('ffmpeg',['-v','error','-f','lavfi','-i','testsrc2=size=160x90:rate=30:duration=6',
+  if(process.env.RSTREAMKIT_REPEAT_RAW!=='1')execFileSync('ffmpeg',['-v','error','-f','lavfi','-i','testsrc2=size=160x90:rate=30:duration=6',
    '-f','lavfi','-i','aevalsrc=0.06*sin(2*PI*440*t)|0.06*sin(2*PI*550*t)|0.06*sin(2*PI*660*t)|0.06*sin(2*PI*110*t)|0.06*sin(2*PI*770*t)|0.06*sin(2*PI*880*t):s=48000:d=6:c=5.1',
    '-c:v','libx264','-preset','ultrafast','-g','60','-c:a','ac3','-b:a','384k','-f','mpegts',file]);
   const clip=fs.readFileSync(path.join(__dirname,'../../tests/fixtures/h264_ac3_51.ts'));
@@ -40,6 +40,7 @@ const os=require('node:os'),{execFileSync}=require('node:child_process');
   });
   await expect.poll(()=>page.locator('#video').evaluate(v=>v.ended),{timeout:10000}).toBe(true);
   const report=await page.evaluate(()=>({sample:sample(),audio:rawAudio}));
+  assert(report.sample.playback.frames.total >= (process.env.RSTREAMKIT_REPEAT_RAW==='1'?149:179), 'all source pictures reach playback');
   assert(report.audio.max_rms>.005,'raw Dolby produces decoded sound');
   assert(report.sample.session.statuses.some(s=>s.status==='Ended'));
   assert(!report.sample.session.statuses.some(s=>/Failed|Unsupported|BrowserError/.test(s.status)));

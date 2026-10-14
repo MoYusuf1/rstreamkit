@@ -464,7 +464,25 @@ impl Transmuxer {
                 .flatten()
                 .min()
                 .unwrap_or(0);
-                if !reset_clock && (first as i64).abs_diff(expected) <= JUMP {
+                // Short encoder restarts can fall inside JUMP's two-second
+                // forward-gap allowance. Never write a run over earlier samples.
+                let video_step = video
+                    .get(1)
+                    .map_or(3003, |next| next.0.saturating_sub(video[0].0).max(1));
+                let audio_step = d.aac.map_or_else(
+                    || {
+                        d.sound.first().map_or(3000, |f| {
+                            u64::from(f.samples) * 90_000 / u64::from(f.rate.max(1))
+                        })
+                    },
+                    |c| 1024 * 90_000 / u64::from(c.sample_rate()),
+                );
+                let overlaps = video_first.is_some_and(|t| {
+                    (t as i64).saturating_add(video_step as i64) < vbase + self.vend as i64
+                }) || sound_first.is_some_and(|t| {
+                    (t as i64).saturating_add(audio_step as i64) < self.abase + self.aend as i64
+                });
+                if !reset_clock && !overlaps && (first as i64).abs_diff(expected) <= JUMP {
                     (vbase, self.abase, false)
                 } else {
                     (

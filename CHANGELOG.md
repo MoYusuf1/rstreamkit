@@ -2,6 +2,8 @@
 
 ## Unreleased (0.2.0)
 
+- Preserve pictures and coded-audio order across short raw clock restarts; emit complete audio PES packets without waiting for another start.
+
 - Yield audio decoding on an eight-millisecond work budget; process raw TS in bounded pieces and flush its final fragment cooperatively.
 
 - Shrink player diagnostics: full compressed Wasm and JavaScript falls by 766 bytes; reported seconds keep millisecond precision.

@@ -1250,3 +1250,43 @@ Fifteen byte checks cover AAC, mono AC-3, 5.1 AC-3, 5.1 E-AC-3 and MP2 at 187-by
 All budgets pass. Root native/Wasm clippy passes in four feature sets, native tests pass in three sets, harness lint/format checks pass, and seven Chrome regressions pass. The decoder suite passed before the timer-policy refinement; decoder code was unchanged. Reports: tools/results/raw-yield-smoke.json (fixed-count experiment), raw-budget-smoke.json and raw-budget-repeat.json (final policy), raw-playback-final.json, size-raw-budget.json.
 
 A separate repeated-clock playback diagnostic still ends early at 4.074666 seconds instead of roughly six. The prior synchronous runtime reproduces it, so it is not hidden as a successful playback case. Run the raw playback helper with RSTREAMKIT_REPEAT_RAW=1; this remains timeline/discontinuity work under #16/#25. Movies still use synchronous range processing, so #34 remains open.
+
+### Short raw-clock restarts and real HLS boundaries — 2026-10-14
+
+A three-clip raw stream could end early because short backward timestamp resets fit inside the old two-second forward-gap allowance. Track base times were reused, overwriting earlier output. Completed audio PES packets could also wait for another packet start, crossing a clock reset; numeric timestamp partitioning then reordered queued audio. The engine now detects overlap per track, emits completed length-delimited audio PES packets promptly, and partitions queued samples within their current clock epoch. Zero-length PES keeps its existing fallback. No dependency or per-sample index is added. The metadata split stays linear and uses the same two output vectors; it adds a linear scan to identify the epoch boundary.
+
+| Three repeated two-second raw clips | Before | Fixed |
+| --- | ---: | ---: |
+| Playback endpoint | 4.074666 s | 6.122666 s |
+| Browser frame counter | 50 | 150 |
+| Fixed-run dropped frames | — | 0 |
+| Full compressed Wasm + JS | 232,961 B | 233,328 B |
+| Chrome CI regressions | 7 | 8 |
+
+Native tests preserve every source picture and byte-for-byte coded audio order across AAC, mono/stereo/5.1 AC-3, 5.1 E-AC-3 and MP2, with 187-byte, 16-KiB and whole-input feeds: 36 property scenarios across two tests. Track times join exactly. Two additional real-fixture unit tests cover early complete-PES delivery and the zero-length fallback. The old runtime fails audio order and clock continuity; its Chrome counter stops at 50. The fixed raw check has a single buffered range [0.08, 6.122666], peak observed PCM RMS 0.036585 and no failed status. Browser frame counters are not a guarantee of unique physical presentations.
+
+Issue #16's real-stream acceptance uses the [Mux-hosted public test catalog](https://test-streams.mux.dev/) and its 720p Big Buck Bunny media playlist: https://test-streams.mux.dev/x36xhzz/url_0/193039199_mp4_h264_aac_hd_7.m3u8 . The playlist SHA-256 is ea751cf5a236a8e2742cb940e9eff0acfb2e84e1cead9aee10258a43b32910c3. Its durations include 9.95- and 10.05-second segments.
+
+| Real-network Chrome check | Result |
+| --- | ---: |
+| Wall time / media position | 120.886 / 120.717 s |
+| Resolution | 1280 × 720 |
+| Checked boundaries | 11 |
+| Buffered ranges at every checked boundary | 1 |
+| Dropped-frame increase at every boundary | 0 |
+| Whole-run browser frame counter / dropped | 7,247 / 0 |
+| Post-start stalls / seeks / hidden time | 0 / 0 / 0 |
+| Callback media-time step at boundaries | 16.655–16.667 ms |
+| Downloaded TS responses | 17 |
+| Final Wasm committed memory | 12,255,232 B |
+
+The standalone optional network script is tools/node/boundary-smoke.cjs; it is excluded from deterministic CI because the external source/network can change. Report: tools/results/real-boundary.json. Callback timing can be delayed by JavaScript, so the dropped-frame assertions use getVideoPlaybackQuality. This is one real 720p60 VOD source, not a 4K60, real-live provider matrix, VFR guarantee or long soak.
+
+| Compressed Wasm + JS | Before | Fixed |
+| --- | ---: | ---: |
+| Live | 108,121 B | 108,548 B |
+| Live with sound | 211,720 B | 212,290 B |
+| VOD | 129,213 B | 129,660 B |
+| Full | 232,961 B | 233,328 B |
+
+All budgets pass. Root native/Wasm feature lints, three native test configurations, the decoder suite, fresh 5,000 bounded parser cases (seed 20261014), Node output checks and eight Chrome playback regressions pass. Added PES tests and expanded fixture arrays also pass their targeted checks. Reports remain in ignored tools/results. Issue #16 acceptance is covered on Chrome; other platforms, provider quirks and endurance remain in #24/#25/#47.
