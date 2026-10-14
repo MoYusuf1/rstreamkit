@@ -9,6 +9,7 @@ Breaking changes:
 - Additional public enums are non-exhaustive; Demuxed gains passthrough metadata.
 
 Changes:
+- Fall back after two unusable live segments; respect manual quality choices and delay automatic upward retry.
 - Tune the small player per package: measured MP2 Wasm packaging falls 16.38 → 13.37 ms, with a slightly smaller full download.
 - Return stereo PCM directly instead of allocating an unused second output buffer.
 - Restore mono AC-3 sound in stereo output by routing its gain to the center slot; mono PCM intentionally changes from silence.

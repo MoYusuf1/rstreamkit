@@ -88,6 +88,7 @@ node tools/node/retry-smoke.cjs
 node tools/node/buffer-smoke.cjs
 node tools/node/session-smoke.cjs
 node tools/node/abr-smoke.cjs
+node tools/node/abr-failure-smoke.cjs
 node tools/node/mono-smoke.cjs
 node tools/node/resilience-smoke.cjs
 node tools/node/pause-smoke.cjs
@@ -137,3 +138,8 @@ node tools/node/opt-compare.cjs tools/results/profiles/s/rstreamkit_harness.js t
 uses `wasm-opt -Oz` and saves compiler settings, dependency locks and source/artifact
 hashes. Comparison checks decoded PCM checksums and output lengths before timing.
 CPU measurements are Node harness processing, not browser startup or frame rates.
+
+The ABR failure check stops the higher encoder and keeps the lower encoder
+advancing. It requires fallback after two failures and playback past the first
+healthy segment. `RSTREAMKIT_PLAYER_DIR` can load preserved full-player artifacts
+for a before/after regression check.

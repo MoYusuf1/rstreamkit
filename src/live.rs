@@ -53,9 +53,42 @@ pub(crate) fn buffer_rate(previous: f64, appended: usize, seconds: f64) -> f64 {
 #[derive(Default)]
 pub(crate) struct Abr {
     throughput: f64,
-    headroom: u32,
+    headroom: u8,
+    failures: u8,
+    recovery: u8,
 }
 impl Abr {
+    pub fn succeeded(&mut self) {
+        self.failures = 0;
+        self.recovery = self.recovery.saturating_sub(1);
+    }
+
+    /// Two consecutive unusable segments try the next lower compatible level.
+    pub fn failed<'a>(
+        &mut self,
+        variants: &'a [crate::hls::Variant],
+        current: &str,
+        requested: Option<&str>,
+    ) -> Option<&'a crate::hls::Variant> {
+        if let Some(uri) = requested {
+            return variants.iter().find(|v| v.uri == uri && v.uri != current);
+        }
+        self.headroom = 0;
+        self.failures = self.failures.saturating_add(1);
+        if self.failures < 2 {
+            return None;
+        }
+        self.failures = 0;
+        let now = variants.iter().find(|v| v.uri == current)?;
+        let lower = crate::hls::pick_variant_for(variants, now.bandwidth.saturating_sub(1))?;
+        if lower.bandwidth >= now.bandwidth {
+            return None;
+        }
+        // Do not immediately retry a broken higher level based on fast low-level downloads.
+        self.recovery = 8;
+        Some(lower)
+    }
+
     pub fn observe(&mut self, bytes: usize, seconds: f64) {
         if seconds > 0.0 && seconds.is_finite() {
             let sample = bytes as f64 * 8.0 / seconds;
@@ -78,6 +111,10 @@ impl Abr {
         if candidate.bandwidth < now.bandwidth {
             self.headroom = 0;
             return Some(candidate);
+        }
+        if self.recovery != 0 {
+            self.headroom = 0;
+            return None;
         }
         if candidate.bandwidth > now.bandwidth && buffered >= target * 2.0 {
             self.headroom += 1;
@@ -230,6 +267,80 @@ mod tests {
             assert_eq!(throttle_delay_ms(1.0, 0.25, rate), 250);
         }
     }
+    fn fallback_variants() -> Vec<crate::hls::Variant> {
+        [("high", 2_000_000), ("low", 200_000), ("middle", 800_000)]
+            .into_iter()
+            .map(|(uri, bandwidth)| crate::hls::Variant {
+                uri: uri.into(),
+                bandwidth,
+                ..Default::default()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn repeated_failures_choose_the_nearest_lower_supported_variant() {
+        let mut variants = fallback_variants();
+        let mut abr = Abr::default();
+        assert!(abr.failed(&variants, "high", None).is_none());
+        assert_eq!(abr.failed(&variants, "high", None).unwrap().uri, "middle");
+        variants[2].codecs = Some("hvc1.1.6.L120.B0".into());
+        assert!(abr.failed(&variants, "high", None).is_none());
+        assert_eq!(abr.failed(&variants, "high", None).unwrap().uri, "low");
+        assert!(abr.failed(&variants, "low", None).is_none());
+        assert!(abr.failed(&variants, "low", None).is_none());
+        assert!(abr.failed(&[], "unknown", None).is_none());
+        assert!(abr.failed(&[], "unknown", None).is_none());
+    }
+
+    #[test]
+    fn failures_respect_a_manual_lock_and_apply_a_new_manual_request() {
+        let variants = fallback_variants();
+        let mut abr = Abr::default();
+        for _ in 0..10 {
+            assert!(abr.failed(&variants, "high", Some("high")).is_none());
+        }
+        assert_eq!(
+            abr.failed(&variants, "high", Some("low")).unwrap().uri,
+            "low"
+        );
+        assert!(abr.failed(&variants, "high", None).is_none());
+    }
+
+    #[test]
+    fn a_good_segment_resets_the_failure_streak_without_a_timing_sample() {
+        let variants = fallback_variants();
+        let mut abr = Abr::default();
+        assert!(abr.failed(&variants, "high", None).is_none());
+        abr.succeeded();
+        assert!(abr.failed(&variants, "high", None).is_none());
+        assert_eq!(abr.failed(&variants, "high", None).unwrap().uri, "middle");
+    }
+
+    #[test]
+    fn failure_recovery_waits_for_healthy_segments_before_retrying_upward() {
+        let variants = fallback_variants();
+        let mut abr = Abr::default();
+        abr.failed(&variants, "high", None);
+        assert_eq!(abr.failed(&variants, "high", None).unwrap().uri, "middle");
+        abr.observe(2_000_000, 1.0);
+        for _ in 0..7 {
+            abr.succeeded();
+            assert!(abr.choose(&variants, "middle", 20.0, 2.0).is_none());
+        }
+        abr.succeeded();
+        assert!(abr.choose(&variants, "middle", 20.0, 2.0).is_none());
+        assert!(abr.choose(&variants, "middle", 20.0, 2.0).is_none());
+        assert_eq!(
+            abr.choose(&variants, "middle", 20.0, 2.0).unwrap().uri,
+            "high"
+        );
+        assert_eq!(
+            std::mem::size_of::<Abr>(),
+            std::mem::size_of::<(f64, u32)>()
+        );
+    }
+
     #[test]
     fn adaptive_selection_steps_down_then_recovers_with_headroom() {
         let variants = vec![
