@@ -115,6 +115,111 @@ pub enum FetchError {
 pub trait Sink {
     async fn append(&mut self, bytes: &mut [u8]) -> Result<(), String>;
 }
+
+/// Host playback buffer. Only I/O and playback-clock access belong here;
+/// [`trim_buffer`] and [`wait_for_room`] own the shared removal/wait policy.
+/// Pending operations must release their work when dropped. No `Send` bound is required.
+#[allow(async_fn_in_trait)]
+pub trait PlaybackBuffer {
+    fn position(&self) -> f64;
+    fn ahead(&self) -> f64;
+    fn playback_rate(&self) -> f64;
+    /// Cross an exhausted range's nearby gap, respecting the host's paused state.
+    fn cross_gap(&mut self, target_seconds: f64);
+    /// Wait for outstanding writes/removals, then return the oldest buffered time.
+    async fn oldest(&mut self) -> Result<Option<f64>, String>;
+    /// Remove this time range and wait for completion; report host errors.
+    async fn remove(&mut self, range: Range<f64>) -> Result<(), String>;
+}
+
+/// Drop old media only when more than one second can be removed.
+/// The host must preserve dependent frames according to its buffer semantics.
+pub async fn trim_buffer(buffer: &mut impl PlaybackBuffer, keep: f64) -> Result<(), String> {
+    if !keep.is_finite() || keep < 0.0 {
+        return Err("invalid buffer retention".into());
+    }
+    if let Some(start) = buffer.oldest().await? {
+        let cut = buffer.position() - keep;
+        if start.is_finite() && cut.is_finite() && cut - start > 1.0 {
+            buffer.remove(start..cut).await?;
+        }
+    }
+    Ok(())
+}
+
+#[derive(Debug, PartialEq)]
+#[non_exhaustive]
+pub enum BufferWait {
+    Ready { waited: bool },
+    Interrupted,
+    Cancelled,
+}
+
+/// Apply backpressure before requesting more media. `limits` is (ahead, behind)
+/// in seconds. A live host should refresh its playlist after any wait or interrupt;
+/// finite input must keep its place and continue to the last segment.
+/// Stop checks happen between awaits. Drop this future to cancel pending host work.
+pub async fn wait_for_room(
+    clock: &impl Clock,
+    buffer: &mut impl PlaybackBuffer,
+    limits: (f64, f64),
+    target_seconds: f64,
+    cancelled: impl Fn() -> bool,
+    interrupted: impl Fn() -> bool,
+) -> Result<BufferWait, String> {
+    let (ahead, behind) = limits;
+    if !ahead.is_finite() || ahead < 0.0 || !behind.is_finite() || behind < 0.0 {
+        return Err("invalid buffer limits".into());
+    }
+    let mut waited = false;
+    loop {
+        if cancelled() {
+            return Ok(BufferWait::Cancelled);
+        }
+        if interrupted() {
+            return Ok(BufferWait::Interrupted);
+        }
+        let buffered = buffer.ahead();
+        if !buffered.is_finite() {
+            return Err("invalid buffered duration".into());
+        }
+        if buffered <= ahead {
+            return Ok(BufferWait::Ready { waited });
+        }
+        buffer.cross_gap(target_seconds);
+        trim_buffer(buffer, behind).await?;
+        if cancelled() {
+            return Ok(BufferWait::Cancelled);
+        }
+        if interrupted() {
+            return Ok(BufferWait::Interrupted);
+        }
+        // Gap recovery can create room without a timer tick.
+        let buffered = buffer.ahead();
+        if !buffered.is_finite() {
+            return Err("invalid buffered duration".into());
+        }
+        if buffered <= ahead {
+            return Ok(BufferWait::Ready { waited: true });
+        }
+        clock
+            .sleep(Duration::from_millis(buffer_delay_ms(
+                buffered,
+                ahead,
+                buffer.playback_rate(),
+            )))
+            .await;
+        waited = true;
+    }
+}
+
+/// Wake near the threshold, bounded to 10–250 ms even with a paused/invalid clock.
+pub(crate) fn buffer_delay_ms(buffered: f64, ahead: f64, rate: f64) -> u64 {
+    if !buffered.is_finite() || !ahead.is_finite() || !rate.is_finite() || rate <= 0.0 {
+        return 250;
+    }
+    ((buffered - ahead) * 1000.0 / rate).clamp(10.0, 250.0) as u64
+}
 /// Deliver fragments in order without concatenating or copying their media payloads.
 pub async fn append_fragments(
     fragments: &mut [crate::Fragment],

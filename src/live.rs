@@ -77,8 +77,12 @@ impl Window {
 }
 
 /// Cross a nearby gap only after the current range is exhausted, never over playable media.
-pub(crate) fn gap_target(ranges: &[(f64, f64)], time: f64, limit: f64) -> Option<f64> {
-    for &(start, end) in ranges {
+pub(crate) fn gap_target(
+    ranges: impl IntoIterator<Item = (f64, f64)>,
+    time: f64,
+    limit: f64,
+) -> Option<f64> {
+    for (start, end) in ranges {
         if time >= start && time < end - 0.15 {
             return None;
         }
@@ -142,15 +146,6 @@ pub(crate) fn buffer_rate(previous: f64, appended: usize, seconds: f64) -> f64 {
     measured.max(0.8 * previous + 0.2 * measured)
 }
 
-/// Wake near the buffer threshold instead of overshooting it by a fixed timer
-/// tick. Bound wake frequency and tolerate a paused/invalid playback clock.
-pub(crate) fn throttle_delay_ms(buffered: f64, ahead: f64, rate: f64) -> u64 {
-    if !buffered.is_finite() || !ahead.is_finite() || !rate.is_finite() || rate <= 0.0 {
-        return 250;
-    }
-    ((buffered - ahead) * 1000.0 / rate).clamp(10.0, 250.0) as u64
-}
-
 #[derive(Default)]
 pub(crate) struct Abr {
     throughput: f64,
@@ -197,14 +192,14 @@ impl Abr {
 mod tests {
     use super::*;
     use crate::hls::{self, Parsed};
-    use crate::net::retry_delay;
+    use crate::net::{buffer_delay_ms as throttle_delay_ms, retry_delay};
     #[test]
     fn recovered_live_gaps_do_not_block_a_full_buffer_or_skip_playable_media() {
         let ranges = [(0.0, 18.026), (20.0, 48.021)];
-        assert_eq!(gap_target(&ranges, 17.944, 4.0), Some(20.0));
-        assert_eq!(gap_target(&ranges, 12.0, 10.0), None);
-        assert_eq!(gap_target(&ranges, 17.944, 0.5), None);
-        assert_eq!(gap_target(&ranges, 48.021, 4.0), None);
+        assert_eq!(gap_target(ranges, 17.944, 4.0), Some(20.0));
+        assert_eq!(gap_target(ranges, 12.0, 10.0), None);
+        assert_eq!(gap_target(ranges, 17.944, 0.5), None);
+        assert_eq!(gap_target(ranges, 48.021, 4.0), None);
         let mut window = Window::default();
         window.consumed(&playlist(100, &["old"]).segments[0]);
         assert!(window.discontinuous(&playlist(103, &["new"]).segments[0]));

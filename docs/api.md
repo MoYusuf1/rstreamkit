@@ -88,3 +88,13 @@ return immediately. Stop checks run between awaits; drop the future to cancel a
 pending request or timer. Host `Fetch` and `Clock` implementations must release
 pending work on drop. Browser timers now clear on drop too. Buffer trimming and
 throttling still belong to the browser session; the full shared session is pending.
+
+`net::PlaybackBuffer` supplies playback position, buffered duration, gap crossing
+and async range removal. `net::trim_buffer` owns the rewind cutoff;
+`net::wait_for_room` owns the actual backpressure loop through `Clock`.
+`BufferWait` distinguishes room available (including whether backpressure was
+needed, even if gap recovery freed space before a timer), go-live
+interruption and cancellation. Limits are finite, nonnegative seconds. Live
+hosts refresh after waiting/interruption; finite hosts keep their current place.
+Dropping a pending future releases host work. The browser uses these helpers;
+playlist selection, refresh and full session orchestration are still pending.

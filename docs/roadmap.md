@@ -79,7 +79,7 @@ against the reviewed code; being implemented is not the same as passing acceptan
 | #14 | Stats and catch-up implemented | After a ten-second stall, measure return to target latency; state when a seek is necessary | 3 |
 | #16 | Boundary snapping implemented | Real multi-segment stream shows continuous buffering and no repeated boundary jitter | 3 |
 | #22 | Library controls/stats implemented | Verify the consuming client's overlay and go-live adoption; external app work is not in this repo | 6 |
-| #23 | Shared retry loop; nine native fault tests | Extract throttle/trim/session control and test remaining provider scenarios natively | 2 |
+| #23 | Shared retry, trim and backpressure; 21 native control tests | Extract full session control and test remaining provider scenarios natively | 2 |
 | #24 | CI exists; browser matrix incomplete | Current main checks plus actual Chrome/Edge/Safari playback on recorded hardware | 0, 4 |
 | #25 | Accelerated soak exists | Mixed parameter/discontinuity fixtures and four hours of real-time playback with stable resources | 4 |
 | #26 | Tracking issue | Keep this queue and acceptance ledger synchronized; do not close it after only one milestone | All |
