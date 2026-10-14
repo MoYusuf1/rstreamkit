@@ -1367,3 +1367,75 @@ and `startup-complete.json` under ignored `tools/results/`; they record source
 and exact emitted asset hashes. The retained-symbol and build-profile results
 above remain the CPU/size tradeoff evidence. Playback memory and processing
 measurements are separate; this startup test does not replace them.
+
+### Reuse FLAC channel scratch storage — 2026-10-14
+
+The encoder now reuses the sample and prediction scratch vectors for its second
+channel. It keeps the same predictor search, arithmetic and output bytes, without
+retaining buffers between calls. Complexity remains O(n) time and O(n) temporary
+space per frame. The improvement is less allocation churn, not a smaller
+asymptotic bound or demonstrated peak-memory reduction.
+
+| One 1,536-sample stereo frame, number 128 | Before | After |
+| --- | ---: | ---: |
+| Nonconstant frame allocations | 6 | 4 |
+| Nonconstant total allocation requests | 30,749 B | 18,461 B |
+| Constant frame allocations | 4 | 3 |
+| Constant total allocation requests | 18,461 B | 12,317 B |
+| Reallocations, either case | 1 | 1 |
+
+Counts include the returned frame and its number encoding. Reusing the two
+scratch buffers halves their total requested bytes; the total nonconstant
+frame requests fall 40%. This is native test-allocator evidence, not browser
+RSS or committed-memory savings. Each frame drops both scratch buffers.
+
+Three fresh Node processes each compare nine alternating pairs of five calls,
+after five warmup calls per module. Both modules use the shipped balanced
+profile, Rust 1.99.0 and wasm-opt -Oz. Medians below are the medians of the three
+process medians, on Ryzen 7 5700 / Linux; hashes and tool versions are recorded
+in each build report. FLAC runs use predecoded PCM; transmux includes input
+copying, decoding and packaging. The largest observed paired whole-transmux
+regression was 1.8%, with mixed signs across repeats. No CPU speedup is claimed;
+this does not meet issue #45's 10% CPU gate and leaves that issue open. The
+allocation improvement is retained for #48.
+
+| Input / stage | Before | After |
+| --- | ---: | ---: |
+| bbb_480p.ts / transmux | 0.145 ms | 0.147 ms |
+| h264_ac3_st.ts / transmux | 6.922 ms | 6.921 ms |
+| h264_ac3_st.ts / flac | 4.065 ms | 4.036 ms |
+| h264_ac3_51.ts / transmux | 10.453 ms | 10.442 ms |
+| h264_ac3_51.ts / flac | 3.696 ms | 3.695 ms |
+| h264_eac3_51.ts / transmux | 12.212 ms | 12.160 ms |
+| h264_eac3_51.ts / flac | 3.699 ms | 3.677 ms |
+| h264_mp2.ts / transmux | 13.542 ms | 13.521 ms |
+| h264_mp2.ts / flac | 4.007 ms | 3.983 ms |
+
+| Engine compressed Wasm + JS | Before | After |
+| --- | ---: | ---: |
+| live | 108,548 B | 108,638 B |
+| live-sound | 212,290 B | 212,104 B |
+| vod | 130,352 B | 130,422 B |
+| full | 234,032 B | 234,117 B |
+
+All engine and shell budgets pass. Full engine grows 85 bytes (0.04%); including
+the unchanged HTML, full startup is 236,867 Brotli bytes. Live and VOD also grow
+slightly because the FLAC writer is available without codec decoders. The
+sound-only build shrinks 186 bytes; compression/code generation can differ by
+feature set.
+
+Complete-output fingerprints match the unchanged encoder for five integer
+signal patterns × six frame sizes × five frame numbers (150 frames). Patterns
+include constant, ramp, seeded noise, extremes and mixed constant/predictable
+channels. The existing independent FFmpeg lossless roundtrip and programme
+conversion checks pass, as do all native feature checks and Node decoder/output
+checks. Chrome playback validation is recorded with the final PR checks.
+
+Reproduce the allocation report with
+`cargo test --release measure_flac_scratch -- --ignored --nocapture`.
+Paired builds use `tools/profile_harness.py --profile balanced`, then
+`tools/node/opt-compare.cjs BEFORE.js AFTER.js`. Ignored reports are
+`flac-scratch-native-before.log`, `flac-scratch-native-after.log`,
+`flac-scratch-paired-{1,2,3}.json` and `size-flac-scratch.json`. Baseline and
+candidate build.json files include exact source and Wasm hashes. This is a
+small fixture comparison, not a varied programme corpus or 4K60 result.
