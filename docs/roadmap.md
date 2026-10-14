@@ -89,7 +89,7 @@ against the reviewed code; being implemented is not the same as passing acceptan
 | #34 | Yielding exists on live path | Measure actual current decoder on live, movies, AES and raw TS; compare yielding/worker CPU, startup and frame drops | 1, 4 |
 | #37 | Wait cancellation implemented | Closure during trim and removal of an unrelated buffer; no hang or false completion | 2 |
 | #42 | Five CLI workloads recorded; remaining comparison work open | Visible baseline, in-process comparison and new wasm figures; explain the old frame-drop result | 0 |
-| #43 | Five bounded parser targets and four regression tests implemented; CI pending | Review [campaign evidence and limits](../tools/fuzz/README.md); longer coverage-guided campaigns remain useful | 2 |
+| #43 | Five bounded parser targets and four regressions; integrated 5,000-case run passes, refreshed PR CI pending | Review [campaign evidence and limits](../tools/fuzz/README.md); longer coverage-guided campaigns remain useful | 2 |
 | #44 | Local-file CLI now implemented | Rust URL transport uses the shared live session, cancellation and bounded outputs; no duplicate player loop | 5 |
 | #45 | Profiling and bit-exact decoder speedups already landed | Re-profile native AND wasm; benchmark remaining kernels and keep or reject SIMD/algorithm changes with quality gates | 5 |
 | #46 | Deferred upstream contribution | Prepare an attributable patch when requested; do not message upstream now | Later |

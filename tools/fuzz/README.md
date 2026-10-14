@@ -81,3 +81,13 @@ The coverage-guided targets compile and lint locally, but their nightly/ASan
 campaigns have not run here. CI uses the stable seeded runner; its remote result
 must be checked after publishing. The sound decoder and browser endurance are
 separate work. No FFmpeg speed comparison is made by these results.
+
+
+## Integration refresh — 2026-10-13
+
+Commit `de1964e` combines current playback/audio/profile work with these parser
+fixes. A fresh seed-20261013 campaign passes all 5,000 cases within the same
+limits. Required Rust checks, coverage-target lints, four regressions, decoder
+checks, five Chrome playback cases and all four player download budgets pass.
+This refresh is separate from the earlier 55,000-case evidence above. Refreshed
+PR CI still gates merge; longer coverage-guided/ASan work remains useful.
