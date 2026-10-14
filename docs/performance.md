@@ -1170,3 +1170,19 @@ The guarded sequence lookup now lives in `Session::next_index`, alongside the sh
 | Full | 232,644 B | 232,581 B |
 
 All four budgets pass. The final native lookup-only benchmark walks 20,000 segments in a median 0.311 ms over seven release runs (0.289–0.324 ms, Ryzen 7 5700/Linux, Rust 1.99.0). The old 120.452 ms result above predates the session refactor; it is historical, not a fresh main comparison. This is not a whole-player or FFmpeg speed claim. Fresh integrated validation also passes the root feature checks, decoder suite and 5,000 bounded seeded parser cases.
+
+### Preserve selected audio across variants — 2026-10-13
+
+Changing quality now keeps the selected external audio language. Changing track URLs also keeps the consumed segment and transmuxer clock, so a late selection continues from the current timeline. The selector scans existing rendition metadata once, uses constant extra space, and adds no runtime dependency. Harness-only controls let the regression exercise the public Rust Player API without adding minimal-player exports.
+
+| Measure | Main after PR #50 | Language fix |
+| --- | ---: | ---: |
+| Chrome CI playback regressions | 5 | 6 |
+| Live compressed Wasm + JS | 108,342 B | 108,356 B |
+| Live with sound | 211,823 B | 211,684 B |
+| VOD | 129,294 B | 129,327 B |
+| Full | 232,581 B | 232,742 B |
+
+All budgets pass. A mixed master advertises a higher-bandwidth HEVC variant; Chrome fetches none of its playlists and plays H.264. After six seconds, the test changes English (440 Hz) to Spanish (880 Hz), then selects the lower variant. Sequence 10 is the first lower-level audio; its playback begins around 14 seconds, and the test observes Spanish tone samples after 14.5 seconds. The standalone final run reached 15.36 seconds with 17 matching lower-level tone samples, no English tone after that boundary, and no failed status. A second run inside the six-test Playwright suite also passes. The same final test fails against main's runtime at the language-preservation assertion.
+
+Fixtures are generated continuous TS segments; both quality levels share video bytes to isolate routing. An earlier repeated-clip experiment had artificial clock resets and is not acceptance evidence. Web Audio verifies decoded PCM, not speaker hardware. This covers the software routing acceptance for #8; Edge/Safari and long high-resolution acceptance remain separate.

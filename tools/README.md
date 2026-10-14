@@ -167,3 +167,5 @@ The ABR failure check stops the higher encoder and keeps the lower encoder
 advancing. It requires fallback after two failures and playback past the first
 healthy segment. `RSTREAMKIT_PLAYER_DIR` can load preserved full-player artifacts
 for a before/after regression check.
+
+The Chrome suite also runs `tools/node/rendition-smoke.cjs`: a mixed HEVC/H.264 master, decoded English/Spanish tones, a late language change and a quality switch. It uses development-only harness controls and generated TS fixtures. Build the harness with `bash tools/build.sh`; run with the same `NODE_PATH` and `RSTREAMKIT_URL` settings as the other browser smoke tools.

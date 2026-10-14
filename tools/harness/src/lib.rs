@@ -344,3 +344,25 @@ pub fn stats() -> String {
             .unwrap_or_default()
     })
 }
+
+#[wasm_bindgen]
+pub fn set_audio_track(language: &str) -> Result<(), JsValue> {
+    PLAYER.with(|p| {
+        p.borrow()
+            .as_ref()
+            .ok_or_else(|| JsValue::from_str("no active player"))?
+            .set_audio_track(language)
+            .map_err(|error| JsValue::from_str(&error))
+    })
+}
+
+#[wasm_bindgen]
+pub fn set_variant(uri: Option<String>) -> Result<(), JsValue> {
+    PLAYER.with(|p| {
+        p.borrow()
+            .as_ref()
+            .ok_or_else(|| JsValue::from_str("no active player"))?
+            .set_variant(uri.as_deref())
+            .map_err(|error| JsValue::from_str(&error))
+    })
+}
