@@ -1156,3 +1156,17 @@ All budgets pass. Small code-generation/compression differences are not evidence
 that bounds checking universally shrinks programs. Five Chrome playback cases
 pass on the exact integrated full build. Refresh PR #51 CI before merging; #43
 closes only after its seeded CI run and integration are confirmed on main.
+
+### Browser-test integration — 2026-10-13
+
+The guarded sequence lookup now lives in `Session::next_index`, alongside the shared playlist controller. Normal consecutive sequences check one offset and full segment identity; broken numbering, changed URLs and byte ranges keep the linear recovery path. The batch iterator already walks playlists once; this shortcut helps repeated individual lookups without adding an index or runtime dependency.
+
+| Measure | Main after parser PR #51 | Integrated browser PR #50 |
+| --- | ---: | ---: |
+| Automated Chrome playback regressions in CI | 0 | 5 |
+| Live compressed Wasm + JS | 108,210 B | 108,342 B |
+| Live with sound | 211,787 B | 211,823 B |
+| VOD | 129,283 B | 129,294 B |
+| Full | 232,644 B | 232,581 B |
+
+All four budgets pass. The final native lookup-only benchmark walks 20,000 segments in a median 0.311 ms over seven release runs (0.289–0.324 ms, Ryzen 7 5700/Linux, Rust 1.99.0). The old 120.452 ms result above predates the session refactor; it is historical, not a fresh main comparison. This is not a whole-player or FFmpeg speed claim. Fresh integrated validation also passes the root feature checks, decoder suite and 5,000 bounded seeded parser cases.
