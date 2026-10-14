@@ -3,17 +3,19 @@
 import argparse
 import hashlib
 import json
+import os
 from pathlib import Path
 import subprocess
 import sys
+import tomllib
 
 ROOT = Path(__file__).resolve().parents[1]
 PLAYER = ROOT / "tools/player"
 FLAVORS = {"live": [], "live-sound": ["sound"], "vod": ["vod"], "full": ["sound", "vod"]}
 
 
-def run(*args):
-    result = subprocess.run(args, cwd=ROOT, check=True, text=True, capture_output=True)
+def run(*args, env=None):
+    result = subprocess.run(args, cwd=ROOT, check=True, text=True, capture_output=True, env=env)
     if result.stderr:
         print(result.stderr, file=sys.stderr, end="")
     return result.stdout.strip()
@@ -24,28 +26,56 @@ def digest(path):
 
 
 def main():
+    profile = tomllib.loads((PLAYER / "Cargo.toml").read_text())["profile"]["release"]
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output", type=Path, default=ROOT / "tools/results/size.json")
     parser.add_argument("--check-budgets", action="store_true",
                         help="fail when wasm + JS Brotli bytes exceed tools/player/budgets.json")
+    parser.add_argument("--opt-level", choices=["s", "z", "3"], default=str(profile["opt-level"]),
+                        help="compare code-size and CPU tradeoffs; default matches the shipped release profile")
+    parser.add_argument("--codec-opt-level", choices=["s", "z", "3"],
+                        help="override AC-3, MP2 and codec-core packages separately")
+    parser.add_argument("--mp2-opt-level", choices=["s", "z", "3"],
+                        help="override MP2 independently after the shared codec setting")
     args = parser.parse_args()
+    package_levels = {}
+    if args.codec_opt_level:
+        package_levels = {name: args.codec_opt_level for name in
+                          ["rstreamkit-ac3", "oxideav-mp2", "oxideav-core"]}
+    if args.mp2_opt_level:
+        package_levels["oxideav-mp2"] = args.mp2_opt_level
+    effective_levels = {name: str(settings["opt-level"]) for name, settings in
+                        profile.get("package", {}).items() if "opt-level" in settings}
+    effective_levels.update(package_levels)
+    overrides = {"CARGO_PROFILE_RELEASE_OPT_LEVEL": args.opt_level,
+                 "CARGO_PROFILE_RELEASE_LTO": "true",
+                 "CARGO_PROFILE_RELEASE_CODEGEN_UNITS": "1",
+                 "CARGO_PROFILE_RELEASE_PANIC": "abort"}
+    cargo_env = {**os.environ, **overrides}
     report = {
         "schema": 1,
         "revision": run("git", "rev-parse", "HEAD"),
         "working_tree": run("git", "status", "--porcelain"),
         "tools": {name: run(name, "--version") for name in
                   ["rustc", "cargo", "wasm-bindgen", "wasm-opt", "brotli"]},
-        "recipe": {"profile": "release: opt-level=s, lto=true, codegen-units=1, panic=abort",
+        "recipe": {"profile": f"release: opt-level={args.opt_level}, lto=true, codegen-units=1, panic=abort",
+                   "cargo_profile_overrides": overrides,
+                   "codec_opt_level": args.codec_opt_level,
+                   "package_opt_levels": effective_levels,
                    "wasm_opt": "-Oz", "brotli_quality": 11,
                    "target": "wasm32-unknown-unknown", "entry": "tools/player/src/lib.rs"},
         "flavors": [],
     }
     for name, features in FLAVORS.items():
-        command = ["cargo", "build", "--offline", "--manifest-path", str(PLAYER / "Cargo.toml"),
+        command = ["cargo"]
+        for package, level in package_levels.items():
+            setting = level if level.isdigit() else f'"{level}"'
+            command += ["--config", f'profile.release.package.{package}.opt-level={setting}']
+        command += ["build", "--offline", "--manifest-path", str(PLAYER / "Cargo.toml"),
                    "--target", "wasm32-unknown-unknown", "--release", "--no-default-features"]
         if features:
             command += ["--features", ",".join(features)]
-        run(*command)
+        run(*command, env=cargo_env)
         output = ROOT / "tools/web/player" / name
         output.mkdir(parents=True, exist_ok=True)
         run("wasm-bindgen", str(PLAYER / "target/wasm32-unknown-unknown/release/rstreamkit_player.wasm"),

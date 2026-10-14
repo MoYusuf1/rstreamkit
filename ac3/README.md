@@ -12,7 +12,8 @@ those terms still apply to this directory. Thank you to its author: rstreamkit p
 browsers because of this work.
 
 rstreamkit keeps its own copy so it can tune the decoder for its use. The changes are below. Every
-one is measured, and the decoded output is byte-identical to oxideav-ac3 0.0.11's.
+speed change is measured and preserves oxideav-ac3 0.0.11 output. The mono
+routing correction below intentionally restores sound that the original made silent.
 
 ## What changed from oxideav-ac3 0.0.11
 
@@ -36,16 +37,23 @@ Results on the files it was measured with:
 | --- | ---: | ---: |
 | 6 s, AC-3 5.1, 448 kbit/s | 40.3 ms | 20.0 ms |
 | 4.2 s of programme audio, AC-3 | 10.4 ms | 5.9 ms |
-| 4 s, AC-3 stereo | 5.75 ms | 2.74 ms |
+| 4 s, AC-3 mono (historical silent output; invalid audio-speed comparison) | 5.75 ms | 2.74 ms |
 | 2 s, AC-3 5.1 | 9.08 ms | 3.59 ms |
 | 2 s, E-AC-3 5.1 | 9.70 ms | 4.36 ms |
 
 The cost is a little size: a browser page built with rstreamkit grows by 6.6 KB brotli-compressed
 (+2.1%), and the native command by 16.9 KB (+1.1%).
 
-Decoded PCM is byte-identical to oxideav-ac3 0.0.11's on all of these inputs, and the full test suite
-passes. rstreamkit's `sound` tests pin a checksum of decoded fixtures to that original output, so a
-change that alters a single sample fails there.
+The speed changes preserve original decoded PCM. The 4 s `h264_ac3.ts` fixture
+is mono (the earlier table called it stereo); its original pinned output was
+768,000 zero PCM bytes. The mono routing fix intentionally changes that output.
+Stereo, 5.1 AC-3 and E-AC-3 retain their existing output checks. The checksum test
+now pins corrected mono output as well, and an independent FFmpeg test covers it.
+
+Mono routing: LoRo and LtRt now place their existing mono gains in the center
+slot, matching the source mapping used by `Downmix::apply`. Positive and negative
+center samples reach both outputs. This fixes silent mono without adding a
+runtime dependency or changing other channel layouts.
 
 Run the decoder's own tests with:
 

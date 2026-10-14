@@ -20,10 +20,10 @@ fn video() -> web_sys::HtmlVideoElement {
 fn report(status: mse::Status) {
     web_sys::console::log_1(&format!("{status:?}").into());
     let global = js_sys::global();
-    if let Ok(f) = js_sys::Reflect::get(&global, &"onStatus".into()) {
-        if let Some(f) = f.dyn_ref::<js_sys::Function>() {
-            let _ = f.call1(&global, &format!("{status:?}").into());
-        }
+    if let Ok(f) = js_sys::Reflect::get(&global, &"onStatus".into())
+        && let Some(f) = f.dyn_ref::<js_sys::Function>()
+    {
+        let _ = f.call1(&global, &format!("{status:?}").into());
     }
 }
 #[wasm_bindgen]
@@ -252,6 +252,12 @@ impl ProfileStream {
     }
 }
 
+impl Default for ProfileStream {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 #[wasm_bindgen]
 pub struct ProfileAudio {
     pcm: Vec<Vec<i16>>,
@@ -282,6 +288,17 @@ impl ProfileAudio {
             .collect();
         Ok(ProfileAudio { pcm })
     }
+    /// Development-only checksum of decoded PCM, excluding packaging.
+    pub fn pcm_checksum(&self) -> u64 {
+        self.pcm
+            .iter()
+            .flatten()
+            .flat_map(|sample| sample.to_le_bytes())
+            .fold(0xcbf2_9ce4_8422_2325, |hash, byte| {
+                (hash ^ u64::from(byte)).wrapping_mul(0x0100_0000_01b3)
+            })
+    }
+
     pub fn raw_size(&self) -> usize {
         self.pcm.iter().map(|p| p.len() * 2).sum()
     }

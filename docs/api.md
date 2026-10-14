@@ -7,7 +7,7 @@ The crate root (`Transmuxer`, streamed `Segment`, `Continuous`, `Output`, `Init`
 playlist inspection and variant selection. With `vod`, `vod::Movie` and `Session`
 support indexed playback and seeking. `cmaf::Rebaser` inspects initialization segments and
 rebases supported fragmented MP4 clocks on native and wasm targets.
-`net::{Fetch, Response, FetchError, Sink}` supports native and browser hosts. On wasm, `mse::{Fetch, Response, Direct,
+`net::{Fetch, Response, FetchError, Sink, Clock, retry, RetryError}` supports native and browser hosts. On wasm, `mse::{Fetch, Response, Direct,
 Player, Status}` supports browser playback with application-owned transport.
 
 The public low-level modules (`avc`, `ts`, `fmp4`, `sound`, `body`, `mp4`, `mkv`)
@@ -80,3 +80,46 @@ This lets native HLS handle compatible streams and uses the Rust path for audio
 decoding and repair of broken timelines. Unsupported HEVC, DRM, Atmos and fully
 interlaced video still need a supported alternative or a clear error. Desktop
 Edge and Safari playback validation remains open.
+
+`net::retry` runs the same bounded retry loop on native and browser hosts. Supply a
+`Clock`, an operation, an error classifier, a stop check and a reconnect callback.
+It makes at most seven attempts with 31 seconds of total backoff. Permanent errors
+return immediately. Stop checks run between awaits; drop the future to cancel a
+pending request or timer. Host `Fetch` and `Clock` implementations must release
+pending work on drop. Browser timers clear on drop too. The browser uses the shared buffer and
+playlist-session helpers below; complete media processing still needs extraction.
+
+`net::PlaybackBuffer` supplies playback position, buffered duration, gap crossing
+and async range removal. `net::trim_buffer` owns the rewind cutoff;
+`net::wait_for_room` owns the actual backpressure loop through `Clock`.
+`BufferWait` distinguishes room available (including whether backpressure was
+needed, even if gap recovery freed space before a timer), go-live
+interruption and cancellation. Limits are finite, nonnegative seconds. Live
+hosts refresh after waiting/interruption; finite hosts keep their current place.
+Dropping a pending future releases host work. The browser uses these helpers together with the shared playlist controller.
+
+`session::{Session, PlaylistSource, Controls, Preparation}` provides shared HLS
+selection and refresh. `prepare` applies backpressure and refreshes after a pause
+or go-live; finite media keeps its place. `wait_and_refresh` waits half a target
+duration (1–5 seconds), reports a stalled playlist through the source callback,
+and refreshes live media. Go-live during that wait uses the same refresh.
+`Session::next` borrows a segment; call `consumed` after successful output or an
+explicit skip. `discontinuous` detects sequence gaps/restarts. `finished` is true
+only when finite input is exhausted. `session::buffer_limits` exposes the same
+budget calculation used by the browser. Hosts own URL resolution, playlist body
+limits, transport retry/error classification and media output. Stop is checked
+between awaits; drop pending work for immediate cancellation. Full per-segment
+processing, variant/rendition changes and a single generic media runner are still
+pending. The new controller does not claim to finish #23 by itself.
+
+`Session::batch(&media)` returns an exact-size, fused `session::Batch` iterator.
+Each `ScheduledSegment` borrows the current/next segment and supplies cached
+remaining/window seconds. Build once per snapshot and keep it across finite
+buffer waits; rebuild after refresh or a control/selection change. The immutable
+borrow prevents changing the playlist underneath a batch. The walk now uses constant extra duration storage, without copying media bytes.
+Ordinary finite durations need no heap allocation. Extreme inputs use one bounded
+fallback allocation instead of an array that grows with the playlist. Remaining
+durations are correctly rounded from exact totals; results can differ from the
+old repeated sums by roundoff. The playlist itself still occupies O(n) memory.
+`Session::consumed` reuses URI storage and replaces an oversized buffer when its
+capacity exceeds four times the new URI length (with a 256-byte minimum).
