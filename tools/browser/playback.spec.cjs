@@ -147,5 +147,6 @@ test('raw timestamp restarts preserve all three clips', async ({ baseURL }, test
     timeout: 40000, maxBuffer: 1024 * 1024,
   });
   await testInfo.attach('raw-restart-report', { body: stdout, contentType: 'application/json' });
-  expect(JSON.parse(stdout).sample.playback.frames.total).toBeGreaterThanOrEqual(149);
+  const report = JSON.parse(stdout);
+  expect(report.raw_quality.total - report.initial_quality.total).toBeGreaterThanOrEqual(149);
 });

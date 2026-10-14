@@ -32,6 +32,9 @@ const os=require('node:os'),{execFileSync}=require('node:child_process');
    document.querySelector('#play').addEventListener('click',()=>context.resume());
    window.closeRawAudio=async()=>{clearInterval(timer);await context.close();};
   });
+  const initialQuality=await page.locator('#video').evaluate(video=>{
+   const q=video.getVideoPlaybackQuality();return {total:q.totalVideoFrames,dropped:q.droppedVideoFrames};
+  });
   await page.locator('#url').fill('/raw-dolby.ts');await page.locator('#play').click();
   await expect.poll(()=>page.locator('#video').evaluate(v=>v.currentTime),{timeout:20000}).toBeGreaterThan(5.6).catch(async error=>{
    console.error(JSON.stringify(await page.evaluate(()=>({sample:sample(),audio:rawAudio,
@@ -43,9 +46,13 @@ const os=require('node:os'),{execFileSync}=require('node:child_process');
    const q=document.querySelector('#video').getVideoPlaybackQuality();
    return {sample:sample(),audio:rawAudio,raw_quality:{total:q.totalVideoFrames,dropped:q.droppedVideoFrames}};
   });
-  if(report.sample.playback.frames.total < (process.env.RSTREAMKIT_REPEAT_RAW==='1'?149:179))
+  report.initial_quality=initialQuality;
+  const sessionFrames=report.raw_quality.total-initialQuality.total;
+  if(sessionFrames < (process.env.RSTREAMKIT_REPEAT_RAW==='1'?149:179))
    console.error(JSON.stringify(report));
-  assert(report.sample.playback.frames.total >= (process.env.RSTREAMKIT_REPEAT_RAW==='1'?149:179), 'all source pictures reach playback');
+  // loadedmetadata may arrive after initial decoding. The whole session starts
+  // before media load, so include those frames in this preservation check.
+  assert(sessionFrames >= (process.env.RSTREAMKIT_REPEAT_RAW==='1'?149:179), 'all source pictures reach playback');
   assert(report.audio.max_rms>.005,'raw Dolby produces decoded sound');
   assert(report.sample.session.statuses.some(s=>s.status==='Ended'));
   assert(!report.sample.session.statuses.some(s=>/Failed|Unsupported|BrowserError/.test(s.status)));
