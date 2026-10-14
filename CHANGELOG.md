@@ -2,6 +2,8 @@
 
 ## Unreleased (0.2.0)
 
+- Count the whole player download, budget its HTML, and check startup requests and initial memory for all four builds.
+
 - Decode movie sound with the shared browser work budget and discard old decoded ranges when a user seeks during a yield.
 
 - Preserve pictures and coded-audio order across short raw clock restarts; emit complete audio PES packets without waiting for another start.

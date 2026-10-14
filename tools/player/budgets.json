@@ -2,5 +2,6 @@
   "live": 115000,
   "live-sound": 220000,
   "vod": 140000,
-  "full": 245000
+  "full": 245000,
+  "player.html": 4096
 }
