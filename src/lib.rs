@@ -40,6 +40,8 @@ pub mod mse;
 pub mod net;
 pub mod session;
 pub mod sound;
+#[cfg(test)]
+mod test_alloc;
 pub mod ts;
 #[cfg(feature = "vod")]
 pub mod vod;

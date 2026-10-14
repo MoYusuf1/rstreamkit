@@ -9,6 +9,7 @@ Breaking changes:
 - Additional public enums are non-exhaustive; Demuxed gains passthrough metadata.
 
 Changes:
+- Return stereo PCM directly instead of allocating an unused second output buffer.
 - Restore mono AC-3 sound in stereo output by routing its gain to the center slot; mono PCM intentionally changes from silence.
 - Scan H.264 units without temporary heap lists; preserve media output and keep all size budgets.
 - Replace the growing duration cache with bounded storage while retaining linear playlist walks.

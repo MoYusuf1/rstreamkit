@@ -41,6 +41,7 @@ checks listed below remain useful follow-up work.
 | #38 Harness | Build/demo/profile commands, generated media, Node/browser probes and clean-source reproduction. Generator cache includes arguments/source hashes; historical low-resolution and fresh 1080p movie results are distinguished. | Clean-source profiling and CI report pass. Broader hardware repetition is follow-up work. |
 | #39 FLAC | Real programme sample: 29.7% of PCM size; encoder CPU reduced from 12.583 to 8.899 ms (29.3%) across twelve alternating fresh processes; trade taken. Lossless noise/extreme/ramp checks pass. | Decision implemented and recorded: take the compression trade. A broader corpus would improve confidence. |
 | #40 Discontinuity skew | Twenty alternating ±100 ms splices: maximum reduced from 316.811 to 105.467 ms with correction capped at 2%; regression test. | Real broadcast splice measurements. |
+| #48 Footprint | Per-flavor budgets; zero-list video scan and one-buffer stereo conversion. Conversion requested bytes fall 12,288 → 6,144; full player remains under 245,000 Brotli bytes. | Retained-size/startup audit, build-profile comparisons and broader runtime measurements. |
 | #59 Mono Dolby silence | Correct center-slot routing in LoRo/LtRt; positive/negative unit regression, 66.6 dB independent FFmpeg comparison and non-silent equal Chrome audio channels. Full download shrinks 163 Brotli bytes. | Close after the mono-fix PR merges; Edge/Safari remain separate acceptance. |
 
 ## Desktop browser matrix

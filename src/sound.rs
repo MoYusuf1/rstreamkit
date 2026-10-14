@@ -350,10 +350,12 @@ mod decode {
             .iter()
             .map(|&b| i16::from_le_bytes(b))
             .collect();
+        if channels == 2 {
+            return Some(pcm);
+        }
         let mut out = Vec::with_capacity(samples * 2);
         match channels {
             1 => pcm.iter().for_each(|&x| out.extend([x, x])),
-            2 => out = pcm,
             // 5.1 in WAVE order: front left and right, centre, LFE, back left and right. The gain keeps
             // the loudest case (everything at full scale in one place) from clipping.
             6 => {
@@ -781,3 +783,7 @@ mod tests {
         }
     }
 }
+
+#[cfg(all(test, feature = "sound"))]
+#[path = "stereo_tests.rs"]
+mod stereo_tests;

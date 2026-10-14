@@ -882,3 +882,62 @@ NODE_PATH=tools/browser/node_modules node tools/node/pause-smoke.cjs
 
 Serve the built full player first; `RSTREAMKIT_URL` can select another local URL.
 These are standalone Playwright checks, not yet CI jobs or a real-time 4K soak.
+
+
+## Stereo conversion buffer reduction (2026-10-13)
+
+`decode::stereo` always allocated an output vector, then replaced it with the
+already converted PCM when input was stereo. Return that PCM before allocating
+the other-layout buffer. This changes no samples or public API; it reduces a
+constant factor, not the O(n) time/space class. No runtime dependency is added.
+
+Baseline `9da40bf` (PR #61). Release/native, Linux Ryzen 7 5700 / Rust 1.99.0.
+The preserved old helper and new helper receive the same 1,536-sample, two-channel
+byte buffer. Fixture construction is excluded. Nine alternating pairs of 10,000
+calls follow 100-call warmups; p95 is the largest batch average. The test allocator
+forwards System calls and checks a disabled thread-local counter during timing;
+these sub-microsecond helper timings include that instrumentation and do not
+measure full decoder CPU or a Wasm speedup.
+
+| Stereo conversion only | Before | After |
+| --- | ---: | ---: |
+| Heap allocations | 2 | 1 |
+| Requested buffer bytes | 12,288 | 6,144 |
+| Median microseconds, final repeat | 0.125686 | 0.110222 |
+| p95 microseconds, final repeat | 0.171303 | 0.137672 |
+| Chrome mono-run committed Wasm bytes | 2,490,368 | 2,490,368 |
+
+Requested bytes exclude input, other decoder state and allocator overhead.
+The first native run measured medians 0.125723 / 0.108664 µs. The reliable win
+is one fewer 6,144-byte buffer per normal AC-3 stereo frame; committed Wasm
+memory did not decrease in this short browser run. Output-equivalence tests
+cover mono/stereo/three/six/eight-channel inputs, short inputs and trailing bytes;
+allocation tests cover 1, 32, 1,536 and 4,096 samples. Existing decoder checksum
+and independent media gates all pass. The production FLAC search is unchanged.
+
+| Player download, Wasm + JS Brotli bytes | Before | After | Change |
+| --- | ---: | ---: | ---: |
+| Live | 112,830 | 112,778 | −52 |
+| Live + sound | 210,303 | 210,311 | +8 |
+| Movie | 135,702 | 135,683 | −19 |
+| Full | 232,654 | 232,807 | +153 |
+
+All budgets pass; code-generation/compression layout can change artifact bytes
+even when a feature's runtime path is unchanged. Full grows 0.066% for the buffer
+reduction. The mono correction and this change together leave full download
+10 bytes smaller than PR #57, with the same features and size recipe.
+
+Formatting, all eight native/Wasm clippy builds, default/minimal/vod tests, the
+vendored decoder suite, four Node Wasm audio checks and five existing Playwright
+Chrome playback checks pass. The mono check exposed a test timing race: separate
+AnalyserNode snapshots can straddle audio render blocks. It now compares both
+channels within one AudioWorklet block. Two fresh runs each observe 1,824 blocks,
+peak RMS 0.066115 in both channels and zero sample difference. The worklet sends
+silent output; no sound is played through physical speakers. Test-only code adds
+no shipped audio worker or UI framework.
+
+```sh
+cargo test --release --lib measure_stereo_conversion -- --ignored --nocapture --test-threads=1
+python3 tools/size.py --check-budgets --output tools/results/size-stereo-allocation.json
+NODE_PATH=tools/browser/node_modules node tools/node/mono-smoke.cjs
+```
