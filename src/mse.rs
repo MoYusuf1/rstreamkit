@@ -1053,10 +1053,7 @@ async fn run(
                 let v = hls::pick_variant(&variants).ok_or("the playlist lists no streams")?;
                 let variant_uri = v.uri.clone();
                 let audio_url = v
-                    .renditions
-                    .iter()
-                    .filter(|r| r.uri.is_some())
-                    .max_by_key(|r| r.default)
+                    .audio_rendition(None)
                     .and_then(|r| r.uri.as_deref())
                     .map(|uri| resolve(&first.url, uri))
                     .transpose()?;
@@ -1104,19 +1101,18 @@ async fn run(
             selected_audio = wanted_audio;
             let mut current = tx.borrow_mut();
             current.audio_language = selected_audio.clone();
-            if let (Some(base), Some(language)) = (&master_base, &selected_audio)
-                && let Some(r) = variants
+            if let Some(base) = &master_base {
+                let selected = variants
                     .iter()
                     .find(|v| v.uri == variant_uri)
-                    .and_then(|v| {
-                        v.renditions
-                            .iter()
-                            .find(|r| r.language.as_deref() == Some(language))
-                    })
-                && let Some(uri) = &r.uri
-            {
-                audio_url = Some(resolve(base, uri)?);
-                audio_state = RenditionState::default();
+                    .and_then(|v| v.audio_rendition(selected_audio.as_deref()))
+                    .and_then(|r| r.uri.as_deref())
+                    .map(|uri| resolve(base, uri))
+                    .transpose()?;
+                if selected != audio_url {
+                    // Keep the consumed sequence and audio clock across track URLs.
+                    audio_url = selected;
+                }
             }
         }
         let prepared = window
@@ -1489,15 +1485,12 @@ async fn run(
             prefetch = None;
             variant_uri = candidate.uri.clone();
             let selected = candidate
-                .renditions
-                .iter()
-                .filter(|r| r.uri.is_some())
-                .max_by_key(|r| r.default)
+                .audio_rendition(selected_audio.as_deref())
                 .and_then(|r| r.uri.as_deref())
                 .map(|uri| resolve(base, uri))
                 .transpose()?;
             if selected != audio_url {
-                audio_state = RenditionState::default();
+                // The next track continues from the same sequence and media clock.
                 audio_url = selected;
             }
             media_url = resolve(base, &variant_uri)?;

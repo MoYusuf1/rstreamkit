@@ -2,6 +2,8 @@
 
 ## Unreleased (0.2.0)
 
+- Keep the selected external audio language and timeline when changing stream quality. Add a decoded-tone Chrome regression.
+
 Breaking changes:
 - HLS segment/variant metadata adds public fields.
 - Movie frames carry borrowed or owned bytes (`Cow`) and a lifetime; MP4 sample

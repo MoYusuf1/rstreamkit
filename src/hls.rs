@@ -25,6 +25,22 @@ pub struct Rendition {
     pub uri: Option<String>,
     pub default: bool,
 }
+#[cfg(any(target_arch = "wasm32", test))]
+impl Variant {
+    /// Prefer the requested external language, then the default external track.
+    pub(crate) fn audio_rendition(&self, language: Option<&str>) -> Option<&Rendition> {
+        self.renditions
+            .iter()
+            .filter(|r| r.uri.is_some())
+            .max_by_key(|r| {
+                (
+                    language.is_some() && r.language.as_deref() == language,
+                    r.default,
+                )
+            })
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct Key {
     pub uri: String,
@@ -379,6 +395,56 @@ pub fn describe_non_playlist(body: &[u8], content_type: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn external_audio_keeps_language_across_variant_groups() {
+        use super::*;
+        for group in ["high", "low"] {
+            let variant = Variant {
+                renditions: vec![
+                    Rendition {
+                        group: group.into(),
+                        name: "English".into(),
+                        language: Some("eng".into()),
+                        uri: Some(format!("{group}-eng.m3u8")),
+                        default: true,
+                    },
+                    Rendition {
+                        group: group.into(),
+                        name: "Spanish".into(),
+                        language: Some("spa".into()),
+                        uri: Some(format!("{group}-spa.m3u8")),
+                        default: false,
+                    },
+                    Rendition {
+                        group: group.into(),
+                        name: "In-band Spanish".into(),
+                        language: Some("spa".into()),
+                        uri: None,
+                        default: true,
+                    },
+                ],
+                ..Variant::default()
+            };
+            assert_eq!(
+                variant.audio_rendition(Some("spa")).unwrap().uri.as_deref(),
+                Some(format!("{group}-spa.m3u8").as_str())
+            );
+            assert_eq!(
+                variant.audio_rendition(None).unwrap().language.as_deref(),
+                Some("eng")
+            );
+            assert_eq!(
+                variant
+                    .audio_rendition(Some("fra"))
+                    .unwrap()
+                    .language
+                    .as_deref(),
+                Some("eng")
+            );
+        }
+        assert!(Variant::default().audio_rendition(Some("spa")).is_none());
+    }
+
     #[test]
     fn invalid_target_durations_are_errors_before_the_playback_timer() {
         for value in ["NaN", "inf", "-inf", "0", "-1", "garbage"] {
