@@ -17,34 +17,42 @@ const fixture = fs.readFileSync(path.join(__dirname, '../../tests/fixtures/h264_
     await page.route('**/mono-smoke.ts', route => route.fulfill({ status: 200, contentType: 'video/mp2t', body: fixture }));
     await page.goto(process.env.RSTREAMKIT_URL || 'http://127.0.0.1:8765/player.html?build=full');
     await page.waitForFunction(() => window.ready === true);
-    await page.evaluate(() => {
+    await page.evaluate(async () => {
       const video = document.querySelector('#video');
       video.muted = false;
       const context = new AudioContext();
-      const source = context.createMediaElementSource(video);
-      const splitter = context.createChannelSplitter(2);
-      const mute = context.createGain(); mute.gain.value = 0; mute.connect(context.destination);
-      source.connect(splitter);
-      const analyzers = [0, 1].map(channel => {
-        const analyzer = context.createAnalyser(); analyzer.fftSize = 256;
-        splitter.connect(analyzer, channel); analyzer.connect(mute); return analyzer;
-      });
-      const values = analyzers.map(() => new Float32Array(256));
-      window.audioResult = { samples: 0, max_rms: [0, 0], max_channel_difference: 0 };
-      const timer = setInterval(() => {
-        analyzers.forEach((analyzer, channel) => analyzer.getFloatTimeDomainData(values[channel]));
-        for (let channel = 0; channel < 2; channel++) {
-          const rms = Math.sqrt(values[channel].reduce((sum, n) => sum + n*n, 0) / values[channel].length);
-          window.audioResult.max_rms[channel] = Math.max(window.audioResult.max_rms[channel], rms);
-        }
-        for (let i = 0; i < values[0].length; i++) {
-          window.audioResult.max_channel_difference = Math.max(window.audioResult.max_channel_difference,
-            Math.abs(values[0][i] - values[1][i]));
-        }
-        window.audioResult.samples++;
-      }, 25);
+      // Separate analyzer snapshots can straddle audio render blocks. Compare both
+      // channels inside the same AudioWorklet block instead.
+      const module = URL.createObjectURL(new Blob([`
+        registerProcessor('mono-observer', class extends AudioWorkletProcessor {
+          constructor() { super(); this.blocks=0; this.rms=[0,0]; this.difference=0; }
+          process(inputs) {
+            const channels=inputs[0];
+            if (channels.length < 2) return true;
+            const [left,right]=channels;
+            let a=0,b=0;
+            for (let i=0;i<left.length;i++) {
+              a+=left[i]*left[i]; b+=right[i]*right[i];
+              this.difference=Math.max(this.difference,Math.abs(left[i]-right[i]));
+            }
+            this.rms[0]=Math.max(this.rms[0],Math.sqrt(a/left.length));
+            this.rms[1]=Math.max(this.rms[1],Math.sqrt(b/right.length));
+            if (++this.blocks % 32 === 0) this.port.postMessage({
+              blocks:this.blocks,max_rms:this.rms,max_channel_difference:this.difference
+            });
+            // Outputs remain silent; only input PCM is observed.
+            return true;
+          }
+        });
+      `], {type:'application/javascript'}));
+      try { await context.audioWorklet.addModule(module); } finally { URL.revokeObjectURL(module); }
+      const observer = new AudioWorkletNode(context, 'mono-observer');
+      window.audioResult = { blocks: 0, max_rms: [0, 0], max_channel_difference: 0 };
+      observer.port.onmessage = event => { window.audioResult = event.data; };
+      context.createMediaElementSource(video).connect(observer);
+      observer.connect(context.destination);
       document.querySelector('#play').addEventListener('click', () => context.resume());
-      window.closeAudio = async () => { clearInterval(timer); await context.close(); };
+      window.closeAudio = async () => { await context.close(); };
     });
     await page.locator('#url').fill('/mono-smoke.m3u8');
     await page.locator('#play').click();
@@ -52,6 +60,7 @@ const fixture = fs.readFileSync(path.join(__dirname, '../../tests/fixtures/h264_
     const audio = await page.evaluate(() => window.audioResult);
     const report = await page.evaluate(() => window.sample());
     await page.evaluate(() => window.closeAudio());
+    assert(audio.blocks >= 32, 'audio render blocks were observed');
     assert(audio.max_rms.every(value => value > 0.01), 'both channels contain audible-level samples');
     assert(audio.max_channel_difference < 0.00001, 'mono is copied equally into left and right');
     assert(report.session.statuses.some(item => item.status === 'Ended'));
