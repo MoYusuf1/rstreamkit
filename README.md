@@ -19,15 +19,16 @@ Results are medians of 5–8 runs on a Ryzen 7 5700, Linux, FFmpeg 9.0.2. The re
 
 ## Latest improvements
 
-Same 18-second 4K60 clip at 40 Mbps, before and after our buffer fixes. Two final runs in Linux Chromium 155:
+The 4K rows use the same 18-second clip at 40 Mbps. Code size and MP2 rows use the latest build-setting comparison:
 
 | Measure | Before | After |
 | --- | ---: | ---: |
 | Rust/Wasm memory | 70.9 MB | **35.8–36.7 MB (about 49% less)** |
 | Dropped frames | 0 of 1,080 | **0 of 1,080 in each run** |
-| Full player download | 228,963 bytes | 229,337 bytes (+0.16%) |
+| Player code download, compressed | 232,807 bytes | **232,290 bytes** |
+| Process 2 seconds of MP2 sound in Wasm | 16.38 ms | **13.37 ms (18% less)** |
 
-Memory here excludes the browser, video decoder and GPU. This short check does not prove long-run 4K performance. Chrome, Edge and Safari endurance tests are still planned.
+Memory excludes the browser, decoder and GPU. MP2 time is measured in Node. Download counts Wasm and JavaScript, with the same features. Short checks do not prove long-run 4K performance. Chrome, Edge and Safari endurance tests are still planned.
 
 ## What you can use it for
 

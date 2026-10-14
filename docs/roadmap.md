@@ -1,6 +1,6 @@
 # Roadmap: reliable 4K streaming with a small Rust engine
 
-Updated 2026-10-10. [GitHub tracker #26](https://github.com/MoYusuf1/rstreamkit/issues/26).
+Updated 2026-10-13. [GitHub tracker #26](https://github.com/MoYusuf1/rstreamkit/issues/26).
 Initial review: `fdcf179`. The targets below remain goals; completed baseline and
 buffer work is recorded in [performance.md](performance.md). All 24 issues open at review are mapped below, plus new
 [#47](https://github.com/MoYusuf1/rstreamkit/issues/47) (4K60) and
@@ -94,7 +94,7 @@ against the reviewed code; being implemented is not the same as passing acceptan
 | #45 | Profiling and bit-exact decoder speedups already landed | Re-profile native AND wasm; benchmark remaining kernels and keep or reject SIMD/algorithm changes with quality gates | 5 |
 | #46 | Deferred upstream contribution | Prepare an attributable patch when requested; do not message upstream now | Later |
 | #47 | New 4K60 goal | Supported 4K60 SDR paths pass the foreground matrix and fall back predictably | 0, 4 |
-| #48 | New size budget | Real-player feature builds, retained-size audit, startup/decode costs and CI growth report | 0, 1 |
+| #48 | Feature budgets and measured per-package profiles; smaller live/movie payloads, faster MP2 | Retained-size audit, whole-app startup/decode costs and CI growth report | 0, 1 |
 
 ## Web playback and library choices
 
