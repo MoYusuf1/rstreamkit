@@ -19,7 +19,7 @@ const builds = files.map(file => {
     module_load_init_ms: moduleLoad };
 });
 const results=[];
-for (const name of ['bbb_480p.ts', 'h264_ac3_st.ts', 'h264_ac3_51.ts', 'h264_eac3_51.ts', 'h264_mp2.ts']) {
+for (const name of ['bbb_480p.ts', 'h264_ac3.ts', 'h264_ac3_st.ts', 'h264_ac3_51.ts', 'h264_eac3_51.ts', 'h264_mp2.ts']) {
   const bytes=fs.readFileSync(path.join(__dirname,'../../tests/fixtures',name));
   const audio=name==='bbb_480p.ts' ? null : builds.map(build => new build.kit.ProfileAudio(bytes));
   try {
@@ -45,7 +45,7 @@ for (const name of ['bbb_480p.ts', 'h264_ac3_st.ts', 'h264_ac3_51.ts', 'h264_eac
     }
   } finally { audio?.forEach(item=>item.free()); }
 }
-console.log(JSON.stringify({node:process.version,platform:process.platform,arch:process.arch,
+console.log(JSON.stringify({script_sha256:crypto.createHash("sha256").update(fs.readFileSync(__filename)).digest("hex"),node:process.version,platform:process.platform,arch:process.arch,
   cpu:os.cpus()[0].model,os_release:os.release(),builds:builds.map(({kit,...build})=>build),results,
   limits:['Both modules coexist in one Node process; module load/init is diagnostic, not a browser cold-start benchmark.',
     'Transmux includes input copying and a new decoder per call; FLAC uses predecoded PCM.',

@@ -34,9 +34,9 @@ const sha=file=>crypto.createHash("sha256").update(fs.readFileSync(file)).digest
  const summary=flavors.map(flavor=>{const selected=runs.filter(r=>r.flavor===flavor);return {flavor,trials,
   ready_ms:distribution(selected.map(r=>r.ready_ms)),module_load_and_init_ms:distribution(selected.map(r=>r.startup.module_load_and_init_ms)),
   wasm_fetch_compile_init_ms:distribution(selected.map(r=>r.startup.wasm_fetch_compile_init_ms)),wasm_bytes:distribution(selected.map(r=>r.wasm_bytes))};});
- const root=path.join(__dirname,"../web");
+ const root=path.join(__dirname,"../web"),playerRoot=process.env.RSTREAMKIT_PLAYER_BUILDS_DIR||path.join(root,"player");
  console.log(JSON.stringify({schema:1,browser:version,cpu:os.cpus()[0].model,node:process.version,
   source_sha256:{"tools/node/startup-smoke.cjs":sha(__filename),"tools/web/player.html":sha(path.join(root,"player.html"))},
-  artifacts:flavors.map(flavor=>({flavor,wasm_sha256:sha(path.join(root,"player",flavor,"rstreamkit_player_bg.wasm")),js_sha256:sha(path.join(root,"player",flavor,"rstreamkit_player.js"))})),summary,runs,
+  artifacts:flavors.map(flavor=>({flavor,wasm_sha256:sha(path.join(playerRoot,flavor,"rstreamkit_player_bg.wasm")),js_sha256:sha(path.join(playerRoot,flavor,"rstreamkit_player.js"))})),summary,runs,
   limits:["Fresh Chrome process per trial; loopback uncompressed HTTP and warm OS file cache.","Ready timing starts at navigation and ends at the page ready setter, before playback.","Committed Wasm memory excludes JS, browser decoder, GPU and process RSS.","Small repeated samples show a range, not a production cold-cache percentile or a 4K60 result."]},null,2));
 })().catch(e=>{console.error(e);process.exitCode=1;});

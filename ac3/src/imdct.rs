@@ -20,15 +20,19 @@
 //!
 //! The FFT is a pure-Rust iterative radix-2 decimation-in-time Cooley-Tukey
 //! transform specialised to the exact two lengths AC-3 uses (128 and 64).
-//! No external crates, no unsafe code — the working set is ~2 kB and the
+//! No external crates. The scalar path uses no unsafe code; optional Wasm SIMD uses
+//! bounded vector loads/stores. The working set is ~2 kB and the
 //! transform runs O(N log N).
 
 use std::f32::consts::PI;
 use std::sync::OnceLock;
 
-/// Complex number `a + j*b` as a (f32, f32) tuple. We avoid pulling in
-/// `num-complex` to keep the dependency graph flat.
-type C = (f32, f32);
+/// Complex number `a + j*b` as a pair of f32 values with an explicit memory layout.
+/// We avoid pulling in `num-complex` to keep the dependency graph flat.
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+struct C(f32, f32);
+const _: () = assert!(std::mem::size_of::<C>() == 8);
 
 /// Long-block IMDCT scale. The direct-form reference in `audblk::imdct_512`
 /// uses `scale = -1.0` to match the encoder's `-2/N` forward MDCT; the
@@ -139,15 +143,53 @@ fn ifft_r2_dit(buf: &mut [C]) {
         let tw = &plan.twiddles[half - 1..2 * half - 1];
         for group in buf.chunks_exact_mut(2 * half) {
             let (lo, hi) = group.split_at_mut(half);
-            for ((a, b), &(wr, wi)) in lo.iter_mut().zip(hi.iter_mut()).zip(tw) {
+            #[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
+            if half >= 2 {
+                butterflies_simd(lo, hi, tw);
+                continue;
+            }
+            for ((a, b), &C(wr, wi)) in lo.iter_mut().zip(hi.iter_mut()).zip(tw) {
                 // t = w * b
                 let tr = wr * b.0 - wi * b.1;
                 let ti = wr * b.1 + wi * b.0;
-                *b = (a.0 - tr, a.1 - ti);
-                *a = (a.0 + tr, a.1 + ti);
+                *b = C(a.0 - tr, a.1 - ti);
+                *a = C(a.0 + tr, a.1 + ti);
             }
         }
         half *= 2;
+    }
+}
+
+// Two independent complex butterflies per vector. Keep subtract/add distinct:
+// replacing subtraction with addition of a sign-flipped product changes signed zero.
+#[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
+fn butterflies_simd(lo: &mut [C], hi: &mut [C], tw: &[C]) {
+    use core::arch::wasm32::*;
+    for ((a, b), w) in lo
+        .as_chunks_mut::<2>().0.iter_mut()
+        .zip(hi.as_chunks_mut::<2>().0.iter_mut())
+        .zip(tw.as_chunks::<2>().0)
+    {
+        // SAFETY: repr(C) C is exactly two contiguous f32 values, asserted above.
+        // Each chunk has two C values (16 bytes), so the unaligned loads are in bounds.
+        let (av, bv, wv) = unsafe {
+            (v128_load(a.as_ptr().cast()), v128_load(b.as_ptr().cast()), v128_load(w.as_ptr().cast()))
+        };
+        let wr = i32x4_shuffle::<0, 0, 2, 2>(wv, wv);
+        let wi = i32x4_shuffle::<1, 1, 3, 3>(wv, wv);
+        let real = f32x4_mul(wr, bv);
+        let imag = f32x4_mul(wi, i32x4_shuffle::<1, 0, 3, 2>(bv, bv));
+        let sub = f32x4_sub(real, imag);
+        let add = f32x4_add(real, imag);
+        let product = i32x4_shuffle::<0, 5, 2, 7>(sub, add);
+        let bv = f32x4_sub(av, product);
+        let av = f32x4_add(av, product);
+        // SAFETY: the two mutable chunks each contain 16 writable bytes and
+        // are disjoint halves from split_at_mut. SIMD is enabled for this build.
+        unsafe {
+            v128_store(a.as_mut_ptr().cast(), av);
+            v128_store(b.as_mut_ptr().cast(), bv);
+        }
     }
 }
 
@@ -172,7 +214,7 @@ impl IfftPlan {
             let wpi = theta.sin();
             let (mut wr, mut wi) = (1.0f32, 0.0f32);
             for _ in 0..half {
-                twiddles.push((wr, wi));
+                twiddles.push(C(wr, wi));
                 let nwr = wr * wpr - wi * wpi;
                 let nwi = wr * wpi + wi * wpr;
                 wr = nwr;
@@ -216,13 +258,13 @@ pub fn imdct_512_fft(x: &[f32; 256], out: &mut [f32; 512]) {
 
     // Step 2 — pre-IFFT complex multiply:
     //   Z[k] = (X[N/2-2k-1] + j*X[2k]) * (xcos[k] + j*xsin[k])
-    let mut z = [(0.0f32, 0.0f32); NOVER4];
+    let mut z = [C(0.0f32, 0.0f32); NOVER4];
     for k in 0..NOVER4 {
         let a = x[256 - 2 * k - 1]; // real part of (X[N/2-2k-1] + j*X[2k])
         let b = x[2 * k]; // imag part
         let cr = tw.xcos[k];
         let ci = tw.xsin[k];
-        z[k] = (a * cr - b * ci, b * cr + a * ci);
+        z[k] = C(a * cr - b * ci, b * cr + a * ci);
     }
 
     // Step 3 — N/4-point complex IFFT (unnormalised, +j convention).
@@ -288,17 +330,17 @@ pub fn imdct_256_pair_fft(x: &[f32; 256], out: &mut [f32; 512]) {
 
     // Step 2 — per-half pre-IFFT complex multiply.
     //   Z_i[k] = (Xi[N/4-2k-1] + j*Xi[2k]) * (xcos2[k] + j*xsin2[k])
-    let mut z1 = [(0.0f32, 0.0f32); NOVER8];
-    let mut z2 = [(0.0f32, 0.0f32); NOVER8];
+    let mut z1 = [C(0.0f32, 0.0f32); NOVER8];
+    let mut z2 = [C(0.0f32, 0.0f32); NOVER8];
     for k in 0..NOVER8 {
         let cr = tw.xcos[k];
         let ci = tw.xsin[k];
         let a1 = x1[NOVER4 - 2 * k - 1];
         let b1 = x1[2 * k];
-        z1[k] = (a1 * cr - b1 * ci, b1 * cr + a1 * ci);
+        z1[k] = C(a1 * cr - b1 * ci, b1 * cr + a1 * ci);
         let a2 = x2[NOVER4 - 2 * k - 1];
         let b2 = x2[2 * k];
-        z2[k] = (a2 * cr - b2 * ci, b2 * cr + a2 * ci);
+        z2[k] = C(a2 * cr - b2 * ci, b2 * cr + a2 * ci);
     }
 
     // Step 3 — N/8-point complex IFFTs.
@@ -391,8 +433,8 @@ fn fft_r2_dit(buf: &mut [C]) {
                 let b = buf[k + j + half];
                 let tr = wr * b.0 - wi * b.1;
                 let ti = wr * b.1 + wi * b.0;
-                buf[k + j + half] = (a.0 - tr, a.1 - ti);
-                buf[k + j] = (a.0 + tr, a.1 + ti);
+                buf[k + j + half] = C(a.0 - tr, a.1 - ti);
+                buf[k + j] = C(a.0 + tr, a.1 + ti);
                 let nwr = wr * wpr - wi * wpi;
                 let nwi = wr * wpi + wi * wpr;
                 wr = nwr;
@@ -416,7 +458,7 @@ fn fft_r2_dit(buf: &mut [C]) {
 /// normalisation to fold AC-3's overlap-add factor of 2), matching the
 /// spec's explicit `(1/N)·Σ` here.
 pub fn dft_512_forward(re: &[f32; 512], im: &[f32; 512]) -> ([f32; 512], [f32; 512]) {
-    let mut buf: Vec<C> = (0..512).map(|n| (re[n], im[n])).collect();
+    let mut buf: Vec<C> = (0..512).map(|n| C(re[n], im[n])).collect();
     fft_r2_dit(&mut buf);
     let mut zr = [0.0f32; 512];
     let mut zi = [0.0f32; 512];
@@ -459,8 +501,8 @@ mod tests {
     /// must produce uniform samples equal to the impulse magnitude.
     #[test]
     fn ifft_impulse_is_constant() {
-        let mut buf = [(0.0f32, 0.0f32); 8];
-        buf[0] = (3.0, 0.0);
+        let mut buf = [C(0.0f32, 0.0f32); 8];
+        buf[0] = C(3.0, 0.0);
         ifft_r2_dit(&mut buf);
         for (i, &c) in buf.iter().enumerate() {
             assert!((c.0 - 3.0).abs() < 1e-5, "idx {i}: re={}", c.0);
@@ -475,8 +517,8 @@ mod tests {
     fn ifft_single_bin_is_cis_tone() {
         let n = 16usize;
         let m = 3usize;
-        let mut buf = vec![(0.0f32, 0.0f32); n];
-        buf[m] = (1.0, 0.0);
+        let mut buf = vec![C(0.0f32, 0.0f32); n];
+        buf[m] = C(1.0, 0.0);
         ifft_r2_dit(&mut buf);
         for i in 0..n {
             let arg = 2.0 * PI * m as f32 * i as f32 / n as f32;

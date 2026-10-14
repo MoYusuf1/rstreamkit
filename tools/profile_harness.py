@@ -24,12 +24,16 @@ def main():
     parser.add_argument("--output", type=Path, default=ROOT / "tools/results/profiles")
     parser.add_argument("--retain-names", action="store_true",
                         help="keep development-only Wasm function names for CPU sampling")
+    parser.add_argument("--simd", action="store_true", help="experiment with Wasm SIMD128; not a shipping default")
     args = parser.parse_args()
     for name in args.profile or ["s", "balanced"]:
         level, packages = PROFILES[name]
         overrides = {"CARGO_PROFILE_RELEASE_OPT_LEVEL": level,
                      "CARGO_PROFILE_RELEASE_LTO": "true", "CARGO_PROFILE_RELEASE_CODEGEN_UNITS": "1",
                      "CARGO_PROFILE_RELEASE_PANIC": "abort"}
+        if args.simd:
+            flags = os.environ.get("CARGO_ENCODED_RUSTFLAGS", "\x1f".join(os.environ.get("RUSTFLAGS", "").split()))
+            overrides["CARGO_ENCODED_RUSTFLAGS"] = flags + ("\x1f" if flags else "") + "-C\x1ftarget-feature=+simd128"
         command = ["cargo"]
         for package, value in packages.items():
             setting = value if value.isdigit() else f'"{value}"'
@@ -42,12 +46,13 @@ def main():
         subprocess.run(["wasm-bindgen", str(ROOT / "tools/harness/target/wasm32-unknown-unknown/release/rstreamkit_harness.wasm"),
                         "--target", "nodejs", "--out-dir", str(output)], check=True)
         wasm = output / "rstreamkit_harness_bg.wasm"
-        wasm_opt = ["-Oz"] + (["-g"] if args.retain_names else [])
+        wasm_opt = ["-Oz"] + (["--enable-simd"] if args.simd else []) + (["-g"] if args.retain_names else [])
         subprocess.run(["wasm-opt", str(wasm), *wasm_opt, "-o", str(wasm)], check=True)
         tools = {tool: subprocess.check_output([tool, "--version"], text=True).strip()
                  for tool in ["rustc", "cargo", "wasm-bindgen", "wasm-opt"]}
         report = {"profile": name, "overrides": overrides, "packages": packages, "tools": tools,
-                  "wasm_opt": wasm_opt, "retain_names": args.retain_names,
+                  "wasm_opt": wasm_opt, "retain_names": args.retain_names, "simd128": args.simd,
+                  "effective_rustflags": overrides.get("CARGO_ENCODED_RUSTFLAGS", os.environ.get("CARGO_ENCODED_RUSTFLAGS", os.environ.get("RUSTFLAGS", ""))),
                   "revision": subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=ROOT, text=True).strip(),
                   "wasm_sha256": hashlib.sha256(wasm.read_bytes()).hexdigest(),
                   "working_tree": subprocess.check_output(["git", "status", "--porcelain"], cwd=ROOT, text=True),

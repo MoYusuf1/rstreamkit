@@ -91,7 +91,7 @@ against the reviewed code; being implemented is not the same as passing acceptan
 | #42 | Five CLI workloads recorded; remaining comparison work open | Visible baseline, in-process comparison and new wasm figures; explain the old frame-drop result | 0 |
 | #43 | Five bounded parser targets and four regressions; integrated 5,000-case run passes, refreshed PR CI pending | Review [campaign evidence and limits](../tools/fuzz/README.md); longer coverage-guided campaigns remain useful | 2 |
 | #44 | Local-file CLI now implemented | Rust URL transport uses the shared live session, cancellation and bounded outputs; no duplicate player loop | 5 |
-| #45 | Profiling and bit-exact decoder speedups already landed | Re-profile native AND wasm; benchmark remaining kernels and keep or reject SIMD/algorithm changes with quality gates | 5 |
+| #45 | Named Wasm profiles and optional SIMD FFT; about 29%/25% less transform time with exact finite-output gates | Profile native and broader programme sources; target MP2 synthesis; retain CPU/bytes/quality gates | 5 |
 | #46 | Deferred upstream contribution | Prepare an attributable patch when requested; do not message upstream now | Later |
 | #47 | New 4K60 goal | Supported 4K60 SDR paths pass the foreground matrix and fall back predictably | 0, 4 |
 | #48 | Feature budgets and measured per-package profiles; smaller live/movie payloads, faster MP2 | Retained-size audit, whole-app startup/decode costs and CI growth report | 0, 1 |
