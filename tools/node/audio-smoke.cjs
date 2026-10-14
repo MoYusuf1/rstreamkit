@@ -2,7 +2,7 @@
 const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const path = require('node:path');
-const kit = require('./pkg/rstreamkit_harness.js');
+const kit = require(process.env.RSTREAMKIT_HARNESS_MODULE ? path.resolve(process.env.RSTREAMKIT_HARNESS_MODULE) : './pkg/rstreamkit_harness.js');
 
 (async () => {
 for (const fixture of ['h264_ac3.ts', 'h264_ac3_51.ts', 'h264_eac3_51.ts', 'h264_mp2.ts']) {

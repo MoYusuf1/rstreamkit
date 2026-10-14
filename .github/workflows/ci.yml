@@ -54,6 +54,8 @@ jobs:
       - run: cargo +1.88.0 check --no-default-features
       - run: cargo +1.88.0 check --target wasm32-unknown-unknown --all-features
       - run: cargo +1.88.0 check --target wasm32-unknown-unknown --no-default-features
+      - name: SIMD path on MSRV
+        run: RUSTFLAGS="-C target-feature=+simd128" cargo +1.88.0 check --target wasm32-unknown-unknown --all-features
 
   wasm-audio:
     runs-on: ubuntu-latest
@@ -80,11 +82,23 @@ jobs:
           echo "$RUNNER_TEMP/binaryen-version_130/bin" >> "$GITHUB_PATH"
       - name: Check all four player download budgets
         run: python3 tools/size.py --check-budgets
+      - name: Scalar and SIMD output gates
+        run: |
+          python3 tools/profile_harness.py --profile balanced --output tools/results/scalar
+          python3 tools/profile_harness.py --profile balanced --simd --output tools/results/simd
+          node tools/node/fft-compare.cjs tools/results/scalar/balanced/rstreamkit_harness.js tools/results/simd/balanced/rstreamkit_harness.js > tools/results/fft-compare.json
+          node tools/node/opt-compare.cjs tools/results/scalar/balanced/rstreamkit_harness.js tools/results/simd/balanced/rstreamkit_harness.js > tools/results/simd-audio.json
+      - name: Experimental SIMD size budgets
+        run: python3 tools/size.py --simd --artifacts-dir tools/results/simd-player --check-budgets --output tools/results/size-simd.json
       - uses: actions/upload-artifact@v4
         if: always()
         with:
           name: player-size
-          path: tools/results/size.json
+          path: |
+            tools/results/size.json
+            tools/results/size-simd.json
+            tools/results/fft-compare.json
+            tools/results/simd-audio.json
       - uses: actions/setup-node@v4
         with:
           node-version: 24

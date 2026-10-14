@@ -60,3 +60,12 @@ Run the decoder's own tests with:
 ```sh
 cargo test --release --manifest-path ac3/Cargo.toml
 ```
+
+
+Optional Wasm SIMD FFT: with `simd128` enabled at compile time, two independent
+butterflies run together with the same multiply/add/subtract order. A private
+checked layout enables bounded vector loads/stores; default and native builds
+keep the scalar algorithm. The measured long/short transforms take about 29%/25%
+less time in warm Node tests, with 2,564 complete finite-output comparisons.
+Complete audio processing gains are smaller. See `../docs/performance.md` for
+CPU, bytes, platform limits and repeat commands. Original MIT credit remains above.

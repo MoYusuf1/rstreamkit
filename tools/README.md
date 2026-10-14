@@ -212,3 +212,25 @@ pass a second argument to choose another directory. Set
 `RSTREAMKIT_PROFILE_SECONDS` to change the default three seconds per stage.
 Names are for profiling only; shipped build settings stay the same. Sampling
 adds overhead, so use the paired timing tool for speed comparisons.
+
+
+### Optional SIMD experiment
+
+Add `--simd` to `tools/profile_harness.py` for a separate SIMD128 profiling build.
+The size tool requires a separate output directory:
+
+```sh
+python3 tools/size.py --simd --artifacts-dir tools/results/simd-player --check-budgets --output tools/results/size-simd.json
+```
+
+Default player files stay intact. A browser must support SIMD to load this build;
+keep a separate default build for hosts that need it. No loader chooses for you.
+Use `tools/node/fft-compare.cjs SCALAR.js SIMD.js` to compare 2,564 complete
+transform outputs and time batches inside Wasm. The audio comparison also checks
+mono AC-3. Rust 1.88, transform/audio equality and SIMD size budgets run in CI.
+
+For a server using alternate assets, `RSTREAMKIT_PLAYER_BUILDS_DIR` gives the
+startup probe the directory containing all four build folders. The existing
+`RSTREAMKIT_PLAYER_DIR` in other probes still points to one full-build folder.
+`RSTREAMKIT_HARNESS_MODULE` lets the Node audio smoke test load an alternate
+harness module. These are development options, not runtime app settings.

@@ -145,3 +145,14 @@ method, and uses the same audio work budget. A cancelled processing future may
 already have advanced the cursor or decoder: discard that session when
 cancelling. The browser adapter owns the session and rechecks seek position
 after sound processing before it appends the result.
+
+
+### Optional Wasm SIMD build
+
+Compiling for Wasm with `-C target-feature=+simd128` selects the measured
+vector FFT kernel. Default Wasm and native builds keep the existing algorithm.
+This is a compile option, without a new runtime dependency or engine API.
+A SIMD module requires support before it can load; hosts should select a
+compatible artifact and retain a separate default build when needed. There is
+no automatic module loader or internal fallback for an engine that rejects SIMD.
+The performance report records exact-output gates, CPU, size and startup limits.

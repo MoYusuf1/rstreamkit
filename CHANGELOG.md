@@ -2,6 +2,8 @@
 
 ## Unreleased (0.2.0)
 
+- Add an opt-in Wasm SIMD FFT: measured long/short transform time falls about 29%/25%, with matching finite outputs; default builds retain the scalar path.
+
 - Reuse FLAC channel scratch buffers: measured frame allocation requests fall 40%, with unchanged output and 85 extra compressed bytes in the full engine.
 
 - Count the whole player download, budget its HTML, and check startup requests and initial memory for all four builds.

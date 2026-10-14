@@ -1503,3 +1503,130 @@ a native CPU profile, a varied programme corpus, browser frame-time measurement
 or 4K60 result. #45 remains open for native/corpus profiling and a measured
 optimization decision meeting its CPU gate. All default shipping build recipes
 and runtime source remain unchanged by the profiling tools.
+
+### Opt-in SIMD FFT after measured no-go experiments — 2026-10-14
+
+The Wasm SIMD build now processes two independent complex butterflies together.
+It preserves the scalar multiply/subtract/add order; separate subtract/add
+vectors also preserve signed zero. A private repr(C) pair gives a checked
+8-byte layout. Two pairs form each 16-byte vector load/store; split_at_mut
+keeps the mutable halves disjoint. No audio buffers, runtime crates or public
+engine signatures are added. FFT complexity stays O(N log N), with the same
+bounded scratch storage. The gain is in work per instruction.
+
+The kernel is selected only when compiling Wasm with simd128. Native and default
+Wasm use the existing scalar algorithm. A SIMD module requires SIMD support at
+validation time; it cannot load on an unsupported engine and fall back internally.
+Keep a separate default artifact set and let the host choose a compatible build.
+No default browser requirement is changed by this PR.
+
+The implementation uses [Rust's Wasm SIMD feature](https://doc.rust-lang.org/stable/rustc/platform-support/wasm32-unknown-unknown.html)
+and bounded [unaligned loads](https://doc.rust-lang.org/core/arch/wasm32/fn.v128_load.html)
+and [stores](https://doc.rust-lang.org/core/arch/wasm32/fn.v128_store.html).
+The size assertion guards the pointer-length invariant. There is no relaxed SIMD
+or changed floating-point association in the kernel.
+
+Before retaining it, reject three cheaper attempts: iterator PCM packing and
+two-byte chunk packing preserve output but improve whole E-AC-3 processing only
+about 3%; native packing changes by about 0–2%. The chunk writer adds 110 full
+compressed bytes. Both are discarded. Compiler-only SIMD also fails to deliver
+a repeatable CPU gain. A first explicit kernel that assembled vector lanes from
+scalar fields is rejected too. The retained kernel uses contiguous vector loads.
+Ignored PCM patches and timing reports preserve those no-go experiments.
+
+CPU: three fresh Node 26.11.1 processes on Ryzen 7 5700/Linux. Scalar and SIMD
+use the same final source and balanced release recipe, with only the SIMD target
+flag different. Each transform batch performs 10,000 calls inside Wasm after
+warmup; black_box prevents loop elimination. Nine alternating pairs avoid the
+repeated JS return-copy overhead that obscured the first microbenchmark.
+The table gives medians of three process medians. No builds or other browser
+tests ran during these final timing campaigns.
+
+| Targeted transform | Default scalar | Opt-in SIMD | Change |
+| --- | ---: | ---: | ---: |
+| Long transform | 1.105 µs | 0.787 µs | 28.8% less |
+| Short transform | 1.077 µs | 0.808 µs | 25.0% less |
+
+Each output gate compares all bytes of 2,564 finite-coefficient transforms:
+zeros/signed zeros, all 256 basis impulses and 1,024 seeded bit-pattern inputs,
+for both long and short transforms. The complete output SHA-256 is
+`bf324192da3b5334fa8f1ba826e535e9df44023c1c9d81b09cf731ff1a76ced8`.
+The original scalar layout and final scalar layout match this fingerprint too.
+NaN payloads are outside the exact-output gate. Public APIs still accept their
+existing inputs; no new mathematical approximation is introduced.
+
+Complete TS processing includes copying, a fresh decoder, PCM conversion,
+FLAC and packaging. Each process uses five warmups and nine alternating pairs
+of five-call batches. PCM hashes and output lengths match for mono/stereo/5.1
+AC-3, 5.1 E-AC-3 and MP2. AAC is the no-sound-conversion control.
+
+| Complete input processing | Default scalar | Opt-in SIMD |
+| --- | ---: | ---: |
+| bbb_480p.ts | 0.139 ms | 0.153 ms |
+| h264_ac3.ts | 12.382 ms | 12.184 ms |
+| h264_ac3_st.ts | 7.190 ms | 6.932 ms |
+| h264_ac3_51.ts | 10.630 ms | 9.858 ms |
+| h264_eac3_51.ts | 12.559 ms | 11.725 ms |
+| h264_mp2.ts | 13.709 ms | 13.634 ms |
+
+The 5.1 AC-3 row improves about 7%; E-AC-3 about 6.6%. Mono and stereo gains are
+smaller. MP2 is near unchanged. AAC is slower in these tiny calls (about 0.01 ms
+in the median-of-medians table), so do not claim a universal speedup. The targeted
+FFT improvement clears #45's 10% gate; complete processing does not improve by
+25–29%. Retain this as an optional measured path, while keeping #45 open for
+native/corpus profiling and remaining audio hotspots.
+
+| Engine Brotli download | Previous main | New default | Opt-in SIMD |
+| --- | ---: | ---: | ---: |
+| live | 108,638 B | 108,638 B | 108,254 B |
+| live-sound | 212,104 B | 212,098 B | 211,947 B |
+| vod | 130,422 B | 130,422 B | 129,936 B |
+| full | 234,117 B | 234,048 B | 233,411 B |
+
+All five engine/shell budgets pass in both modes. Full default saves 69 bytes;
+SIMD saves 706 bytes versus previous main. The shared HTML remains 2,750 Brotli
+bytes, giving complete full startup of 236,798 B and 236,161 B respectively.
+Code-generation and compression layout affect these small differences; use the
+exact hashes/tool versions in the reports, not a general claim that SIMD shrinks
+programs. The SIMD size tool requires a separate artifact directory and refuses
+to overwrite the default player.
+
+Five fresh Chrome 155 processes per flavor and build record startup and initial
+committed memory. Loopback HTTP is uncompressed and the OS cache is warm. The
+campaigns are sequential, not randomized paired cold-cache trials. These timing
+ranges do not establish a startup win. Memory values are identical across all
+five trials in both modes; they exclude JS, browser decoder, GPU and process RSS.
+
+| Build | Default ready median (range) | SIMD ready median (range) | Initial committed Wasm, both |
+| --- | ---: | ---: | ---: |
+| live | 39.7 ms (27.2–41.8) | 42.0 ms (29.0–44.0) | 1,179,648 B |
+| live-sound | 43.2 ms (28.4–46.8) | 41.4 ms (28.6–45.0) | 1,245,184 B |
+| vod | 38.9 ms (27.7–40.4) | 40.1 ms (27.4–40.9) | 1,179,648 B |
+| full | 41.5 ms (29.1–43.9) | 41.6 ms (27.9–42.4) | 1,245,184 B |
+
+Validation includes native/Wasm feature checks, explicit SIMD clippy, the decoder
+suite, independent media/FLAC checks, Node synchronous/yielded output equality,
+all ten Chrome SIMD playback regressions and all startup inventories. CI now
+checks the SIMD branch with Rust 1.88, exact transform and audio gates, and all
+SIMD size budgets. Default Chrome regression checks remain in CI too. No native
+speedup, Edge/Safari result, long-run 4K60 acceptance or FFmpeg superiority is
+claimed by these short audio tests.
+
+Reproduce the matched builds and output gates:
+
+```sh
+python3 tools/profile_harness.py --profile balanced --output tools/results/scalar
+python3 tools/profile_harness.py --profile balanced --simd --output tools/results/simd
+node tools/node/fft-compare.cjs tools/results/scalar/balanced/rstreamkit_harness.js tools/results/simd/balanced/rstreamkit_harness.js
+node tools/node/opt-compare.cjs tools/results/scalar/balanced/rstreamkit_harness.js tools/results/simd/balanced/rstreamkit_harness.js
+python3 tools/size.py --check-budgets
+python3 tools/size.py --simd --artifacts-dir tools/results/simd-player --check-budgets --output tools/results/size-simd.json
+```
+
+Final ignored reports: `fft-final-direct-{1,2,3}.json`,
+`fft-final-audio-{1,2,3}.json`, `size-fft-default.json`, `size-fft-vector.json`,
+`fft-startup-{default,vector}.json`, and `fft-simd-browser-final.log`.
+The benchmark drivers record their hashes, input/PCM hashes and Wasm hashes;
+matching build.json files record effective compiler flags and exact source hashes.
+Audio and transform outputs match across the repeated campaigns. Keep the
+full report limitations with any extracted numbers.

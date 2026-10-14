@@ -37,7 +37,12 @@ def main():
                         help="override AC-3, MP2 and codec-core packages separately")
     parser.add_argument("--mp2-opt-level", choices=["s", "z", "3"],
                         help="override MP2 independently after the shared codec setting")
+    parser.add_argument("--simd", action="store_true", help="experimental SIMD128 build; requires separate artifacts")
+    parser.add_argument("--artifacts-dir", type=Path, default=ROOT / "tools/web/player",
+                        help="destination for player builds; use a separate directory for experiments")
     args = parser.parse_args()
+    if args.simd and args.artifacts_dir.resolve() == ROOT / "tools/web/player":
+        parser.error("--simd requires a separate --artifacts-dir; default player stays scalar")
     package_levels = {}
     if args.codec_opt_level:
         package_levels = {name: args.codec_opt_level for name in
@@ -51,7 +56,11 @@ def main():
                  "CARGO_PROFILE_RELEASE_LTO": "true",
                  "CARGO_PROFILE_RELEASE_CODEGEN_UNITS": "1",
                  "CARGO_PROFILE_RELEASE_PANIC": "abort"}
+    if args.simd:
+        flags = os.environ.get("CARGO_ENCODED_RUSTFLAGS", "\x1f".join(os.environ.get("RUSTFLAGS", "").split()))
+        overrides["CARGO_ENCODED_RUSTFLAGS"] = flags + ("\x1f" if flags else "") + "-C\x1ftarget-feature=+simd128"
     cargo_env = {**os.environ, **overrides}
+    wasm_opt = ["-Oz"] + (["--enable-simd"] if args.simd else [])
     report = {
         "schema": 2,
         "revision": run("git", "rev-parse", "HEAD"),
@@ -62,7 +71,9 @@ def main():
                    "cargo_profile_overrides": overrides,
                    "codec_opt_level": args.codec_opt_level,
                    "package_opt_levels": effective_levels,
-                   "wasm_opt": "-Oz", "brotli_quality": 11,
+                   "wasm_opt": " ".join(wasm_opt), "simd128": args.simd, "brotli_quality": 11,
+                   "effective_rustflags": cargo_env.get("CARGO_ENCODED_RUSTFLAGS", cargo_env.get("RUSTFLAGS", "")),
+                   "artifacts_dir": str(args.artifacts_dir.resolve()),
                    "target": "wasm32-unknown-unknown", "entry": "tools/player/src/lib.rs"},
         "flavors": [],
     }
@@ -83,13 +94,13 @@ def main():
         if features:
             command += ["--features", ",".join(features)]
         run(*command, env=cargo_env)
-        output = ROOT / "tools/web/player" / name
+        output = args.artifacts_dir.resolve() / name
         output.mkdir(parents=True, exist_ok=True)
         run("wasm-bindgen", str(PLAYER / "target/wasm32-unknown-unknown/release/rstreamkit_player.wasm"),
             "--target", "web", "--out-dir", str(output))
         wasm = output / "rstreamkit_player_bg.wasm"
         wasm_before_opt_bytes = wasm.stat().st_size
-        run("wasm-opt", str(wasm), "-Oz", "-o", str(wasm))
+        run("wasm-opt", str(wasm), *wasm_opt, "-o", str(wasm))
         files = []
         for path in [wasm, output / "rstreamkit_player.js"]:
             compressed = path.with_suffix(path.suffix + ".br")

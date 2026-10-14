@@ -458,3 +458,44 @@ pub async fn continuous_yielded(bytes: &[u8], chunk_size: usize) -> Result<Strin
     hash.output(stream.finish_yielded().await.map_err(error)?);
     Ok(hash.result())
 }
+
+/// Development-only exact transform output, before overlap/window/PCM conversion.
+#[wasm_bindgen]
+pub fn transform(input: &[f32], short: bool) -> Result<Vec<f32>, JsValue> {
+    let input: &[f32; 256] = input
+        .try_into()
+        .map_err(|_| JsValue::from_str("expected 256 coefficients"))?;
+    let mut output = [0.0; 512];
+    if short {
+        rstreamkit_ac3::imdct::imdct_256_pair_fft(input, &mut output);
+    } else {
+        rstreamkit_ac3::imdct::imdct_512_fft(input, &mut output);
+    }
+    Ok(output.to_vec())
+}
+
+/// Keep repeated transform work inside Wasm, excluding per-call JS output copies.
+#[wasm_bindgen]
+pub fn transform_repeat(input: &[f32], short: bool, repeats: u32) -> Result<f32, JsValue> {
+    let input: &[f32; 256] = input
+        .try_into()
+        .map_err(|_| JsValue::from_str("expected 256 coefficients"))?;
+    if !(1..=100_000).contains(&repeats) {
+        return Err(JsValue::from_str("invalid repeat count"));
+    }
+    let mut output = [0.0; 512];
+    for _ in 0..repeats {
+        if short {
+            rstreamkit_ac3::imdct::imdct_256_pair_fft(
+                std::hint::black_box(input),
+                std::hint::black_box(&mut output),
+            );
+        } else {
+            rstreamkit_ac3::imdct::imdct_512_fft(
+                std::hint::black_box(input),
+                std::hint::black_box(&mut output),
+            );
+        }
+    }
+    Ok(std::hint::black_box(output[0]))
+}

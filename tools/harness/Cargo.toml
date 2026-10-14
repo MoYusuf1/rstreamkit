@@ -9,6 +9,7 @@ crate-type = ["cdylib"]
 
 [dependencies]
 rstreamkit = { path = "../.." }
+rstreamkit-ac3 = { path = "../../ac3" }
 wasm-bindgen = "=0.2.128"
 wasm-bindgen-futures = "=0.4.78"
 js-sys = "=0.3.105"
