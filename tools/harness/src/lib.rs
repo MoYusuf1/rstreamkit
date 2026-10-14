@@ -366,3 +366,66 @@ pub fn set_variant(uri: Option<String>) -> Result<(), JsValue> {
             .map_err(|error| JsValue::from_str(&error))
     })
 }
+
+// Compare complete output bytes across synchronous and yielded continuous decoding.
+struct ContinuousHash {
+    hash: u64,
+    bytes: usize,
+    fragments: usize,
+}
+impl ContinuousHash {
+    fn new() -> Self {
+        Self {
+            hash: 0xcbf29ce484222325,
+            bytes: 0,
+            fragments: 0,
+        }
+    }
+    fn bytes(&mut self, bytes: &[u8]) {
+        self.bytes += bytes.len();
+        for &byte in bytes {
+            self.hash = (self.hash ^ u64::from(byte)).wrapping_mul(0x100000001b3);
+        }
+    }
+    fn output(&mut self, out: rstreamkit::Output) {
+        if let Some(init) = out.init {
+            self.bytes(&init.bytes);
+        }
+        self.fragments += out.fragments.len();
+        for fragment in out.fragments {
+            self.bytes(&fragment.moof);
+            self.bytes(&fragment.mdat);
+        }
+    }
+    fn result(self) -> String {
+        format!("{:016x}:{}:{}", self.hash, self.bytes, self.fragments)
+    }
+}
+
+#[wasm_bindgen]
+pub fn continuous_sync(bytes: &[u8], chunk_size: usize) -> Result<String, JsValue> {
+    let mut stream = rstreamkit::Continuous::default().decode_sound(true);
+    let mut hash = ContinuousHash::new();
+    let error = |e: rstreamkit::Error| JsValue::from_str(&e.to_string());
+    for chunk in bytes.chunks(chunk_size.max(1)) {
+        for out in stream.feed(chunk).map_err(error)? {
+            hash.output(out);
+        }
+    }
+    hash.output(stream.finish().map_err(error)?);
+    Ok(hash.result())
+}
+
+#[wasm_bindgen]
+pub async fn continuous_yielded(bytes: &[u8], chunk_size: usize) -> Result<String, JsValue> {
+    let mut stream = rstreamkit::Continuous::default().decode_sound(true);
+    let mut hash = ContinuousHash::new();
+    let error = |e: rstreamkit::Error| JsValue::from_str(&e.to_string());
+    for chunk in bytes.chunks(chunk_size.max(1)) {
+        for out in stream.feed_yielded(chunk).await.map_err(error)? {
+            hash.output(out);
+        }
+    }
+    hash.output(stream.finish_yielded().await.map_err(error)?);
+    Ok(hash.result())
+}

@@ -2,6 +2,8 @@
 
 ## Unreleased (0.2.0)
 
+- Yield audio decoding on an eight-millisecond work budget; process raw TS in bounded pieces and flush its final fragment cooperatively.
+
 - Shrink player diagnostics: full compressed Wasm and JavaScript falls by 766 bytes; reported seconds keep millisecond precision.
 
 - Keep the selected external audio language and timeline when changing stream quality. Add a decoded-tone Chrome regression.

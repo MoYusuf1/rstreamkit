@@ -49,7 +49,7 @@ required-features = ["vod"]
 js-sys = "0.3.105"
 wasm-bindgen = "0.2.128"
 wasm-bindgen-futures = "0.4.78"
-web-sys = { version = "0.3.105", features = ["AbortController", "AbortSignal", "Window", "Document", "Element", "Headers", "HtmlMediaElement", "HtmlVideoElement", "MediaSource", "MediaSourceReadyState", "ReadableStream", "ReadableStreamDefaultReader", "Request", "RequestInit", "Response", "SourceBuffer", "SourceBufferList", "TimeRanges", "Url"] }
+web-sys = { version = "0.3.105", features = ["AbortController", "AbortSignal", "Window", "Performance", "Document", "Element", "Headers", "HtmlMediaElement", "HtmlVideoElement", "MediaSource", "MediaSourceReadyState", "ReadableStream", "ReadableStreamDefaultReader", "Request", "RequestInit", "Response", "SourceBuffer", "SourceBufferList", "TimeRanges", "Url"] }
 
 [package.metadata.docs.rs]
 targets = ["wasm32-unknown-unknown"]

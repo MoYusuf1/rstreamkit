@@ -17,7 +17,7 @@ Both tools did the same job: repackage video and sound without changing the pict
 Lower is better. Times include starting each program and reading and writing files.
 Results are medians of 5–8 runs on a Ryzen 7 5700, Linux, FFmpeg 9.0.2. The repackaged picture and sound were checked against the inputs. These results cover these jobs; FFmpeg supports far more formats and can also convert video.
 
-## Latest improvements
+## Recent measurements
 
 The 4K rows use the same 18-second clip at 40 Mbps. The sound and download rows measure separate changes:
 
@@ -25,10 +25,10 @@ The 4K rows use the same 18-second clip at 40 Mbps. The sound and download rows 
 | --- | ---: | ---: |
 | Rust/Wasm memory | 70.9 MB | **35.8–36.7 MB (about 49% less)** |
 | Dropped frames | 0 of 1,080 | **0 of 1,080 in each run** |
-| Player code download, compressed | 232,742 bytes | **231,976 bytes** |
+| Full player download, compressed | 232,742 bytes | **232,961 bytes (+219)** |
 | Process 2 seconds of MP2 sound in Wasm | 16.38 ms | **13.37 ms (18% less)** |
 
-Memory excludes the browser, decoder and GPU. MP2 time is measured in Node. Download counts Wasm and JavaScript, with the same features. Short checks do not prove long-run 4K performance. Chrome, Edge and Safari endurance tests are still planned.
+Memory excludes the browser, decoder and GPU. MP2 time is measured in Node. Download counts Wasm and JavaScript, with the same features. Stats formatting saved 766 bytes; safer audio scheduling added 985. Short checks do not prove long-run 4K performance. Chrome, Edge and Safari endurance tests are still planned.
 
 ## What you can use it for
 

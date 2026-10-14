@@ -1659,48 +1659,63 @@ async fn run_ts(
     let mut started = false;
     while let Some(chunk) = std::future::poll_fn(|cx| body.as_mut().poll_next(cx)).await {
         let chunk = chunk?;
-        for mut out in continuous.feed(&chunk)? {
-            if let Some(codec) = out.skipped_audio
-                && !partial
-            {
-                return Err(Unsupported::Sound(codec).into());
+        // Bound the outputs awaiting append even when a host returns a giant chunk.
+        for bytes in chunk.chunks(16 << 10) {
+            if stop.get() {
+                return Ok(());
             }
-            if let Some(mut init) = out.init {
-                if init.interlaced && !partial {
-                    return Err(Unsupported::Interlaced.into());
+            for mut out in continuous.feed_yielded(bytes).await? {
+                if stop.get() {
+                    return Ok(());
                 }
-                if let Some(old) = sb.take() {
-                    ms.remove_source_buffer(&old).map_err(js_err)?;
+                if let Some(codec) = out.skipped_audio
+                    && !partial
+                {
+                    return Err(Unsupported::Sound(codec).into());
                 }
-                let buffer =
-                    ms.add_source_buffer(&init.mime)
-                        .map_err(|e| Unsupported::MediaType {
-                            mime: init.mime.clone(),
-                            why: js_err(e),
-                        })?;
-                append(video, &buffer, &ms, &mut init.bytes).await?;
-                sb = Some(buffer);
-            }
-            let buffer = sb.as_ref().ok_or("no TS media buffer")?;
-            for f in &mut out.fragments {
-                append(video, buffer, &ms, &mut f.moof).await?;
-                append(video, buffer, &ms, &mut f.mdat).await?;
-            }
-            if !started {
-                started = true;
-                let _ = video.play();
-                if !stop.get() {
-                    report(Status::Playing);
+                if let Some(mut init) = out.init {
+                    if init.interlaced && !partial {
+                        return Err(Unsupported::Interlaced.into());
+                    }
+                    if let Some(old) = sb.take() {
+                        ms.remove_source_buffer(&old).map_err(js_err)?;
+                    }
+                    let buffer =
+                        ms.add_source_buffer(&init.mime)
+                            .map_err(|e| Unsupported::MediaType {
+                                mime: init.mime.clone(),
+                                why: js_err(e),
+                            })?;
+                    append(video, &buffer, &ms, &mut init.bytes).await?;
+                    sb = Some(buffer);
                 }
-            }
-            trim(video, buffer, &ms, 5.0).await?;
-            while buffered_ahead(video) > 15.0 {
-                sleep(Duration::from_millis(250)).await;
+                let buffer = sb.as_ref().ok_or("no TS media buffer")?;
+                for f in &mut out.fragments {
+                    append(video, buffer, &ms, &mut f.moof).await?;
+                    append(video, buffer, &ms, &mut f.mdat).await?;
+                }
+                if !started {
+                    started = true;
+                    let _ = video.play();
+                    if !stop.get() {
+                        report(Status::Playing);
+                    }
+                }
+                trim(video, buffer, &ms, 5.0).await?;
+                while buffered_ahead(video) > 15.0 {
+                    if stop.get() {
+                        return Ok(());
+                    }
+                    sleep(Duration::from_millis(250)).await;
+                }
             }
         }
     }
+    if stop.get() {
+        return Ok(());
+    }
     if let Some(buffer) = sb {
-        let mut out = continuous.finish()?;
+        let mut out = continuous.finish_yielded().await?;
         for f in &mut out.fragments {
             append(video, &buffer, &ms, &mut f.moof).await?;
             append(video, &buffer, &ms, &mut f.mdat).await?;

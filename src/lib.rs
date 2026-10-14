@@ -253,7 +253,16 @@ impl Transmuxer {
     /// Browser-friendly decoding: yield between small batches of audio frames.
     #[cfg(target_arch = "wasm32")]
     pub async fn finish_yielded(&mut self, segment: Segment) -> Result<Output, Error> {
-        let d = segment.demuxer.finish()?;
+        self.assemble_yielded(segment.demuxer.finish()?, &mut YieldSlice::new())
+            .await
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    async fn assemble_yielded(
+        &mut self,
+        d: ts::Demuxed,
+        slice: &mut YieldSlice,
+    ) -> Result<Output, Error> {
         if cfg!(feature = "sound")
             && !self.skip_sound
             && !d.sound.is_empty()
@@ -281,7 +290,7 @@ impl Transmuxer {
                 ));
                 self.flac_frames += 1;
                 if i % 8 == 7 {
-                    crate::mse::sleep(std::time::Duration::ZERO).await;
+                    slice.checkpoint().await;
                 }
             }
             self.prepared_flac = Some(frames);
@@ -675,6 +684,40 @@ impl Transmuxer {
     }
 }
 
+// Share the CPU slice across fragments in one feed, rather than resetting it
+// for every short GOP. A fixed frame count can otherwise add many timer waits.
+#[cfg(target_arch = "wasm32")]
+struct YieldSlice {
+    clock: Option<web_sys::Performance>,
+    started: f64,
+}
+#[cfg(target_arch = "wasm32")]
+impl YieldSlice {
+    fn new() -> Self {
+        let clock = js_sys::Reflect::get(&js_sys::global(), &"performance".into())
+            .ok()
+            .and_then(|p| wasm_bindgen::JsCast::dyn_into::<web_sys::Performance>(p).ok());
+        let mut slice = Self {
+            clock,
+            started: 0.0,
+        };
+        slice.started = slice.now();
+        slice
+    }
+    fn now(&self) -> f64 {
+        self.clock
+            .as_ref()
+            .map_or_else(js_sys::Date::now, web_sys::Performance::now)
+    }
+    async fn checkpoint(&mut self) {
+        let spent = self.now() - self.started;
+        if spent >= 8.0 || spent < 0.0 {
+            crate::mse::sleep(std::time::Duration::ZERO).await;
+            self.started = self.now();
+        }
+    }
+}
+
 /// Bounded continuous MPEG-TS input, cut into output fragments at keyframes.
 /// Unlike `Segment`, program tables and incomplete PES packets survive between feeds.
 pub struct Continuous {
@@ -715,6 +758,36 @@ impl Continuous {
         }
         Ok(out)
     }
+    /// Like feed, yielding between small batches of decoded audio frames.
+    #[cfg(target_arch = "wasm32")]
+    pub async fn feed_yielded(&mut self, bytes: &[u8]) -> Result<Vec<Output>, Error> {
+        let mut out = vec![];
+        let mut slice = YieldSlice::new();
+        for bytes in bytes.chunks(16 << 10) {
+            self.demuxer.feed(bytes);
+            while let Some(d) = self.demuxer.take_fragment()? {
+                out.push(self.transmuxer.assemble_yielded(d, &mut slice).await?);
+            }
+            if self.demuxer.buffered_bytes() > self.limit {
+                return Err(Error::Unsupported(
+                    "continuous TS exceeded its keyframe buffer limit".into(),
+                ));
+            }
+            slice.checkpoint().await;
+        }
+        Ok(out)
+    }
+
+    /// Flush the final fragment with cooperative browser audio decoding.
+    #[cfg(target_arch = "wasm32")]
+    pub async fn finish_yielded(mut self) -> Result<Output, Error> {
+        self.transmuxer
+            .finish_yielded(Segment {
+                demuxer: self.demuxer,
+            })
+            .await
+    }
+
     pub fn finish(mut self) -> Result<Output, Error> {
         self.transmuxer.finish(Segment {
             demuxer: self.demuxer,

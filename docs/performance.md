@@ -1222,3 +1222,31 @@ The same-checkout full optimized Wasm shrinks from 580,195 to 577,582 bytes; all
 The named raw compiler Wasm retains the AC-3/E-AC-3 and MP2 decoder paths, including JOC and object metadata; deleting unused source files alone is not a demonstrated size win. Twiggy lists the float Debug formatting root at 16,658 retained bytes before and the Display root at 15,053 after. These are overlapping, conservative call-graph totals, not additive shipped-byte savings. The actual shipped file is stripped and uses numbered functions; it cannot be assigned named subsystem totals from that report. The raw build also includes 362,361 bytes of wasm-bindgen metadata and 246,517 bytes of function names before stripping; neither is a new optimization opportunity in the shipped file. Audit outputs are `tools/results/retained-raw.txt`, `retained-shipped.txt` and `stats-retained-final.txt`.
 
 Validation: all four minimal-player Wasm clippy feature combinations, formatting, six real-Chrome regressions. This is a download and diagnostic-format change; no processing-time or memory improvement is claimed. Total HTML startup assets, cold-start distributions and further codec feature tradeoffs remain under #48.
+
+### Budgeted audio yielding and bounded raw output — 2026-10-13
+
+The browser raw-TS adapter now feeds 16 KiB pieces, appends returned fragments before continuing, and cooperatively decodes its final fragment. It checks cancellation during processing and buffer waits. Additional outputs waiting for append are bounded by each piece and the existing GOP buffer, rather than by the whole transport chunk; the transport's input allocation itself is unchanged. Native synchronous methods remain available.
+
+The shared browser audio decoder checks elapsed work every eight coded frames and yields after roughly eight milliseconds. One frame or final assembly can exceed that slice. A budget is shared across the raw feed's fragments, so many short GOPs cannot bypass it. It uses global performance.now(), with a Date.now() fallback. This replaces fixed-count timer waits in HLS too. The time/space complexity of decoding remains linear in samples; the change controls scheduling, timer overhead and pending raw output.
+
+| Browser harness measurement | Fixed eight-frame yield | Final eight-ms slice |
+| --- | ---: | ---: |
+| Three repeated two-second AC-3 clips, median elapsed | 108.8 ms | 35.2 ms |
+| Ten repeated two-second AC-3 clips, median elapsed | 418.1 ms | 148.6 ms |
+| Full compressed player (before raw work / final) | 231,976 B | 232,961 B |
+| Chrome CI regressions | 6 | 7 |
+
+Each timing uses five alternating synchronous/yielded pairs after two warm-ups, with 320×180 HLS playback in the background. The final repeat's synchronous controls are 35.1 ms and 113.8 ms. Six-second-sized probes have zero long tasks in either mode; the stress control has five 114–116 ms long tasks, while budgeted yielding has zero. Both modes drop zero frames in each short paired sample. The first final-policy campaign similarly measures 36.2/35.9 ms and 114.7/152.3 ms. Thus there is no measured dropped-frame win here, and yielding still adds elapsed time in the large stress case. These are development-harness results (opt-level s), not a universal CPU speedup or 4K60 result.
+
+Fifteen byte checks cover AAC, mono AC-3, 5.1 AC-3, 5.1 E-AC-3 and MP2 at 187-byte, 16-KiB and whole-input chunk sizes. Synchronous and yielded output hashes, byte counts and fragment counts agree. A generated continuous six-second H.264/5.1 AC-3 raw stream reaches 6.016 seconds and EOF, with 180 frames, zero dropped frames, peak observed audio RMS 0.020601 and no failed state. Chrome 155.0.8059.39, Ryzen 7 5700/Linux. The final measured harness Wasm SHA-256 is 1bf1c9287673a7017b3647d8a16711d83e2c0c1e0bf8a93a78382e4c1a735c51.
+
+| Compressed Wasm + JS | Before | Final |
+| --- | ---: | ---: |
+| Live | 107,362 B | 108,121 B |
+| Live with sound | 210,912 B | 211,720 B |
+| VOD | 128,537 B | 129,213 B |
+| Full | 231,976 B | 232,961 B |
+
+All budgets pass. Root native/Wasm clippy passes in four feature sets, native tests pass in three sets, harness lint/format checks pass, and seven Chrome regressions pass. The decoder suite passed before the timer-policy refinement; decoder code was unchanged. Reports: tools/results/raw-yield-smoke.json (fixed-count experiment), raw-budget-smoke.json and raw-budget-repeat.json (final policy), raw-playback-final.json, size-raw-budget.json.
+
+A separate repeated-clock playback diagnostic still ends early at 4.074666 seconds instead of roughly six. The prior synchronous runtime reproduces it, so it is not hidden as a successful playback case. Run the raw playback helper with RSTREAMKIT_REPEAT_RAW=1; this remains timeline/discontinuity work under #16/#25. Movies still use synchronous range processing, so #34 remains open.
