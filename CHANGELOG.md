@@ -2,6 +2,8 @@
 
 ## Unreleased (0.2.0)
 
+- Shrink player diagnostics: full compressed Wasm and JavaScript falls by 766 bytes; reported seconds keep millisecond precision.
+
 - Keep the selected external audio language and timeline when changing stream quality. Add a decoded-tone Chrome regression.
 
 Breaking changes:
