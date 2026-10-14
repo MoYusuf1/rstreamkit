@@ -1032,3 +1032,61 @@ resolved harness lockfile. The comparison records hardware, input hashes, PCM
 checksums, memory and timings. Reproducing the selected harness yielded the same
 Wasm artifact hash as the measured candidate. Module load/init numbers in the
 Node report are diagnostic; this is not a browser cold-start benchmark.
+
+
+## Adaptive bitrate failure fallback (2026-10-13)
+
+Issue #9 also required fallback when a selected level repeatedly fails. The old
+player skipped every bad segment but never called bitrate selection on that path.
+Two consecutive unusable live segments now select the nearest lower compatible
+level. A healthy segment resets the streak even if no usable timing sample exists.
+Eight healthy segments delay reconsidering an upward retry; the existing three
+headroom checks then apply. Further downward steps remain available during recovery.
+Manual locks suppress automatic fallback, and a new manual quality request can
+apply even when the current level has no usable segment. Finite errors still fail.
+
+Variant changes use one existing apply/fetch/rendition path after the batch, rather
+than duplicating it for errors. Counters fit in the previous state padding by using
+bounded u8 fields. Policy state remains 16 bytes on this x86_64 target; the regression
+compares against the previous field layout so it is portable to different ABIs.
+No extra heap storage or dependency is added. Selection remains O(variant count)
+when needed; normal per-segment counter work is constant.
+
+| Failed-encoder provider case | Before | After |
+| --- | ---: | ---: |
+| Healthy lower-level segment requests | 0 | 4 |
+| Failed higher-level requests before fallback | No fallback | 2 |
+| New native failure/control cases | 0 | 4 |
+| Policy state on x86_64, bytes | 16 | 16 |
+
+The exact final Playwright fixture fails on preserved PR #63 artifacts (zero
+lower requests) and passes on the fixed full build. High sequences 37 and 38
+return 404; the healthy encoder has published through 42, and low sequences
+39–42 play. This preserves sequence progress rather than replaying skipped
+segments. Playback passes 6 seconds, stats report low quality and two skipped
+segments, and no Failed/Unsupported/browser error occurs. Four native cases cover
+nearest compatible fallback, lowest/empty sets, successful streak reset without
+timing, recovery hysteresis and manual choices (some cases combine related checks).
+Manual controls are tested in native policy; the small JS demo does not expose them.
+
+| Wasm + JS Brotli download bytes | Before (PR #63) | After |
+| --- | ---: | ---: |
+| Live | 107,969 | 108,210 |
+| Live + sound | 211,419 | 211,787 |
+| Movie | 128,972 | 129,224 |
+| Full | 232,290 | 232,741 |
+
+All four budgets pass. Full adds 451 bytes (0.19%) for the reliability fix. Native
+and Wasm lint/feature gates, media/decoder tests, normal provider downshift/upshift
+and five existing Chrome playback cases pass. This is live-segment recovery;
+it does not promise recovery from every manifest, source-close or unlimited outage.
+No CPU speedup or broad 4K/Edge/Safari claim is made.
+
+```sh
+NODE_PATH=tools/browser/node_modules node tools/node/abr-failure-smoke.cjs
+NODE_PATH=tools/browser/node_modules node tools/node/abr-smoke.cjs
+```
+
+The failure check uses repeated committed media with advancing lower-level
+availability to isolate policy. For the before case, set `RSTREAMKIT_PLAYER_DIR`
+to a directory containing PR #63's full-player JS and Wasm artifacts.

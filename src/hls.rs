@@ -319,8 +319,8 @@ pub fn parse(bytes: &[u8]) -> Result<Parsed, Error> {
     })
 }
 
-/// Highest bandwidth that still fits a modest budget, else the lowest available.
-/// ponytail: the budget is fixed; real ABR would watch download speed.
+/// Initial choice: highest compatible bandwidth within a modest budget, else the lowest.
+/// Playback can later adapt using measured throughput and repeated failures.
 pub fn pick_variant(variants: &[Variant]) -> Option<&Variant> {
     pick_variant_for(variants, 4_000_000)
 }

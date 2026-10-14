@@ -1149,6 +1149,7 @@ async fn run(
                 jump_requested |= jump;
             }
         }
+        let mut next_variant = None;
         for scheduled in window.batch(&media) {
             let seg = scheduled.segment;
             let url = resolve(&latest.url, &seg.uri)?;
@@ -1210,10 +1211,21 @@ async fn run(
                     stats.borrow_mut().dropped_segments += 1;
                     tx.borrow_mut().discontinuity();
                     say(Status::Note(format!("skipping unavailable segment: {why}")));
+                    if master_base.is_some() {
+                        next_variant = abr.failed(
+                            &variants,
+                            &variant_uri,
+                            variant_request.borrow().as_deref(),
+                        );
+                        if next_variant.is_some() {
+                            break;
+                        }
+                    }
                     continue;
                 }
                 Err(e) => return Err(e),
             };
+            abr.succeeded();
             if stop.get() {
                 return Ok(());
             }
@@ -1425,9 +1437,9 @@ async fn run(
             let (ahead, behind) =
                 crate::live::buffer_limits(bytes_per_second, media.target_duration);
             trim(video, buffer, &ms, behind).await?;
-            if let Some(base) = &master_base {
+            if master_base.is_some() {
                 let requested = variant_request.borrow().clone();
-                let candidate = if let Some(uri) = requested {
+                next_variant = if let Some(uri) = requested {
                     variants
                         .iter()
                         .find(|v| v.uri == uri && v.uri != variant_uri)
@@ -1439,28 +1451,7 @@ async fn run(
                         media.target_duration,
                     )
                 };
-                if let Some(candidate) = candidate {
-                    prefetch = None;
-                    variant_uri = candidate.uri.clone();
-                    let selected = candidate
-                        .renditions
-                        .iter()
-                        .filter(|r| r.uri.is_some())
-                        .max_by_key(|r| r.default)
-                        .and_then(|r| r.uri.as_deref())
-                        .map(|uri| resolve(base, uri))
-                        .transpose()?;
-                    if selected != audio_url {
-                        audio_state = RenditionState::default();
-                        audio_url = selected;
-                    }
-                    media_url = resolve(base, &variant_uri)?;
-                    say(Status::Note(format!(
-                        "switching variant to {}",
-                        candidate.bandwidth
-                    )));
-                    latest = fetch(http, &media_url, PLAYLIST_LIMIT, stop, &mut say).await?;
-                    media = parse_media(&latest)?;
+                if next_variant.is_some() {
                     break;
                 }
             }
@@ -1492,6 +1483,31 @@ async fn run(
                     break;
                 }
             }
+        }
+
+        if let (Some(base), Some(candidate)) = (&master_base, next_variant) {
+            prefetch = None;
+            variant_uri = candidate.uri.clone();
+            let selected = candidate
+                .renditions
+                .iter()
+                .filter(|r| r.uri.is_some())
+                .max_by_key(|r| r.default)
+                .and_then(|r| r.uri.as_deref())
+                .map(|uri| resolve(base, uri))
+                .transpose()?;
+            if selected != audio_url {
+                audio_state = RenditionState::default();
+                audio_url = selected;
+            }
+            media_url = resolve(base, &variant_uri)?;
+            say(Status::Note(format!(
+                "switching variant to {}",
+                candidate.bandwidth
+            )));
+            latest = fetch(http, &media_url, PLAYLIST_LIMIT, stop, &mut say).await?;
+            media = parse_media(&latest)?;
+            continue;
         }
 
         if media.ended {
