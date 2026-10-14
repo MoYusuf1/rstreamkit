@@ -294,8 +294,8 @@ impl Downmix {
                 // §7.8.1 `output_nfront == 2` path with `input_nfront==1`:
                 //   mix center into left with –3 dB
                 //   mix center into right with –3 dB
-                out.out_coeffs[0][0] = 0.707;
-                out.out_coeffs[1][0] = 0.707;
+                out.out_coeffs[0][1] = 0.707;
+                out.out_coeffs[1][1] = 0.707;
             }
             2 => {
                 // 2/0 — pass through. L at slot 0, R at slot 2 per
@@ -392,8 +392,8 @@ impl Downmix {
                 // 1/0 — pure center → both outputs get the C gain
                 // (default -3 dB = 0.707). Symmetric with the LoRo case
                 // (no surround sign play).
-                out.out_coeffs[0][0] = c;
-                out.out_coeffs[1][0] = c;
+                out.out_coeffs[0][1] = c;
+                out.out_coeffs[1][1] = c;
             }
             2 => {
                 // 2/0 — pass through. No surround to matrix-encode.
@@ -697,6 +697,21 @@ mod tests {
             copyright_info: crate::bsi::CopyrightInfo::from_bits(false, true),
             addbsi: None,
             bits_consumed: 0,
+        }
+    }
+
+    #[test]
+    fn stereo_from_mono_routes_center_to_both_outputs() {
+        let bsi = fake_bsi(1, 0, 0, false);
+        let mut src = [[0.0f32; 256]; 5];
+        src[0][..4].copy_from_slice(&[0.5, -0.5, 0.25, -0.25]);
+        for mode in [DownmixMode::Stereo, DownmixMode::StereoLtRt] {
+            let mix = Downmix::from_bsi(&bsi, mode);
+            let mut dst = [0.0f32; 8];
+            mix.apply(&src, 4, &mut dst);
+            for (frame, input) in dst.chunks_exact(2).zip(src[0]) {
+                assert_eq!(frame, &[input * 0.707, input * 0.707]);
+            }
         }
     }
 

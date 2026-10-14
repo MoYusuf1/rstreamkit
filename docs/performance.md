@@ -326,7 +326,7 @@ Decoding alone, best of ten in-process (the same Ryzen 7 5700):
 | --- | ---: | ---: |
 | 6 s AC-3 5.1, 448 kbit/s (`tools/media/ac3.ts`) | 40.3 ms | 20.0 ms |
 | 4.2 s programme audio (`tools/media/programme.ts`) | 10.4 ms | 5.9 ms |
-| 4 s AC-3 stereo (`h264_ac3.ts`) | 5.75 ms | 2.74 ms |
+| 4 s AC-3 mono (`h264_ac3.ts`; historical silent output, invalid audio-speed comparison) | 5.75 ms | 2.74 ms |
 | 2 s AC-3 5.1 (`h264_ac3_51.ts`) | 9.08 ms | 3.59 ms |
 | 2 s E-AC-3 5.1 (`h264_eac3_51.ts`) | 9.70 ms | 4.36 ms |
 
@@ -783,3 +783,66 @@ NODE_PATH=tools/browser/node_modules node tools/node/abr-smoke.cjs
 ```
 
 Serve a built full player first; set `RSTREAMKIT_URL` for an alternate local URL.
+
+
+## Mono AC-3 sound correction (2026-10-13)
+
+Issue #59: the committed four-second `h264_ac3.ts` clip is mono and has audible
+source sound (FFmpeg volumedetect mean −21.1 dB). Its original decoded stereo
+checksum, `b928f2d0e7a08325`, was exactly the checksum of 768,000 zero bytes.
+The old decoder-equality check therefore pinned silence. Earlier documentation
+called this fixture stereo; its historical silent-output timing is not valid
+evidence of correct audio processing speed.
+
+LoRo and LtRt placed their mono gains in slot 0, while the mixer mapped the
+source to center slot 1. Both now use slot 1. The existing gain stays unchanged.
+Mono PCM intentionally changes; corrected checksum is `2f95f6c00b945b35`.
+Other existing checksum gates remain unchanged. No dependency, unsafe code or
+public API change is added; optional `sound` builds retain the same capabilities.
+
+| Validation | Result |
+| --- | ---: |
+| Mono source duration | 4 seconds |
+| Corrected mono vs FFmpeg score | 66.6 dB |
+| Corrected mono correlation / level difference | 1.000 / about 0.0 dB |
+| Chrome peak observed RMS, left / right | 0.064183 / 0.064183 |
+| Chrome largest left/right sample difference | 0 |
+| Chrome audio analyzer polls | 197 |
+
+Native tests exercise positive/negative mono inputs in LoRo and LtRt and add
+mono to the existing independent FFmpeg pipeline comparison. Stereo, 5.1 AC-3,
+E-AC-3 and MP2 checks continue to pass. `tools/node/mono-smoke.cjs` uses Playwright
+Chrome 155.0.8059.39 and Web Audio to require non-silent, equal channels from
+actual MSE playback; completion alone would pass for silent sound too. The
+analyzer feeds a zero-gain output to avoid playing test tones through speakers.
+This observes decoded PCM, not physical speaker output or Edge/Safari support.
+
+| Player download, Wasm + JS Brotli bytes | Before (0450007) | After | Change |
+| --- | ---: | ---: | ---: |
+| Live | 112,830 | 112,830 | 0 |
+| Live + sound | 210,259 | 210,303 | +44 |
+| Movie | 135,702 | 135,702 | 0 |
+| Full | 232,817 | 232,654 | −163 |
+
+All budgets pass with the same size recipe. Compression/layout differences do
+not imply less CPU. Correct mono sound necessarily does more useful encoding
+work than the prior silent output; no speedup claim is made for this fix.
+
+```sh
+cargo test --release --test pipeline ac3_eac3_and_mp2_sound_is_decoded_to_flac_that_matches_ffmpeg -- --nocapture
+cargo test --release --manifest-path ac3/Cargo.toml stereo_from_mono
+NODE_PATH=tools/browser/node_modules node tools/node/mono-smoke.cjs
+python3 tools/size.py --check-budgets --output tools/results/size-mono-audio.json
+```
+
+FLAC experiment decision: do not retain the attempted constant-space residual
+search. On the same nonconstant two-second 5.1 AC-3 corpus, an early native
+variant reduced allocations from 378 to 126 but slowed median encoder time from
+2.168 to 4.483 ms. Borrowing channel samples while retaining a residual vector
+still measured 2.239 → 2.389 ms. These are targeted native experiments, not final
+shipped-code or Wasm benchmarks. The original FLAC writer remains unchanged;
+its speed/space tradeoff needs more profiling under #45/#48.
+
+Mono validation also passes formatting, all eight native/Wasm clippy builds,
+default/minimal/vod tests, the complete vendored decoder suite and five existing
+Playwright playback/recovery checks.
