@@ -25,10 +25,10 @@ The 4K rows use the same 18-second clip at 40 Mbps. The sound and download rows 
 | --- | ---: | ---: |
 | Rust/Wasm memory | 70.9 MB | **35.8–36.7 MB (about 49% less)** |
 | Dropped frames | 0 of 1,080 | **0 of 1,080 in each run** |
-| Full player download, compressed | 232,742 bytes | **233,328 bytes (+586)** |
+| Full player download, compressed | 232,742 bytes | **234,032 bytes (+1,290)** |
 | Process 2 seconds of MP2 sound in Wasm | 16.38 ms | **13.37 ms (18% less)** |
 
-Memory excludes the browser, decoder and GPU. MP2 time is measured in Node. Download counts Wasm and JavaScript, with the same features. Stats formatting saved 766 bytes; audio scheduling and clock fixes added 1,352. Short checks do not prove long-run 4K performance. Chrome, Edge and Safari endurance tests are still planned.
+Memory excludes the browser, decoder and GPU. MP2 time is measured in Node. The download includes the engine and browser code, with the same features. Short checks do not prove long-run 4K performance. Chrome, Edge and Safari endurance tests are still planned.
 
 ## What you can use it for
 

@@ -154,6 +154,7 @@ pub fn memory_bytes() -> usize {
 pub struct ProfileSession {
     movie: Rc<vod::Movie>,
     session: vod::Session,
+    hash: ContinuousHash,
 }
 #[wasm_bindgen]
 impl ProfileSession {
@@ -162,7 +163,14 @@ impl ProfileSession {
             vod::Movie::from_mp4(moov, size).map_err(|e| JsValue::from_str(&e.to_string()))?,
         );
         let session = movie.session(0.0);
-        Ok(ProfileSession { movie, session })
+        Ok(ProfileSession {
+            movie,
+            session,
+            hash: ContinuousHash::new(),
+        })
+    }
+    pub fn range_limit(&mut self, max: u64) -> Option<Vec<u64>> {
+        self.session.range(max).map(|(a, l)| vec![a, l])
     }
     pub fn range(&mut self) -> Option<Vec<u64>> {
         self.session
@@ -170,10 +178,27 @@ impl ProfileSession {
             .map(|(a, l)| vec![a, l])
     }
     pub fn push(&mut self, bytes: &[u8]) -> Result<usize, JsValue> {
-        self.session
+        let bytes = self
+            .session
             .push(bytes)
-            .map(|b| b.len())
-            .map_err(|e| JsValue::from_str(&e.to_string()))
+            .map_err(|e| JsValue::from_str(&e.to_string()))?;
+        self.hash.bytes(&bytes);
+        Ok(bytes.len())
+    }
+    pub async fn push_yielded(&mut self, bytes: &[u8]) -> Result<usize, JsValue> {
+        let bytes = self
+            .session
+            .push_yielded(bytes)
+            .await
+            .map_err(|e| JsValue::from_str(&e.to_string()))?;
+        self.hash.bytes(&bytes);
+        Ok(bytes.len())
+    }
+    pub fn output_checksum(&self) -> u64 {
+        self.hash.hash
+    }
+    pub fn output_bytes(&self) -> usize {
+        self.hash.bytes
     }
     pub fn duration(&self) -> f64 {
         self.movie.duration
@@ -215,7 +240,11 @@ impl ProfileProbe {
             .ok_or_else(|| JsValue::from_str("probe incomplete"))?
             .clone();
         let session = movie.session(0.0);
-        Ok(ProfileSession { movie, session })
+        Ok(ProfileSession {
+            movie,
+            session,
+            hash: ContinuousHash::new(),
+        })
     }
 }
 

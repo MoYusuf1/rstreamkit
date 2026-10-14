@@ -337,6 +337,19 @@ impl Session {
 
     /// Hands over the bytes of the last range. Returns what to append (maybe nothing yet).
     pub fn push(&mut self, bytes: &[u8]) -> Result<Vec<u8>, Error> {
+        let (frames, done) = self.read_frames(bytes)?;
+        Ok(self.frag.push(frames, done))
+    }
+
+    /// Process a range with cooperative browser sound decoding.
+    /// Discard this session if the future is cancelled: its cursor may have advanced.
+    #[cfg(target_arch = "wasm32")]
+    pub async fn push_yielded(&mut self, bytes: &[u8]) -> Result<Vec<u8>, Error> {
+        let (frames, done) = self.read_frames(bytes)?;
+        Ok(self.frag.push_yielded(frames, done).await)
+    }
+
+    fn read_frames<'a>(&mut self, bytes: &'a [u8]) -> Result<(Vec<Frame<'a>>, bool), Error> {
         let (start, _) = self.asked;
         let (frames, done) = match (&self.movie.index, &mut self.cursor) {
             (Index::Mp4(i), Cursor::Mp4(c)) => {
@@ -355,7 +368,7 @@ impl Session {
             ));
         }
         self.done = done;
-        Ok(self.frag.push(frames, done))
+        Ok((frames, done))
     }
 
     pub fn done(&self) -> bool {
@@ -406,8 +419,25 @@ impl Fragmenter {
     }
 
     fn push(&mut self, frames: Vec<Frame<'_>>, last: bool) -> Vec<u8> {
+        let (video, sound) = self.prepare(frames, last);
+        let coded = self.coded_sound(&sound);
+        self.fragment(&video, &sound, &coded)
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    async fn push_yielded(&mut self, frames: Vec<Frame<'_>>, last: bool) -> Vec<u8> {
+        let (video, sound) = self.prepare(frames, last);
+        let coded = self.coded_sound_yielded(&sound).await;
+        self.fragment(&video, &sound, &coded)
+    }
+
+    fn prepare<'a>(
+        &mut self,
+        frames: Vec<Frame<'a>>,
+        last: bool,
+    ) -> (Vec<Frame<'a>>, Vec<Frame<'a>>) {
         let mut video = vec![];
-        let mut audio = std::mem::take(&mut self.waiting);
+        let mut audio: Vec<Frame<'a>> = std::mem::take(&mut self.waiting);
         for f in frames {
             match f.track {
                 Track::Video => match self.floor {
@@ -440,6 +470,15 @@ impl Fragmenter {
             .filter(|f| f.pts.saturating_add(SOUND_FRAME) >= floor)
             .collect();
 
+        (video, sound)
+    }
+
+    fn fragment(
+        &mut self,
+        video: &[Frame<'_>],
+        sound: &[Frame<'_>],
+        coded: &[(Cow<'_, [u8]>, u32)],
+    ) -> Vec<u8> {
         let mut runs = vec![];
         if !video.is_empty() {
             // A run's times come from its durations alone, so each lasts until the next one
@@ -466,7 +505,6 @@ impl Fragmenter {
                 samples,
             });
         }
-        let coded = self.coded_sound(&sound);
         if !coded.is_empty() {
             let rate = u64::from(self.audio.as_ref().map_or(48_000, |a| a.1));
             let derived = (sound[0].pts.max(0) as u64) * rate / 1_000_000;
@@ -495,6 +533,35 @@ impl Fragmenter {
         }
         self.seq += 1;
         fmp4::fragment(self.seq, &runs)
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    async fn coded_sound_yielded<'a>(
+        &mut self,
+        frames: &'a [Frame<'_>],
+    ) -> Vec<(Cow<'a, [u8]>, u32)> {
+        let Some((Audio::Sound(kind), _)) = &self.audio else {
+            return self.coded_sound(frames);
+        };
+        let kind = *kind;
+        let mut out = vec![];
+        let mut slice = crate::YieldSlice::new();
+        let mut count = 0usize;
+        for frame in frames {
+            for part in sound::split(kind, &frame.data) {
+                let pcm = self.decoder.decode(kind, &part);
+                out.push((
+                    Cow::Owned(sound::flac_frame(&pcm, self.flac_frames)),
+                    (pcm.len() / 2) as u32,
+                ));
+                self.flac_frames += 1;
+                count += 1;
+                if count.is_multiple_of(8) {
+                    slice.checkpoint().await;
+                }
+            }
+        }
+        out
     }
 
     /// Sound as the samples of the audio track: (bytes, length in sample-rate ticks). AAC is
