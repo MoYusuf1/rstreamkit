@@ -26,6 +26,7 @@ pub mod body;
 #[cfg(any(target_arch = "wasm32", test))]
 mod cancel;
 pub mod cmaf;
+mod duration;
 pub mod fmp4;
 pub mod hls;
 #[cfg(any(target_arch = "wasm32", test))]

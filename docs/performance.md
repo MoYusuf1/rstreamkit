@@ -550,6 +550,10 @@ variant/rendition transitions and streamed/pending-I/O faults through that runne
 
 ## Prepared playlist walks (2026-10-13)
 
+Historical benchmark below is from `c80c0ee` (PR #55). The later constant-space
+section compares against that cache-based implementation.
+
+
 The old browser loop found the current/next segment and summed the remaining
 playlist for every segment. Live stats also summed the whole window repeatedly.
 The new `Session::batch` prepares suffix durations once, borrows segment references
@@ -606,3 +610,90 @@ existing checks against this build: five playback, four source-update faults,
 two retry and one go-live check. In particular, finite playback still reaches
 its last segment across buffer waits. Browser instructions are above and in
 `tools/README.md`. Long 4K60 and real Edge/Safari validation remain pending.
+
+## Constant-space runtime walks (2026-10-13)
+
+The playlist walk now keeps bounded duration totals instead of an array per
+segment. Equal durations use a count and one value. Ordinary varying durations
+use scaled 128-bit integers. Extreme values use a fixed 2176-bit integer sum;
+this fallback preserves small tails after overflowing totals. Conversion rounds
+the exact remaining total once. The cursor also reuses URI storage and releases
+an unusually large buffer after a short replacement.
+
+For one unchanged snapshot, time remains O(n). Extra walk storage changes from
+O(n) to O(1). The parsed playlist and media buffers still occupy their own memory;
+this does not make the whole player constant-space.
+
+Allocator measurements: native x86_64, Ryzen 7 5700/Linux, Rust 1.99.0 release,
+predecessor `c80c0ee`. Thread-local counters cover batch construction/walking or
+cursor updates only; fixture creation is excluded. These measure requested heap
+bytes and object sizes, not whole-process peak memory or committed Wasm pages.
+
+| Native runtime measure | Cache-based | Constant-space |
+| --- | ---: | ---: |
+| Normal 20,000-entry batch heap bytes requested | 160,008 | 0 |
+| Normal batch object + requested array bytes | 160,064 | 64 |
+| Normal three-entry batch object + array bytes | 88 | 64 |
+| URI allocations across 20,000 equal-length names | 20,000 | 1 |
+| URI bytes requested across those updates (cumulative) | 360,000 | 18 |
+
+The new normal batch is 64 bytes on this build, independent of playlist length.
+Rare extreme inputs use one 296-byte fallback allocation, also independent of
+length; normal durations allocate none. Allocator headers/padding are excluded.
+Cursor growth may reallocate for longer URIs; it does not promise one allocation
+for arbitrary names. Storage above four times the next URI length (minimum
+256 bytes) is replaced rather than retained indefinitely.
+
+Timing driver retains the predecessor's suffix array and URI cloning beside the
+new path. Each scenario is a fresh process, one warm-up per path then nine
+alternating pairs. Construction and cursor updates are included; parsing, media,
+network, file I/O and playback waits are excluded. CPU/OS/compiler are as above.
+Variable durations cycle through 4.589889, 5.123457 and 5.5 seconds.
+
+| Entries / durations | Before median | After median | Before p95 | After p95 |
+| --- | ---: | ---: | ---: | ---: |
+| 128 / equal | 0.002094 ms | 0.002225 ms | 0.002184 ms | 0.002294 ms |
+| 2,048 / equal | 0.041348 ms | 0.041980 ms | 0.041658 ms | 0.042961 ms |
+| 20,000 / equal | 0.302902 ms | 0.287533 ms | 0.457495 ms | 0.409774 ms |
+| 128 / varying | 0.001954 ms | 0.003066 ms | 0.002044 ms | 0.003477 ms |
+| 2,048 / varying | 0.035567 ms | 0.048312 ms | 0.037771 ms | 0.051086 ms |
+| 20,000 / varying | 0.324584 ms | 0.485528 ms | 0.398252 ms | 0.489355 ms |
+
+Equal-duration timing is broadly unchanged; varying durations cost another
+0.161 ms for 20,000 entries. This is a deliberate memory/allocator tradeoff,
+not a universal CPU win. Linear time is retained rather than improved beyond
+O(n). No end-to-end speed, whole-player peak-memory or FFmpeg claim is made.
+
+Repeat allocation measurements with
+`cargo test --release --test playlist_allocations measure_playlist_allocations -- --ignored --nocapture`.
+To capture the predecessor, copy that test file into an isolated `c80c0ee`
+checkout and run only the ignored measurement; its new zero-allocation assertions
+are intended for the new implementation. Timing:
+
+```sh
+for count in 128 2048 20000; do
+  RSTREAMKIT_BENCH_SEGMENTS=$count cargo test --release --test playlist_batch measure_playlist_bookkeeping -- --ignored --nocapture
+  RSTREAMKIT_BENCH_VARIABLE=1 RSTREAMKIT_BENCH_SEGMENTS=$count cargo test --release --test playlist_batch measure_playlist_bookkeeping -- --ignored --nocapture
+done
+```
+
+Six new regular checks cover exact removable arithmetic, nonfinite restoration,
+bounded URI retention, normal zero allocations, URI reuse and constant fallback
+allocation. The arithmetic oracle checks every suffix in 112 generated cases,
+using Python Decimal at 1600-digit precision. Reproduce with
+`python3 tools/duration_vectors.py --check`; Python is a development tool only.
+Runtime library code adds no dependencies and no unsafe code; the allocation-test
+wrapper alone forwards unsafe System allocator calls for measurement.
+
+| Download, Wasm + JS Brotli bytes | Before | After |
+| --- | ---: | ---: |
+| Live | 111,440 | 112,767 |
+| Live + sound | 208,904 | 210,542 |
+| Movie | 134,520 | 135,739 |
+| Full | 231,450 | 232,785 |
+
+Same wasm-bindgen 0.2.128, wasm-opt 130 and Brotli 1.2.0 recipe. Full download
+grows 1,335 bytes (0.58%) to remove growing runtime storage. All four budgets
+pass: `python3 tools/size.py --check-budgets --output tools/results/size-constant-space.json`.
+Required Rust/native/wasm checks, media/decoder tests and twelve Playwright Chrome
+155.0.8059.39 checks pass. 4K60 soak and real Edge/Safari acceptance remain open.

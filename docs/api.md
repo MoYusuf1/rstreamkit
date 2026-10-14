@@ -116,7 +116,10 @@ pending. The new controller does not claim to finish #23 by itself.
 Each `ScheduledSegment` borrows the current/next segment and supplies cached
 remaining/window seconds. Build once per snapshot and keep it across finite
 buffer waits; rebuild after refresh or a control/selection change. The immutable
-borrow prevents changing the playlist underneath a batch. Duration cache payload
-is `8 * (pending_segments + 1)` bytes; no media bytes are copied. Suffix sums avoid
-losing small tails through subtraction of very large totals. Ordinary floating
-point sums can differ from the former forward sums by roundoff.
+borrow prevents changing the playlist underneath a batch. The walk now uses constant extra duration storage, without copying media bytes.
+Ordinary finite durations need no heap allocation. Extreme inputs use one bounded
+fallback allocation instead of an array that grows with the playlist. Remaining
+durations are correctly rounded from exact totals; results can differ from the
+old repeated sums by roundoff. The playlist itself still occupies O(n) memory.
+`Session::consumed` reuses URI storage and replaces an oversized buffer when its
+capacity exceeds four times the new URI length (with a 256-byte minimum).
