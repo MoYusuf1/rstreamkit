@@ -4,7 +4,75 @@ use crate::{
     body::{self, Capped},
 };
 use futures_core::Stream;
-use std::{ops::Range, pin::Pin};
+use std::{future::Future, ops::Range, pin::Pin, time::Duration};
+
+/// Host-provided timer. Native hosts may use their executor; tests can advance a fake clock.
+/// Dropping the sleep future must release its pending work. No `Send` bound is required.
+#[allow(async_fn_in_trait)]
+pub trait Clock {
+    async fn sleep(&self, duration: Duration);
+}
+
+/// A retry operation either failed with its original error or was cancelled between attempts.
+#[derive(Debug, PartialEq)]
+#[non_exhaustive]
+pub enum RetryError<E> {
+    Failed(E),
+    Cancelled,
+}
+
+/// Run at most seven attempts, with delays of 0, 1, 2, 4, 8, 8 and 8 seconds.
+/// Only errors accepted by `retryable` are retried. Report reconnecting before each
+/// retry delay, keeping callbacks and transport errors owned by the host.
+///
+/// Cancellation is checked before callbacks, timers and requests, and after timers.
+/// To interrupt a request or timer already pending, drop this future; the host's
+/// `Fetch` and `Clock` implementations must cancel their work on drop.
+pub async fn retry<T, E, F: Future<Output = Result<T, E>>>(
+    clock: &impl Clock,
+    cancelled: impl Fn() -> bool,
+    mut once: impl FnMut() -> F,
+    retryable: impl Fn(&E) -> bool,
+    mut reconnecting: impl FnMut(u32),
+) -> Result<T, RetryError<E>> {
+    let mut attempt = 0;
+    loop {
+        if cancelled() {
+            return Err(RetryError::Cancelled);
+        }
+        if attempt > 0 {
+            reconnecting(attempt);
+        }
+        if cancelled() {
+            return Err(RetryError::Cancelled);
+        }
+        clock
+            .sleep(Duration::from_secs(retry_delay(attempt).unwrap_or(0)))
+            .await;
+        if cancelled() {
+            return Err(RetryError::Cancelled);
+        }
+        match once().await {
+            Ok(value) => return Ok(value),
+            Err(error) if attempt == 6 || !retryable(&error) => {
+                return Err(RetryError::Failed(error));
+            }
+            Err(_) => attempt += 1,
+        }
+    }
+}
+
+/// Bounded backoff shared by native and browser playback.
+pub(crate) fn retry_delay(attempt: u32) -> Option<u64> {
+    match attempt {
+        0 => Some(0),
+        1 => Some(1),
+        2 => Some(2),
+        3 => Some(4),
+        4..=6 => Some(8),
+        _ => None,
+    }
+}
 
 /// How the player reaches the network. The app supplies it, so rstreamkit knows nothing about proxies,
 /// credentials or headers: the browser’s `mse::Direct` adapter is the plain case, and an app that has to go through a proxy

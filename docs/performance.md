@@ -421,3 +421,37 @@ Reproduce with `bash tools/build.sh`, then
 `profile.cjs` from the baseline build, use identical input files, and alternate
 baseline/current processes. This small programme sample does not represent all
 soundtracks; browser dropped-frame improvement is still unmeasured.
+
+## Shared retry loop (2026-10-10)
+
+Browser playback now uses the same Rust retry loop as native hosts. Fake time
+makes outage and stop tests immediate; it does not make real network retries
+faster. No dependencies were added. The loop keeps its seven-attempt limit and
+31-second total backoff budget. Dropping a browser wait now clears its timer.
+
+| Measure | Before | After |
+| --- | ---: | ---: |
+| Native tests of the actual retry loop | 0 | 9 |
+| Live player, Brotli bytes (Wasm + JS) | 109,318 | 108,751 |
+| Live + sound player, Brotli bytes | 207,114 | 206,631 |
+| Movie player, Brotli bytes | 132,204 | 131,598 |
+| Full player, Brotli bytes | 229,337 | 228,866 |
+
+Same Linux, Rust 1.99.0, wasm-bindgen 0.2.128, wasm-opt 130 and Brotli 1.2.0;
+`python3 tools/size.py --check-budgets --output tools/results/size-retry.json`.
+The baseline is the main tree at `39f9c383`, with the existing
+`size-buffer-final.json` report. These small build-size changes are not runtime
+speed measurements or a comparison with FFmpeg.
+
+Run `cargo test --test retry` (also with `--no-default-features`). The nine cases
+cover a ten-second outage through real TS parsing, a dropped response body,
+404, retry exhaustion, three stop points, and dropping pending timer/request
+work. The fake provider recovers at the scheduled 15-second attempt.
+
+For browser checks, install `@playwright/test@1.64.0` in a development directory,
+build the player and run `python3 tools/server.py`. Set `NODE_PATH` to that
+installation's `node_modules`, then run `node tools/node/retry-smoke.cjs`.
+`RSTREAMKIT_URL` can select another local player URL. Chrome 155.0.8059.39 passed
+two checks: Stop reduced one pending retry timer to zero with no later request;
+a 503 followed by a 404 made exactly two requests and stopped. These are
+functional checks; real Edge/Safari and long 4K60 acceptance remain pending.

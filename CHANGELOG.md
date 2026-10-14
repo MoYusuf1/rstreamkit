@@ -9,6 +9,8 @@ Breaking changes:
 - Additional public enums are non-exhaustive; Demuxed gains passthrough metadata.
 
 Changes:
+- Share the retry loop between native and browser hosts; test nine outage/cancellation cases with fake time.
+- Clear browser timers when their waiting future is dropped.
 - Cancel player tasks and Direct fetches on stop/drop; release buffer listeners.
 - Handle source closure/removal while waiting for appends and removals.
 - Retain HLS durations, source dates and discontinuities; prefer supported codecs.
