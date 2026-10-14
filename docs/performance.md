@@ -754,3 +754,32 @@ Chrome 155.0.8059.39 checks pass against this exact full-player build: finite
 completion, Dolby fallback, finite 404, stop/new session, and live 404 recovery.
 This is not 4K60 or desktop Edge/Safari acceptance. #48 remains open for the
 broader retained-size/startup audit and build-profile comparisons.
+
+
+## Adaptive bitrate provider acceptance (2026-10-13)
+
+`tools/node/abr-smoke.cjs` uses Playwright Chrome 155.0.8059.39 and the exact
+full player from PR #57. Two fresh-browser runs pass. The fake provider advertises
+100,000 and 1,000,000 bit/s levels. Both return the same committed 206,800-byte
+`bbb_480p.ts` clip, preserving source timing to isolate switching policy.
+Forty finite entries allow time for real MSE appends and buffer backpressure.
+
+| Provider phase | Response delay | Completed variant requests, each run |
+| --- | ---: | --- |
+| Slow | 2,000 ms | high, low, low, low, low |
+| Restored | 100 ms | low, low, low, low, high, high, high |
+| Runtime code/dependencies added | — | 0 / 0 |
+
+The test requires at least three slow low-level responses, three recovered
+high-level responses, continued playback and recovered variant stats, with no
+Failed/Unsupported/browser error. Cancelled requests are recorded separately.
+All shipped bytes are unchanged. This models delayed complete-body throughput,
+not packet loss, a shared bandwidth cap, perceptual quality or resolution changes.
+It does not prove 4K60, Edge/Safari or dropped-frame acceptance. #9's provider
+acceptance is covered; close after this test lands.
+
+```sh
+NODE_PATH=tools/browser/node_modules node tools/node/abr-smoke.cjs
+```
+
+Serve a built full player first; set `RSTREAMKIT_URL` for an alternate local URL.
