@@ -88,6 +88,7 @@ node tools/node/retry-smoke.cjs
 node tools/node/buffer-smoke.cjs
 node tools/node/session-smoke.cjs
 node tools/node/abr-smoke.cjs
+node tools/node/mono-smoke.cjs
 ```
 
 These use routes and committed fixtures; no generated media is needed.
@@ -98,3 +99,6 @@ The ABR check starts at the higher advertised level, slows complete segment
 responses for at least three lower-level downloads, then restores speed and
 requires three higher-level downloads plus continued playback. Both levels use
 the same committed clip to isolate policy; this is not a resolution/quality test.
+
+The mono check observes decoded PCM with Web Audio and requires non-silent,
+equal left/right channels; it sends no sound to physical speakers.

@@ -283,7 +283,8 @@ mod sound {
             eprintln!("ffmpeg isn't installed: skipping");
             return;
         }
-        let clips: [(&str, &[u8]); 4] = [
+        let clips: [(&str, &[u8]); 5] = [
+            ("h264_ac3.ts", include_bytes!("fixtures/h264_ac3.ts")),
             ("h264_ac3_st.ts", include_bytes!("fixtures/h264_ac3_st.ts")),
             ("h264_ac3_51.ts", include_bytes!("fixtures/h264_ac3_51.ts")),
             (
