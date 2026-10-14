@@ -134,3 +134,19 @@ test('raw Dolby TS plays through EOF with decoded sound', async ({ baseURL }, te
   await testInfo.attach('raw-playback-report', { body: stdout, contentType: 'application/json' });
   expect(JSON.parse(stdout).audio.max_rms).toBeGreaterThan(0.005);
 });
+
+test('raw timestamp restarts preserve all three clips', async ({ baseURL }, testInfo) => {
+  test.skip(testInfo.project.name !== 'chrome', 'This helper launches installed Chrome.');
+  test.setTimeout(45000);
+  const path = require('node:path');
+  const { promisify } = require('node:util');
+  const { execFile } = require('node:child_process');
+  const { stdout } = await promisify(execFile)(process.execPath, [path.join(__dirname, '../node/raw-playback-smoke.cjs')], {
+    env: { ...process.env, RSTREAMKIT_URL: baseURL, RSTREAMKIT_REPEAT_RAW: '1',
+      NODE_PATH: process.env.NODE_PATH || path.join(__dirname, 'node_modules') },
+    timeout: 40000, maxBuffer: 1024 * 1024,
+  });
+  await testInfo.attach('raw-restart-report', { body: stdout, contentType: 'application/json' });
+  const report = JSON.parse(stdout);
+  expect(report.raw_quality.total - report.initial_quality.total).toBeGreaterThanOrEqual(149);
+});

@@ -439,22 +439,37 @@ impl Demuxer {
             || Some(pid) == self.audio_pid
             || self.sound.is_some_and(|(p, _)| p == pid)
         {
+            // One reused buffer per stream; audio with a declared PES length
+            // can be delivered as soon as it is complete instead of waiting for
+            // the next packet start, which may belong to a restarted clock.
+            let at = match self.pes.iter().position(|(p, _)| *p == pid) {
+                Some(at) => at,
+                None if pusi => {
+                    self.pes.push((pid, Vec::new()));
+                    self.pes.len() - 1
+                }
+                None => return,
+            };
+            let buf = &mut self.pes[at].1;
             if pusi {
-                // One buffer per stream, reused for every packet of it: after the largest frame
-                // there is nothing left to allocate.
-                let at = match self.pes.iter().position(|(p, _)| *p == pid) {
-                    Some(at) => at,
-                    None => {
-                        self.pes.push((pid, Vec::new()));
-                        self.pes.len() - 1
-                    }
-                };
-                let buf = &mut self.pes[at].1;
                 flush(pid, buf, self.video_pid, self.sound, &mut self.out);
                 buf.clear();
-                buf.extend(payload);
-            } else if let Some((_, buf)) = self.pes.iter_mut().find(|(p, _)| *p == pid) {
-                buf.extend(payload);
+            } else if buf.is_empty() {
+                return;
+            }
+            buf.extend(payload);
+            if Some(pid) != self.video_pid && buf.len() >= 6 {
+                let length = usize::from(u16::from_be_bytes([buf[4], buf[5]]));
+                if length != 0 && buf.len() >= length + 6 {
+                    flush(
+                        pid,
+                        &buf[..length + 6],
+                        self.video_pid,
+                        self.sound,
+                        &mut self.out,
+                    );
+                    buf.clear();
+                }
             }
         }
     }
@@ -551,6 +566,7 @@ impl Demuxer {
             return Ok(None);
         };
         let cutoff = self.out.video[cut].pts;
+        let clock_reset = self.out.video[cut].dts < self.out.video[cut - 1].dts;
         let bytes: usize = self.out.video[..cut].iter().map(|v| v.len as usize).sum();
         // The next fragment's buffer starts at this one's size, so it doesn't grow (and copy, and
         // fault in fresh pages) all over again for every group of pictures.
@@ -561,13 +577,19 @@ impl Demuxer {
         self.out.video_data.truncate(end);
         let video_data = std::mem::replace(&mut self.out.video_data, next);
         let video = self.out.video.drain(..cut).collect();
-        let (audio, later) = std::mem::take(&mut self.out.audio)
-            .into_iter()
-            .partition(|s| s.pts < cutoff);
+        let (audio, later) = split_clock(
+            std::mem::take(&mut self.out.audio),
+            cutoff,
+            clock_reset,
+            |s| s.pts,
+        );
         self.out.audio = later;
-        let (sound, later) = std::mem::take(&mut self.out.sound)
-            .into_iter()
-            .partition(|s| s.pts < cutoff);
+        let (sound, later) = split_clock(
+            std::mem::take(&mut self.out.sound),
+            cutoff,
+            clock_reset,
+            |s| s.pts,
+        );
         self.out.sound = later;
         let mut out = Demuxed {
             video,
@@ -641,6 +663,29 @@ impl Demuxer {
     }
 }
 
+// Compare audio within its current clock epoch. A new encoder's small PTS
+// must not leap ahead of older queued samples just because its clock restarted.
+fn split_clock<T>(
+    samples: Vec<T>,
+    cutoff: u64,
+    reset: bool,
+    pts: impl Fn(&T) -> u64,
+) -> (Vec<T>, Vec<T>) {
+    let epoch_end = samples
+        .windows(2)
+        .position(|w| pts(&w[1]) < pts(&w[0]))
+        .map_or(samples.len(), |at| at + 1);
+    let (mut before, mut after) = (Vec::new(), Vec::new());
+    for (at, sample) in samples.into_iter().enumerate() {
+        if at < epoch_end && (reset || pts(&sample) < cutoff) {
+            before.push(sample);
+        } else {
+            after.push(sample);
+        }
+    }
+    (before, after)
+}
+
 /// Puts the pictures in decode order. They nearly always arrive that way, and then nothing moves;
 /// a stream that doesn't gets its buffer rebuilt in order (`base` is what the buffer began with).
 fn sort_video(out: &mut Demuxed, base: usize) {
@@ -676,6 +721,47 @@ pub fn demux(data: &[u8]) -> Result<Demuxed, Error> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn completed_audio_pes_is_available_without_another_packet_start() {
+        let clip = include_bytes!("../tests/fixtures/h264_ac3_51.ts");
+        let expected = super::demux(clip).unwrap().sound.len();
+        let mut live = super::Demuxer::new(vec![]);
+        live.feed(clip);
+        assert_eq!(live.out.sound.len(), expected);
+        assert!(expected > 0);
+    }
+
+    #[test]
+    fn zero_length_audio_pes_keeps_the_existing_finish_fallback() {
+        let clip = include_bytes!("../tests/fixtures/h264_ac3_51.ts");
+        let expected = super::demux(clip).unwrap();
+        let mut unbounded = clip.to_vec();
+        for packet in unbounded.as_chunks_mut::<188>().0 {
+            if packet[1] & 0x40 == 0 {
+                continue;
+            }
+            let off = match (packet[3] >> 4) & 3 {
+                1 => 4,
+                3 => 5 + usize::from(packet[4]),
+                _ => continue,
+            };
+            if let Some(header) = packet.get_mut(off..off + 6)
+                && header[..4] == [0, 0, 1, 0xbd]
+            {
+                header[4..6].fill(0);
+            }
+        }
+        let actual = super::demux(&unbounded).unwrap();
+        assert_eq!(actual.sound.len(), expected.sound.len());
+        assert!(
+            actual
+                .sound
+                .iter()
+                .zip(expected.sound)
+                .all(|(a, b)| a.data == b.data)
+        );
+    }
+
     use super::*;
 
     #[test]
