@@ -519,8 +519,11 @@ pub fn flac_frame(pcm: &[i16], number: u32) -> Vec<u8> {
         word: 0,
         used: 0,
     };
+    // Reuse temporary channel storage within this frame; retain nothing between calls.
+    let mut values = Vec::with_capacity(samples);
+    let mut residual = Vec::new();
     for channel in 0..2 {
-        flac_channel(&mut bits, pcm, channel);
+        flac_channel(&mut bits, pcm, channel, &mut values, &mut residual);
     }
     if bits.used != 0 {
         bits.bytes.push((bits.word << (8 - bits.used)) as u8);
@@ -562,13 +565,15 @@ impl FlacBits {
 fn folded(n: i32) -> u32 {
     ((n as u32) << 1) ^ ((n >> 31) as u32)
 }
-fn flac_channel(bits: &mut FlacBits, pcm: &[i16], channel: usize) {
-    let samples: Vec<i32> = pcm
-        .as_chunks::<2>()
-        .0
-        .iter()
-        .map(|p| i32::from(p[channel]))
-        .collect();
+fn flac_channel(
+    bits: &mut FlacBits,
+    pcm: &[i16],
+    channel: usize,
+    samples: &mut Vec<i32>,
+    residual: &mut Vec<u32>,
+) {
+    samples.clear();
+    samples.extend(pcm.as_chunks::<2>().0.iter().map(|p| i32::from(p[channel])));
     if samples.iter().all(|&n| n == samples[0]) {
         bits.put(0, 8);
         bits.put(samples[0] as u32, 16);
@@ -576,7 +581,8 @@ fn flac_channel(bits: &mut FlacBits, pcm: &[i16], channel: usize) {
     }
     let mut best = (8 + samples.len() * 16, None, 0);
     // Reuse one search buffer; remember the winning parameters instead of cloning it.
-    let mut residual = Vec::with_capacity(samples.len());
+    residual.clear();
+    residual.reserve(samples.len());
     for order in 0..=2usize.min(samples.len() - 1) {
         residual.clear();
         residual.extend((order..samples.len()).map(|i| {
@@ -621,7 +627,7 @@ fn flac_channel(bits: &mut FlacBits, pcm: &[i16], channel: usize) {
         }
     } else {
         bits.put(2, 8);
-        for n in samples {
+        for &n in samples.iter() {
             bits.put(n as u32, 16);
         }
     }
@@ -787,3 +793,7 @@ mod tests {
 #[cfg(all(test, feature = "sound"))]
 #[path = "stereo_tests.rs"]
 mod stereo_tests;
+
+#[cfg(test)]
+#[path = "flac_tests.rs"]
+mod flac_tests;

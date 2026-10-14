@@ -2,6 +2,8 @@
 
 ## Unreleased (0.2.0)
 
+- Reuse FLAC channel scratch buffers: measured frame allocation requests fall 40%, with unchanged output and 85 extra compressed bytes in the full engine.
+
 - Count the whole player download, budget its HTML, and check startup requests and initial memory for all four builds.
 
 - Decode movie sound with the shared browser work budget and discard old decoded ranges when a user seeks during a yield.
