@@ -123,3 +123,18 @@ durations are correctly rounded from exact totals; results can differ from the
 old repeated sums by roundoff. The playlist itself still occupies O(n) memory.
 `Session::consumed` reuses URI storage and replaces an oversized buffer when its
 capacity exceeds four times the new URI length (with a 256-byte minimum).
+
+### Cooperative browser audio
+
+On Wasm, Transmuxer::finish_yielded, Continuous::feed_yielded and
+Continuous::finish_yielded keep the synchronous output bytes while yielding
+during sound decoding. The browser checks elapsed work every eight audio frames
+and yields after roughly eight milliseconds; one frame can exceed the budget.
+The clock uses global performance.now() (also usable in workers), falling back
+to Date.now() when unavailable. Native synchronous methods stay available.
+
+A host should feed raw input in bounded pieces and append each returned output
+before asking for more. The browser adapter uses 16 KiB pieces; this limits
+outputs awaiting append even if its transport returns a large network chunk.
+The keyframe buffer still has its existing explicit cap. This does not bound
+memory already allocated by a caller's transport.
