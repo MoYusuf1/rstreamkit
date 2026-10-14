@@ -135,6 +135,30 @@ mod tests {
     use crate::hls::{self, Media, Parsed};
     use crate::net::{buffer_delay_ms as throttle_delay_ms, retry_delay};
     #[test]
+    #[ignore = "manual scheduling benchmark; run in release mode"]
+    fn playlist_walk_measurement() {
+        let names: Vec<String> = (0..20_000).map(|i| format!("segment{i}.ts")).collect();
+        let mut media = playlist(100, &names.iter().map(String::as_str).collect::<Vec<_>>());
+        media.ended = true;
+        let mut times = Vec::new();
+        for _ in 0..7 {
+            let mut window = Window::default();
+            let start = std::time::Instant::now();
+            let mut count = 0;
+            while let Some(segment) = window.next(std::hint::black_box(&media)) {
+                window.consumed(std::hint::black_box(segment));
+                count += 1;
+            }
+            times.push(start.elapsed().as_secs_f64() * 1000.0);
+            assert_eq!(count, 20_000);
+        }
+        times.sort_by(f64::total_cmp);
+        println!(
+            "20,000 segments, 7 runs, median {:.3} ms, min {:.3} ms, max {:.3} ms",
+            times[3], times[0], times[6]
+        );
+    }
+    #[test]
     fn recovered_live_gaps_do_not_block_a_full_buffer_or_skip_playable_media() {
         let ranges = [(0.0, 18.026), (20.0, 48.021)];
         assert_eq!(gap_target(ranges, 17.944, 4.0), Some(20.0));
@@ -204,6 +228,28 @@ mod tests {
             w.consumed(w.next(&new).unwrap());
             assert!(w.next(&new).is_none());
         }
+    }
+    #[test]
+    fn sequence_lookup_checks_identity_and_falls_back_for_gaps() {
+        let mut old = playlist(100, &["a", "b", "c"]);
+        old.ended = true;
+        let mut window = Window::default();
+        window.consumed(&old.segments[1]);
+        let changed = playlist(100, &["x", "y", "z", "next"]);
+        assert_eq!(window.next(&changed).unwrap().uri, "z");
+        let mut gapped = playlist(100, &["a", "b", "c"]);
+        gapped.segments[1].seq = 105;
+        gapped.segments[2].seq = 106;
+        window.consumed(&gapped.segments[1]);
+        assert_eq!(window.next(&gapped).unwrap().uri, "c");
+        let mut near_overflow = playlist(u64::MAX - 2, &["a", "b", "c"]);
+        near_overflow.ended = true;
+        window = Window::default();
+        for segment in &near_overflow.segments {
+            assert_eq!(window.next(&near_overflow).unwrap().seq, segment.seq);
+            window.consumed(segment);
+        }
+        assert!(window.finished(&near_overflow));
     }
     #[test]
     fn long_pause_and_numbering_restart_use_current_window() {

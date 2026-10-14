@@ -96,6 +96,36 @@ The browser reports worker MSE available, ManagedMediaSource unavailable and
 WebCodecs available on this installation. These are feature checks, not enabled
 backends. Technology choices and their costs are recorded in docs/roadmap.md.
 
+## Playlist lookup follow-up (2026-10-10)
+
+The shared scheduler searched from the start of a playlist after every segment.
+It now checks the segment's sequence offset and full identity first. Normal
+unchanged playlists take constant time per lookup, so a full walk changes from
+O(n²) to O(n). Broken numbering, changed URLs and byte ranges retain the existing
+recovery search. This adds no dependency or playlist index allocation.
+
+| Measure | Before | After |
+| --- | ---: | ---: |
+| Walk 20,000 segment anchors, median of 7 runs | 120.452 ms | 0.345 ms |
+| Automated real-Chrome playback regressions | 0 | 5 |
+| Full player, Brotli Wasm + JS | 229,337 bytes | 229,378 bytes (+41) |
+
+Native Rust 1.99.0 release build, no optional features, Ryzen 7 5700/Linux.
+Playlist parsing is outside the timing; URI cloning and consumption are included.
+The synthetic playlist has unique URLs and consecutive sequence numbers.
+This measures scheduler lookup only, not total playback or video processing.
+Other work in the browser loop still scans playlist durations; this change does
+not make that whole loop linear. Broken-provider fallback remains O(n) per lookup.
+
+Repeat: `cargo test --release --no-default-features playlist_walk_measurement -- --ignored --nocapture`.
+The benchmark is ignored in normal tests to avoid timing work in CI.
+The five Playwright checks use real Chrome and small local inputs, including
+40-second finite HLS at 4× playback. They verify completion, Dolby fallback,
+finite-input errors, stop/restart and live recovery, not frame-rate performance.
+See tools/README.md for repeat commands and the remaining Safari/Edge limits.
+All four compressed-size budgets pass: live 109,385, live+sound 207,071,
+live+movies 132,302 and full 229,378 bytes, using the same size recipe above.
+
 ## Work in order
 
 1. Preserve the reproducible Node and browser harness (#38). Run each memory scenario
@@ -1126,3 +1156,17 @@ All budgets pass. Small code-generation/compression differences are not evidence
 that bounds checking universally shrinks programs. Five Chrome playback cases
 pass on the exact integrated full build. Refresh PR #51 CI before merging; #43
 closes only after its seeded CI run and integration are confirmed on main.
+
+### Browser-test integration — 2026-10-13
+
+The guarded sequence lookup now lives in `Session::next_index`, alongside the shared playlist controller. Normal consecutive sequences check one offset and full segment identity; broken numbering, changed URLs and byte ranges keep the linear recovery path. The batch iterator already walks playlists once; this shortcut helps repeated individual lookups without adding an index or runtime dependency.
+
+| Measure | Main after parser PR #51 | Integrated browser PR #50 |
+| --- | ---: | ---: |
+| Automated Chrome playback regressions in CI | 0 | 5 |
+| Live compressed Wasm + JS | 108,210 B | 108,342 B |
+| Live with sound | 211,787 B | 211,823 B |
+| VOD | 129,283 B | 129,294 B |
+| Full | 232,644 B | 232,581 B |
+
+All four budgets pass. The final native lookup-only benchmark walks 20,000 segments in a median 0.311 ms over seven release runs (0.289–0.324 ms, Ryzen 7 5700/Linux, Rust 1.99.0). The old 120.452 ms result above predates the session refactor; it is historical, not a fresh main comparison. This is not a whole-player or FFmpeg speed claim. Fresh integrated validation also passes the root feature checks, decoder suite and 5,000 bounded seeded parser cases.

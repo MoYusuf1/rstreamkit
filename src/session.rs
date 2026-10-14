@@ -208,11 +208,26 @@ impl Session {
             }
             Some((seq, uri, range)) => {
                 // URI anchors survive broken providers that slide without advancing sequence.
-                if let Some(at) = media
+                // Parsed HLS sequences are consecutive. Verify the full identity at
+                // the sequence offset before using it; changed/broken playlists still
+                // take the URI-anchor recovery path below. Walking a long unchanged
+                // playlist then needs one lookup per segment instead of scanning it.
+                let offset = media
                     .segments
-                    .iter()
-                    .position(|s| s.seq == *seq && s.uri == *uri && s.byte_range == *range)
-                {
+                    .first()
+                    .and_then(|first| usize::try_from(seq.checked_sub(first.seq)?).ok());
+                let anchor = offset.filter(|&at| {
+                    media
+                        .segments
+                        .get(at)
+                        .is_some_and(|s| s.seq == *seq && s.uri == *uri && s.byte_range == *range)
+                });
+                if let Some(at) = anchor.or_else(|| {
+                    media
+                        .segments
+                        .iter()
+                        .position(|s| s.seq == *seq && s.uri == *uri && s.byte_range == *range)
+                }) {
                     at + 1
                 } else if let Some(at) = media
                     .segments

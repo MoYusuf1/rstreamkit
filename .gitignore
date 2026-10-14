@@ -9,6 +9,8 @@ Cargo.lock
 /tools/node/pkg/
 /tools/media/
 /tools/results/
+/tools/browser/node_modules/
+/tools/browser/__pycache__/
 /tools/__pycache__/
 /ac3/target/
 /tools/fuzz/target/

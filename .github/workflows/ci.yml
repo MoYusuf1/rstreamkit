@@ -72,7 +72,7 @@ jobs:
       - run: node tools/node/audio-smoke.cjs
       - name: Size tools (Binaryen 130)
         run: |
-          sudo apt-get update && sudo apt-get install -y brotli
+          sudo apt-get update && sudo apt-get install -y brotli ffmpeg
           archive="$RUNNER_TEMP/binaryen.tar.gz"
           curl -fL https://github.com/WebAssembly/binaryen/releases/download/version_130/binaryen-version_130-x86_64-linux.tar.gz -o "$archive"
           echo "0a18362361ad05465118cd8eeb72edaeec89de6894bc283576ef4e07aa3babcc  $archive" | sha256sum --check
@@ -85,6 +85,27 @@ jobs:
         with:
           name: player-size
           path: tools/results/size.json
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: tools/browser/package-lock.json
+      - name: Browser regression tools
+        working-directory: tools/browser
+        run: |
+          npm ci --ignore-scripts
+          npx playwright install --with-deps chrome
+          python3 fixtures.py
+      - name: Chrome playback regressions
+        working-directory: tools/browser
+        run: npm test -- --project=chrome
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: browser-regressions
+          path: |
+            tools/results/playwright.json
+            tools/results/playwright/
 
   profile:
     runs-on: ubuntu-latest
