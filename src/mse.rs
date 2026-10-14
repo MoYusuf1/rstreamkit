@@ -2024,7 +2024,18 @@ mod movie {
             if !buffered_at(video, t) && (t - frontier).abs() > 1.0 {
                 continue;
             }
-            let mut fragment = session.push(&part.bytes).map_err(|e| e.to_string())?;
+            let mut fragment = session
+                .push_yielded(&part.bytes)
+                .await
+                .map_err(|e| e.to_string())?;
+            if stop.get() {
+                return Ok(());
+            }
+            // Yielding lets a seek arrive while sound is being decoded too.
+            let t = video.current_time();
+            if !buffered_at(video, t) && (t - frontier).abs() > 1.0 {
+                continue;
+            }
             evict(video, &sb, &ms).await?;
             if !fragment.is_empty() {
                 append(video, &sb, &ms, &mut fragment).await?;

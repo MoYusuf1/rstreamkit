@@ -1290,3 +1290,39 @@ The standalone optional network script is tools/node/boundary-smoke.cjs; it is e
 | Full | 232,961 B | 233,328 B |
 
 All budgets pass. Root native/Wasm feature lints, three native test configurations, the decoder suite, fresh 5,000 bounded parser cases (seed 20261014), Node output checks and eight Chrome playback regressions pass. Added PES tests and expanded fixture arrays also pass their targeted checks. Reports remain in ignored tools/results. Issue #16 acceptance is covered on Chrome; other platforms, provider quirks and endurance remain in #24/#25/#47.
+
+### Cooperative movie ranges and seek safety — 2026-10-14
+
+Movie playback now uses vod::Session::push_yielded on Wasm, with the same eight-millisecond work-budget clock as HLS and raw TS. Synchronous and yielded paths share range extraction, frame selection and fragment packaging. AAC remains borrowed; decoded sound uses the existing FLAC output. Native synchronous playback is retained. The browser rechecks cancellation and seek position after decoding, because a user can now seek while the decoder yields. A cancelled library processing future may have advanced its cursor/decoder; discard that session.
+
+| Six-second development-harness movie, repeat campaign | Synchronous | Yielded |
+| --- | ---: | ---: |
+| MP4 median elapsed | 32.2 ms | 32.6 ms |
+| MKV median elapsed | 33.0 ms | 33.6 ms |
+| Timer callbacks during each processing call | 0 | 1 |
+| Long tasks in five calls, each format | 0 | 0 |
+| Dropped background frames in each format | 0 | 0 |
+
+Five alternating pairs after two warm-ups per method/format, Chrome 155/Ryzen 7 5700/Linux, harness opt-level s. Both methods include range indexing, input copying and development output hashing. The first campaign measures 31.4/31.5 ms for MP4 and 31.5/31.4 ms for MKV. There is no measured CPU speedup or dropped-frame win on these short inputs. The choice is to keep the event loop responsive with a small elapsed-time cost, while retaining the larger stress-case long-task improvement recorded above. This does not promise every frame/assembly/cold compilation stays below eight milliseconds.
+
+Nine output comparisons cover AAC MP4, AC-3 MP4 and AC-3 MKV at 4-KiB, 64-KiB and whole-file range limits. Complete output hashes, byte counts and requested ranges match. Node also checks synchronous/yielded movie output equality, using the same global timer clock outside the browser. Measured harness Wasm SHA-256: f86eb8d90e30dce785d45ff9c1030787b6e054510d84de65e9d9809adc36a0db.
+
+| Real browser playback check | Endpoint / result |
+| --- | ---: |
+| AC-3 MP4 | 6.010667 s, RMS 0.078334 |
+| AC-3 MKV | 6.016 s, RMS 0.078333 |
+| AES-128 HLS with AC-3 | 6.016 s, RMS 0.025189 |
+| Seek injected during an audio yield | Reaches 15.909333 s after seeking to 14 s |
+| First appended video base after that seek | 14 s |
+| Failed statuses across all four cases | 0 |
+
+The seek case uses a generated 40-second file; a zero-delay decoder timer triggers the seek. Appended video starts after the seek are 14, 18.9, 24, 28.9667, 34 and 39.0333 seconds: the old decoded range is discarded. All four cases have zero reported drops. MP4/MKV report 144 frames each; the generated encrypted stream reports 184 (browser counters are not a unique-frame guarantee). PCM is observed through Web Audio with silent output, not physical speakers.
+
+| Compressed Wasm + JS | Before | Movie change |
+| --- | ---: | ---: |
+| Live | 108,548 B | 108,548 B |
+| Live with sound | 212,290 B | 212,290 B |
+| VOD | 129,660 B | 130,352 B |
+| Full | 233,328 B | 234,032 B |
+
+All budgets pass. Root feature lints/tests, harness checks, Node decoder/continuous/movie checks and all nine Chrome CI cases (the ninth contains four movie/encryption/seek checks) pass locally. Rust 1.88 is not installed locally; GitHub's MSRV job is required before merge. The new integer predicate is [supported since Rust 1.87](https://doc.rust-lang.org/std/primitive.usize.html#method.is_multiple_of), and the full API must still pass that CI job. Reports: tools/results/movie-yield-smoke.json, movie-yield-repeat.json, movie-playback-smoke.json and size-movie-yield.json. External hardware/browser and high-resolution endurance acceptance remain separate.

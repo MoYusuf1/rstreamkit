@@ -138,3 +138,10 @@ before asking for more. The browser adapter uses 16 KiB pieces; this limits
 outputs awaiting append even if its transport returns a large network chunk.
 The keyframe buffer still has its existing explicit cap. This does not bound
 memory already allocated by a caller's transport.
+
+Movie range playback can use vod::Session::push_yielded on Wasm. It shares
+frame selection, seeking and fragment packaging with the synchronous push
+method, and uses the same audio work budget. A cancelled processing future may
+already have advanced the cursor or decoder: discard that session when
+cancelling. The browser adapter owns the session and rechecks seek position
+after sound processing before it appends the result.

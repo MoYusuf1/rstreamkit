@@ -150,3 +150,18 @@ test('raw timestamp restarts preserve all three clips', async ({ baseURL }, test
   const report = JSON.parse(stdout);
   expect(report.raw_quality.total - report.initial_quality.total).toBeGreaterThanOrEqual(149);
 });
+
+test('movies and encrypted sound play; a seek interrupts audio decoding', async ({ baseURL }, testInfo) => {
+  test.skip(testInfo.project.name !== 'chrome', 'This helper launches installed Chrome.');
+  test.setTimeout(120000);
+  const path = require('node:path');
+  const { promisify } = require('node:util');
+  const { execFile } = require('node:child_process');
+  const { stdout } = await promisify(execFile)(process.execPath, [path.join(__dirname, '../node/movie-playback-smoke.cjs')], {
+    env: { ...process.env, RSTREAMKIT_URL: baseURL,
+      NODE_PATH: process.env.NODE_PATH || path.join(__dirname, 'node_modules') },
+    timeout: 110000, maxBuffer: 1024 * 1024,
+  });
+  await testInfo.attach('movie-playback-report', { body: stdout, contentType: 'application/json' });
+  expect(JSON.parse(stdout).checks).toBe(4);
+});
