@@ -24,6 +24,8 @@ Changes:
 - Report failed browser removals and inspect live gaps without a temporary range vector.
 - Share the retry loop between native and browser hosts; test nine outage/cancellation cases with fake time.
 - Clear browser timers when their waiting future is dropped.
+- Reject oversized MP4 timing runs, bound malformed edit counts and check file-offset arithmetic.
+- Clamp extreme negative Matroska seeks; add five bounded parser fuzz targets and four regression tests.
 - Cancel player tasks and Direct fetches on stop/drop; release buffer listeners.
 - Handle source closure/removal while waiting for appends and removals.
 - Retain HLS durations, source dates and discontinuities; prefer supported codecs.

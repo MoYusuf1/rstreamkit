@@ -495,7 +495,7 @@ pub struct Cursor {
 
 impl Index {
     pub fn cursor(&self, at: i64) -> Cursor {
-        let movie = at - SHIFT;
+        let movie = at.saturating_sub(SHIFT);
         let i = self.cues.partition_point(|c| c.0 <= movie);
         Cursor {
             offset: self.cues[i.saturating_sub(1)].1,

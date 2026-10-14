@@ -1090,3 +1090,39 @@ NODE_PATH=tools/browser/node_modules node tools/node/abr-smoke.cjs
 The failure check uses repeated committed media with advancing lower-level
 availability to isolate policy. For the before case, set `RSTREAMKIT_PLAYER_DIR`
 to a directory containing PR #63's full-player JS and Wasm artifacts.
+
+
+## Parser integration check (2026-10-13)
+
+The bounded parser fixes were integrated with the merged retry/session, audio,
+profile and ABR work. Exact integration commit `de1964e`: all required native/
+Wasm feature checks, native feature test sets, decoder suite, coverage-target
+compilation/lints and a fresh seeded 5,000-case campaign pass. Seed 20261013;
+1,000 cases per target, no failure or limit breach in the tested corpus.
+Earlier 55,000 cases remain historical evidence for the earlier parser branch.
+
+| Target | Fresh cases passed | Child wall seconds |
+| --- | ---: | ---: |
+| HLS | 1,000 | 0.033 |
+| TS | 1,000 | 0.165 |
+| MP4 | 1,000 | 0.065 |
+| Matroska | 1,000 | 0.266 |
+| CMAF | 1,000 | 0.066 |
+
+Limits remain 1 MiB input, 512 MiB address space, 30 CPU seconds and 45 wall
+seconds per target campaign, with at most 32 MKV probe requests per input.
+No audio decoding or coverage-guided/ASan campaign is claimed here. Four normal
+regressions preserve the original findings; parser tooling adds zero library
+runtime dependencies and stays outside the default test path.
+
+| Wasm + JS Brotli bytes | Main before parser integration | Integrated |
+| --- | ---: | ---: |
+| Live | 108,210 | 108,210 |
+| Live + sound | 211,787 | 211,787 |
+| Movie | 129,224 | 129,283 |
+| Full | 232,741 | 232,644 |
+
+All budgets pass. Small code-generation/compression differences are not evidence
+that bounds checking universally shrinks programs. Five Chrome playback cases
+pass on the exact integrated full build. Refresh PR #51 CI before merging; #43
+closes only after its seeded CI run and integration are confirmed on main.
