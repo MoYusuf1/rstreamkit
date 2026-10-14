@@ -1205,3 +1205,20 @@ Fixtures are generated continuous TS segments; both quality levels share video b
 | Runtime code or download bytes added | 0 |
 
 The bounded acceptance is 240 seconds after resumption to reach the existing target-plus-two-second band and restore 1× playback. This is not a claim that latency reaches exactly six seconds: the existing controller has a two-second deadband. With only 5% extra playback speed, ten seconds of delay takes roughly 200 seconds to remove. The test checks no seek or abrupt timeline jump, not physical display quality. Its headless report has 374 dropped frames out of 6,940 (5.39%); do not use it as smooth-rendering or 4K60 evidence. Repeated media isolates the policy, and this four-minute run is not a soak test. Reports stay in ignored `tools/results/catchup-smoke.json`.
+
+### Smaller stats output — 2026-10-13
+
+A Twiggy 0.8 retained-byte audit identified floating-point diagnostic formatting in the minimal player. The wrapper now prints seconds to three decimal places and bitrate to whole bits per second, keeping the same field names. Rust `Player::stats()` values and playback calculations keep full precision. No runtime dependency or codec feature changes.
+
+| Compressed Wasm + JS | Before | After | Saved |
+| --- | ---: | ---: | ---: |
+| Live | 108,356 B | 107,362 B | 994 B |
+| Live with sound | 211,684 B | 210,912 B | 772 B |
+| VOD | 129,327 B | 128,537 B | 790 B |
+| Full | 232,742 B | 231,976 B | 766 B |
+
+The same-checkout full optimized Wasm shrinks from 580,195 to 577,582 bytes; all four budgets pass. A separate temporary-checkout experiment saved 617 compressed full bytes, but the table uses the controlled review-checkout build. Source hashes, exact lock resolution, tool versions and dirty status are recorded by `tools/size.py` in ignored `tools/results/size-stats-final.json` and the prior `size-language-final.json`.
+
+The named raw compiler Wasm retains the AC-3/E-AC-3 and MP2 decoder paths, including JOC and object metadata; deleting unused source files alone is not a demonstrated size win. Twiggy lists the float Debug formatting root at 16,658 retained bytes before and the Display root at 15,053 after. These are overlapping, conservative call-graph totals, not additive shipped-byte savings. The actual shipped file is stripped and uses numbered functions; it cannot be assigned named subsystem totals from that report. The raw build also includes 362,361 bytes of wasm-bindgen metadata and 246,517 bytes of function names before stripping; neither is a new optimization opportunity in the shipped file. Audit outputs are `tools/results/retained-raw.txt`, `retained-shipped.txt` and `stats-retained-final.txt`.
+
+Validation: all four minimal-player Wasm clippy feature combinations, formatting, six real-Chrome regressions. This is a download and diagnostic-format change; no processing-time or memory improvement is claimed. Total HTML startup assets, cold-start distributions and further codec feature tradeoffs remain under #48.

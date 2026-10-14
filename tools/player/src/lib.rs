@@ -90,7 +90,12 @@ pub fn stats() -> String {
     PLAYER.with(|p| {
         p.borrow()
             .as_ref()
-            .map(|p| format!("{:?}", p.stats()))
+            .map(|p| {
+                let s = p.stats();
+                format!("Stats {{ buffered_seconds: {:.3}, latency_seconds: {:.3}, bitrate: {:.0}, dropped_segments: {}, current_variant: {:?}, variants: {:?}, live_window_seconds: {:.3} }}",
+                    s.buffered_seconds, s.latency_seconds, s.bitrate, s.dropped_segments,
+                    s.current_variant, s.variants, s.live_window_seconds)
+            })
             .unwrap_or_default()
     })
 }
