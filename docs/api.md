@@ -86,8 +86,8 @@ Edge and Safari playback validation remains open.
 It makes at most seven attempts with 31 seconds of total backoff. Permanent errors
 return immediately. Stop checks run between awaits; drop the future to cancel a
 pending request or timer. Host `Fetch` and `Clock` implementations must release
-pending work on drop. Browser timers now clear on drop too. Buffer trimming and
-throttling still belong to the browser session; the full shared session is pending.
+pending work on drop. Browser timers clear on drop too. The browser uses the shared buffer and
+playlist-session helpers below; complete media processing still needs extraction.
 
 `net::PlaybackBuffer` supplies playback position, buffered duration, gap crossing
 and async range removal. `net::trim_buffer` owns the rewind cutoff;
@@ -96,5 +96,18 @@ and async range removal. `net::trim_buffer` owns the rewind cutoff;
 needed, even if gap recovery freed space before a timer), go-live
 interruption and cancellation. Limits are finite, nonnegative seconds. Live
 hosts refresh after waiting/interruption; finite hosts keep their current place.
-Dropping a pending future releases host work. The browser uses these helpers;
-playlist selection, refresh and full session orchestration are still pending.
+Dropping a pending future releases host work. The browser uses these helpers together with the shared playlist controller.
+
+`session::{Session, PlaylistSource, Controls, Preparation}` provides shared HLS
+selection and refresh. `prepare` applies backpressure and refreshes after a pause
+or go-live; finite media keeps its place. `wait_and_refresh` waits half a target
+duration (1–5 seconds), reports a stalled playlist through the source callback,
+and refreshes live media. Go-live during that wait uses the same refresh.
+`Session::next` borrows a segment; call `consumed` after successful output or an
+explicit skip. `discontinuous` detects sequence gaps/restarts. `finished` is true
+only when finite input is exhausted. `session::buffer_limits` exposes the same
+budget calculation used by the browser. Hosts own URL resolution, playlist body
+limits, transport retry/error classification and media output. Stop is checked
+between awaits; drop pending work for immediate cancellation. Full per-segment
+processing, variant/rendition changes and a single generic media runner are still
+pending. The new controller does not claim to finish #23 by itself.
