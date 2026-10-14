@@ -20,7 +20,18 @@ js-sys = "=0.3.105"
 web-sys = { version = "=0.3.105", features = ["Window", "Document", "HtmlVideoElement", "Element"] }
 
 [profile.release]
-opt-level = "s"
+opt-level = "z"
 lto = true
 codegen-units = 1
 panic = "abort"
+
+# Keep Dolby compact without the measured global-z decoder slowdown.
+[profile.release.package.rstreamkit-ac3]
+opt-level = "s"
+
+[profile.release.package.oxideav-core]
+opt-level = "s"
+
+# MP2's faster profile earns its roughly 5 KB over the lean codec setting.
+[profile.release.package.oxideav-mp2]
+opt-level = 3

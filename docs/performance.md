@@ -941,3 +941,94 @@ cargo test --release --lib measure_stereo_conversion -- --ignored --nocapture --
 python3 tools/size.py --check-budgets --output tools/results/size-stereo-allocation.json
 NODE_PATH=tools/browser/node_modules node tools/node/mono-smoke.cjs
 ```
+
+
+## Per-package browser profile tuning (2026-10-13)
+
+The supplied small player now uses Rust `z` for the core, `s` for the Dolby
+and codec-support crates, and `3` for MP2. Native library/CLI release settings
+are unchanged. No dependency, feature or runtime API is added. This is a compiler
+profile change, not a new decoder or renderer.
+
+All candidates use identical source, Rust 1.99.0, wasm-bindgen 0.2.128,
+wasm-opt 130 `-Oz` and Brotli 1.2.0 quality 11. Same advertised features.
+The full-player payload tradeoff determined which candidates to reject:
+
+| Core / codec settings | Full Wasm + JS Brotli bytes | Decision |
+| --- | ---: | --- |
+| All `s` (before) | 232,807 | Reference |
+| All `z` | 224,704 | Reject as default: 5.1 AC-3 processing slows about 22% |
+| All `3` | 282,946 | Reject: download budgets exceeded |
+| Core `z`, all codecs `s` | 227,367 | Lean option; modest processing gains |
+| Core `z`, all codecs `3` | 249,364 | Reject as default: full and sound budgets exceeded |
+| Core `z`, Dolby/core `s`, MP2 `3` | 232,290 | Selected: fits budgets and improves MP2 processing about 18% |
+
+The selected MP2 setting costs 4,923 full-player bytes over the lean option.
+Compared with all-s, full is still 517 bytes smaller; sound-only grows 1,108.
+Hosts that value those 4.9 KB over MP2 processing can reproduce the lean setting
+with `--opt-level z --codec-opt-level s`. This trades CPU for download size without
+removing codec support.
+
+| Player download, Wasm + JS Brotli bytes | All-s before | Selected after |
+| --- | ---: | ---: |
+| Live | 112,778 | 107,969 |
+| Live + sound | 210,311 | 211,419 |
+| Movie | 135,683 | 128,972 |
+| Full | 232,807 | 232,290 |
+
+All four existing budgets pass. `size.py` reads defaults from the player manifest
+and records effective per-package settings; environment variables no longer
+silently change the four documented release settings. Python 3.11+ is needed for
+the standard-library TOML reader. Reports still count Wasm + generated JS, not
+the diagnostic HTML page or media downloads; whole-app startup remains #48 work.
+
+CPU: Linux x86_64 Ryzen 7 5700, Node 26.11.1, identical development harnesses
+optimized with `wasm-opt -Oz`. Each comparison runs in a fresh process with both
+modules present, five warmups, then nine alternating pairs of five-call batches.
+p95 below is the largest batch average, not individual-call tail latency. Two
+fresh comparisons per candidate pass PCM-checksum and output-length gates.
+Transmux timings include input copying and fresh decoder construction per call;
+FLAC uses predecoded PCM. The harness is not the minimal player's exact call path.
+
+| Selected-profile workload | Median ms before → after | p95 batch ms before → after |
+| --- | ---: | ---: |
+| AAC TS, 4.59 s | 0.1268 → 0.1306 | 0.2045 → 0.2248 |
+| Stereo AC-3 TS, 2 s | 7.2707 → 6.8162 | 7.8906 → 7.0313 |
+| 5.1 AC-3 TS, 2 s | 10.8378 → 10.2926 | 11.1078 → 10.6257 |
+| 5.1 E-AC-3 TS, 2 s | 12.4971 → 11.9587 | 13.0465 → 13.0805 |
+| MP2 TS, 2 s | 16.3837 → 13.3651 | 16.6666 → 13.5365 |
+| FLAC from AC-3 5.1 PCM | 4.1267 → 3.6480 | 4.1427 → 3.8399 |
+
+AAC is slightly slower in this run; E-AC-3's measured tail is slightly higher.
+This is not a universal speedup. The first selected-profile comparison measured
+MP2 medians 16.4191 / 13.4112 ms (see JSON for exact results if regenerated);
+CPU ratios are meaningful only within each alternating pair. Committed harness
+memory matches within each pair (1,900,544 bytes after AAC; 2,621,440 after the
+audio workloads). No overall memory or FFmpeg advantage is claimed.
+
+A headless Chrome 155.0.8059.39 control uses the same existing 18-second,
+3840×2160/60 SDR, 40 Mbps clip, viewport 1440×900 and visible document state.
+Both all-s and selected-profile runs finish with zero waiting events and zero
+reported dropped frames. The source has 1,080 frames; Chrome reports 1,081 in
+both runs, so that counter is not proof of 1,081 unique source frames. Short
+checks do not settle the long-run target-device matrix. Peak sampled committed
+Wasm is 39,059,456 bytes for all-s and 38,010,880 for selected. Each is only one
+run; chunk delivery/allocator variation prevents treating the difference as a
+proven profile memory saving. Long-task observations are two at 52/53 ms versus
+one at 58 ms; they do not establish a general responsiveness improvement.
+
+All required root Rust checks, decoder/media tests, harness clippy and four
+size budgets pass. Playback/audio/ABR checks run against the exact selected
+player; Edge/Safari and real-time 4K endurance remain open.
+
+```sh
+python3 tools/size.py --check-budgets --output tools/results/size-balanced-profile.json
+python3 tools/profile_harness.py --profile s --profile balanced
+node tools/node/opt-compare.cjs tools/results/profiles/s/rstreamkit_harness.js tools/results/profiles/balanced/rstreamkit_harness.js
+```
+
+The builder saves tool versions, source/artifact hashes, dirty state and the
+resolved harness lockfile. The comparison records hardware, input hashes, PCM
+checksums, memory and timings. Reproducing the selected harness yielded the same
+Wasm artifact hash as the measured candidate. Module load/init numbers in the
+Node report are diagnostic; this is not a browser cold-start benchmark.

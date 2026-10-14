@@ -108,3 +108,32 @@ equal left/right channels; it sends no sound to physical speakers.
 Resilience checks exercise a real ten-second HTTP 503 outage, one missing body
 and one HTML body. The pause check takes about a minute: pause for 50 seconds,
 prove old resources return 404, then require fresh downloads and continued playback.
+
+
+## Compare player build settings
+
+`tools/size.py` uses the small player's release settings: `z` for the core,
+`s` for Dolby and codec support, and `3` for MP2. It records effective package
+settings and enforces the existing budgets. Python 3.11 or newer is required.
+Override settings for a measured comparison, without changing defaults:
+
+```sh
+python3 tools/size.py --opt-level s --codec-opt-level s --output tools/results/size-s.json
+python3 tools/size.py --opt-level z --codec-opt-level z --output tools/results/size-z.json
+python3 tools/size.py --opt-level 3 --codec-opt-level 3 --output tools/results/size-3.json
+python3 tools/size.py --opt-level z --codec-opt-level s --output tools/results/size-lean.json
+python3 tools/size.py --check-budgets
+```
+
+For CPU/output checks, build identical development harnesses, then compare them
+in one fresh Node process after other builds finish:
+
+```sh
+python3 tools/profile_harness.py --profile s --profile balanced
+node tools/node/opt-compare.cjs tools/results/profiles/s/rstreamkit_harness.js tools/results/profiles/balanced/rstreamkit_harness.js
+```
+
+`z`, `3`, `lean` and `fast-codecs` are other harness profile choices. The helper
+uses `wasm-opt -Oz` and saves compiler settings, dependency locks and source/artifact
+hashes. Comparison checks decoded PCM checksums and output lengths before timing.
+CPU measurements are Node harness processing, not browser startup or frame rates.
