@@ -9,6 +9,7 @@ Breaking changes:
 - Additional public enums are non-exhaustive; Demuxed gains passthrough metadata.
 
 Changes:
+- Scan H.264 units without temporary heap lists; preserve media output and keep all size budgets.
 - Replace the growing duration cache with bounded storage while retaining linear playlist walks.
 - Reuse cursor URI storage and release oversized buffers after shorter replacements.
 - Prepare playlist walks once; reuse next-segment and duration metadata across finite buffer waits.
