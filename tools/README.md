@@ -169,3 +169,5 @@ healthy segment. `RSTREAMKIT_PLAYER_DIR` can load preserved full-player artifact
 for a before/after regression check.
 
 The Chrome suite also runs `tools/node/rendition-smoke.cjs`: a mixed HEVC/H.264 master, decoded English/Spanish tones, a late language change and a quality switch. It uses development-only harness controls and generated TS fixtures. Build the harness with `bash tools/build.sh`; run with the same `NODE_PATH` and `RSTREAMKIT_URL` settings as the other browser smoke tools.
+
+`tools/node/catchup-smoke.cjs` is a manual, real-time Chrome check for a ten-second playback stall. Run it with the same `NODE_PATH` and `RSTREAMKIT_URL`; generate browser fixtures first. Allow five minutes. It checks return to the six-second target plus its two-second control band, a 1.05× catch-up rate, and no seek. It is kept out of the short CI suite.
