@@ -1439,3 +1439,67 @@ Paired builds use `tools/profile_harness.py --profile balanced`, then
 `flac-scratch-paired-{1,2,3}.json` and `size-flac-scratch.json`. Baseline and
 candidate build.json files include exact source and Wasm hashes. This is a
 small fixture comparison, not a varied programme corpus or 4K60 result.
+
+### Named Wasm audio CPU samples — 2026-10-14
+
+Two fresh Node v26.11.1 processes each sample four committed audio inputs,
+with separate three-second decode and FLAC runs after twenty warmup calls.
+The requested sampling interval is 1,000 microseconds. The sixteen stage runs
+record 45,298 samples. The balanced release recipe matches the shipped
+package settings; the development build retains function names with wasm-opt
+-Oz -g. Removing all custom sections leaves identical executable/data sections
+to the matching stripped build (SHA-256
+`a1ef36da7df01167af987d1e339f486231d76bda8e4999e7388e486bd41fcd15`).
+The named artifact is not shipped or used to claim a download saving.
+
+| Decode input | Target | Self samples, run 1 | Run 2 |
+| --- | --- | ---: | ---: |
+| AC-3 stereo | FFT + IMDCT | 31.3% | 31.7% |
+| AC-3 5.1 | FFT + IMDCT | 37.9% | 37.5% |
+| E-AC-3 5.1 | FFT + IMDCT | 29.0% | 30.7% |
+| E-AC-3 5.1 | Float-to-PCM packing | 18.4% | 18.2% |
+| MP2 stereo | Synthesis filter | 78.2% | 77.6% |
+
+These are self samples, including work the compiler inlined into each function.
+The FFT + IMDCT rows sum their distinct self samples; they do not add inclusive
+and self counts. Decode includes TS demux, packet copy, a fresh decoder and PCM
+conversion. In the separate FLAC stage, 99.5–99.7% of samples land in the encoder;
+inlining hides the split between predictor search, bit writing and checksums.
+It would be wrong to claim that these samples isolate FLAC's internal kernels.
+The profile times include sampling overhead and must not become speed claims.
+
+Decision for #45: prototype a small, optional SIMD FFT path with scalar fallback,
+and investigate MP2 synthesis independently. Preserve operation order and gate
+retention on exact output, repeated unprofiled CPU measurements, feature budgets
+and target support. E-AC-3 packing is a secondary target. Do not enable SIMD across
+the whole module without measuring its size, compatibility and throughput.
+No SIMD optimization is shipped by this report.
+
+For realistic expectations, if FFT/IMDCT is 38% of a decode path, making only
+that work twice as fast gives a theoretical total speedup of
+`1 / (0.62 + 0.38 / 2) = 1.23`. This is an estimate from the sampled split, not
+a measured result. Complete decoding and packaging would have a different split.
+Small allocation changes alone cannot close the recorded fourfold long-Dolby
+conversion gap with FFmpeg.
+
+Reproduce with:
+
+```sh
+python3 tools/profile_harness.py --profile balanced --retain-names --output tools/results/audio-kernels
+node tools/node/audio-cpu.cjs tools/results/audio-kernels/balanced/rstreamkit_harness.js tools/results/audio-cpu > tools/results/audio-cpu.json
+```
+
+`RSTREAMKIT_PROFILE_SECONDS` accepts 1–30 seconds per stage, default three.
+The JSON report records input/PCM/module/Wasm/script hashes and sample shares;
+the output directory keeps raw Chrome-compatible `.cpuprofile` files. Inspect
+those in a CPU-profile viewer to see stacks instead of adding overlapping costs.
+Local reports are `audio-cpu-first.json`, `audio-cpu-repeat.json`, their eight
+raw profiles each, and `audio-kernel-equivalence.json`. PCM hashes and FLAC lengths
+match across both campaigns. The named Wasm hash is
+`a7abcdda8e5bb13b9f4eddf515d4509022a91cda90b72bb3c5220e212e3b24a1`.
+
+Limits: Ryzen 7 5700/Linux, warm Node Wasm, small generated fixtures. This is not
+a native CPU profile, a varied programme corpus, browser frame-time measurement
+or 4K60 result. #45 remains open for native/corpus profiling and a measured
+optimization decision meeting its CPU gate. All default shipping build recipes
+and runtime source remain unchanged by the profiling tools.

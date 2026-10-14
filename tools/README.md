@@ -196,3 +196,19 @@ The report records readiness, committed Wasm memory before playback, source and
 artifact hashes, and every startup request. Local HTTP is uncompressed; consult
 the size report for Brotli totals. Timing excludes process launch. Memory excludes
 the browser, JS and GPU. Small samples do not prove production cold starts.
+
+### Audio CPU profiles
+
+Use a named development harness to see where Wasm sound processing spends time:
+
+```sh
+python3 tools/profile_harness.py --profile balanced --retain-names --output tools/results/audio-kernels
+node tools/node/audio-cpu.cjs tools/results/audio-kernels/balanced/rstreamkit_harness.js > tools/results/audio-cpu.json
+```
+
+The sampler checks AC-3 stereo/5.1, E-AC-3 5.1 and MP2, keeping separate decode
+and FLAC profiles. Raw `.cpuprofile` files go to `tools/results/audio-cpu/`;
+pass a second argument to choose another directory. Set
+`RSTREAMKIT_PROFILE_SECONDS` to change the default three seconds per stage.
+Names are for profiling only; shipped build settings stay the same. Sampling
+adds overhead, so use the paired timing tool for speed comparisons.
