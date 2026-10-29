@@ -166,7 +166,7 @@ test('movies and encrypted sound play; a seek interrupts audio decoding', async 
   expect(JSON.parse(stdout).checks).toBe(4);
 });
 
-test('a movie whose clock starts late plays; one that cannot start says so', async ({ baseURL }, testInfo) => {
+test('late-clock and laced-sound movies play; one that cannot start says so', async ({ baseURL }, testInfo) => {
   test.skip(testInfo.project.name !== 'chrome', 'This helper launches installed Chrome.');
   test.setTimeout(90000);
   const path = require('node:path');
@@ -178,7 +178,7 @@ test('a movie whose clock starts late plays; one that cannot start says so', asy
     timeout: 80000, maxBuffer: 1024 * 1024,
   });
   await testInfo.attach('movie-late-start-report', { body: stdout, contentType: 'application/json' });
-  expect(JSON.parse(stdout).checks).toBe(3);
+  expect(JSON.parse(stdout).checks).toBe(4);
 });
 
 test("all four player builds load exactly three startup assets", async ({ baseURL }, testInfo) => {

@@ -1,4 +1,4 @@
-// Movies whose first picture or sound begins after zero must still start, not refetch the start.
+// Movies that start late, never start, or carry laced sound: each plays or says why it can't.
 const assert=require('node:assert/strict'),fs=require('node:fs'),path=require('node:path'),os=require('node:os');
 const {execFileSync}=require('node:child_process'),{chromium,expect}=require('@playwright/test');
 (async()=>{
@@ -14,6 +14,9 @@ const {execFileSync}=require('node:child_process'),{chromium,expect}=require('@p
    far:make('far.mkv',['-output_ts_offset','8']),
    // Buffered at the start but never decodable (keyframe slices removed): the engine must say so.
    undecodable:make('undecodable.mkv',['-bsf:v','filter_units=remove_types=5']),
+   // Sound laced as mkvmerge writes it.
+   laced:(()=>{const plain=make('plain.mkv',[]),out=path.join(temporary,'laced.mkv');
+    execFileSync('python3',[path.join(__dirname,'../lace_mkv.py'),plain,out]);return out;})(),
   };
   browser=await chromium.launch({channel:'chrome'});const results=[];
   for(const [name,file] of Object.entries(cases)){
@@ -42,10 +45,11 @@ const {execFileSync}=require('node:child_process'),{chromium,expect}=require('@p
    await page.close();
    assert.deepEqual(errors,[]);
   }
-  const [clock,far,undecodable]=results;
+  console.log(JSON.stringify({checks:results.length,results},null,1));
+  const [clock,far,undecodable,laced]=results;
   assert(clock.plays&&clock.statuses.includes('Playing')&&clock.range_requests<20,'late clock plays without refetching');
   assert(!far.plays&&far.statuses.some(s=>/Failed/.test(s))&&far.range_requests<20,'unreachable start fails promptly');
+  assert(laced.plays&&laced.statuses.includes('Playing'),'laced sound plays');
   assert(!undecodable.plays&&undecodable.statuses.some(s=>/Failed/.test(s)),'undecodable start fails');
-  console.log(JSON.stringify({checks:results.length,results},null,1));
  }finally{await browser?.close();fs.rmSync(temporary,{recursive:true,force:true});}
 })().catch(e=>{console.error(e);process.exit(1);});
