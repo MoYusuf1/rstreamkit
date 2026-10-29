@@ -44,7 +44,7 @@ simplification and names its ceiling and upgrade path; keep that convention).
 - Decoded sound is stereo, 16-bit. 5.1 is folded down; LFE is dropped.
 - MP4: no fragmented input files, and no edit lists beyond the first entry. Only the AVC, HEVC, AAC,
   AC-3 and E-AC-3 sample entries are understood.
-- MKV: needs a cue index. No lacing and no content encodings.
+- MKV: needs a cue index. Laced sound is split into frames and header stripping is undone; laced pictures and other content encodings (zlib, encryption) are refused or skipped.
 - Dolby object/Atmos metadata is not interpreted. No DRM.
 - In the browser, AES-128 uses Web Crypto. Native hosts must decrypt before the media core.
 - No FFmpeg, ever, at runtime: not launched, not linked.
