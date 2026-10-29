@@ -381,7 +381,10 @@ fn video_entry(kind: [u8; 4], e: &[u8]) -> R<VideoInfo> {
             info.codec = crate::vod::hevc_codec(child(kids, b"hvcC").unwrap_or(&[]));
         }
         b"vp09" => (info.name, info.codec) = ("VP9".into(), "vp09.00.10.08".into()),
-        b"av01" => (info.name, info.codec) = ("AV1".into(), "av01.0.08M.08".into()),
+        b"av01" => {
+            info.name = "AV1".into();
+            info.codec = crate::vod::av1_codec(child(kids, b"av1C").unwrap_or(&[]));
+        }
         other => info.name = String::from_utf8_lossy(other).into_owned(),
     }
     Ok(info)

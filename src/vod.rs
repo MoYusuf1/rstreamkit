@@ -121,6 +121,25 @@ pub(crate) fn hevc_codec(hvcc: &[u8]) -> String {
     codec
 }
 
+/// The `codecs` string for AV1 from its `av1C` record (AV1 ISOBMFF binding), e.g. `av01.0.08M.10`
+/// for 10-bit main profile at level 4.0; 8-bit main at level 4.0 when the record is too short.
+pub(crate) fn av1_codec(av1c: &[u8]) -> String {
+    let Some(&[_, profile_level, flags]) = av1c.get(..3) else {
+        return "av01.0.08M.08".into();
+    };
+    let tier = if flags & 0x80 != 0 { 'H' } else { 'M' };
+    let depth = match (flags & 0x40 != 0, flags & 0x20 != 0) {
+        (true, true) => 12,
+        (true, false) => 10,
+        _ => 8,
+    };
+    format!(
+        "av01.{}.{:02}{tier}.{depth:02}",
+        profile_level >> 5,
+        profile_level & 0x1F
+    )
+}
+
 impl VideoInfo {
     /// Fills in H.264 from an `avcC` payload, when its pictures can be copied as they are (they
     /// can if their NAL units are prefixed with 4-byte lengths, which is what nearly all are).

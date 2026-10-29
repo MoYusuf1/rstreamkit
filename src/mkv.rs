@@ -12,7 +12,7 @@
 
 use crate::{
     Error,
-    vod::{Audio, AudioInfo, Frame, Track, VideoInfo, hevc_codec},
+    vod::{Audio, AudioInfo, Frame, Track, VideoInfo, av1_codec, hevc_codec},
 };
 
 /// Microseconds the movie's clock is moved forward by on the output timeline. A picture can be
@@ -209,7 +209,7 @@ fn video_info(e: &Entry) -> VideoInfo {
         "V_MPEGH/ISO/HEVC" => (info.name, info.codec) = ("HEVC".into(), hevc_codec(&e.private)),
         "V_VP9" => (info.name, info.codec) = ("VP9".into(), "vp09.00.10.08".into()),
         "V_VP8" => (info.name, info.codec) = ("VP8".into(), "vp8".into()),
-        "V_AV1" => (info.name, info.codec) = ("AV1".into(), "av01.0.08M.08".into()),
+        "V_AV1" => (info.name, info.codec) = ("AV1".into(), av1_codec(&e.private)),
         other => info.name = other.trim_start_matches("V_").into(),
     }
     info
@@ -870,6 +870,16 @@ mod tests {
         let main10 = [1, 0x22, 0x20, 0, 0, 0, 0xB0, 0, 0, 0, 0, 0, 153];
         assert_eq!(hevc_codec(&main10), "hvc1.2.4.H153.B0");
         assert_eq!(hevc_codec(&[1, 2]), "hvc1.1.6.L120.90");
+    }
+
+    #[test]
+    fn av1_codec_strings_come_from_the_av1c_record() {
+        use crate::vod::av1_codec;
+        // Main profile, level 4.0 (8), main tier, 10-bit.
+        assert_eq!(av1_codec(&[0x81, 0x08, 0x4C, 0]), "av01.0.08M.10");
+        // Professional profile (2), level 5.1 (13), high tier, 12-bit.
+        assert_eq!(av1_codec(&[0x81, 0x4D, 0xE0, 0]), "av01.2.13H.12");
+        assert_eq!(av1_codec(&[0x81]), "av01.0.08M.08");
     }
 
     #[test]
