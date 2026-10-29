@@ -140,6 +140,17 @@ pub(crate) fn av1_codec(av1c: &[u8]) -> String {
     )
 }
 
+/// The `codecs` string for VP9 from its profile, level and bit depth (VP9 codec ISOBMFF binding),
+/// e.g. `vp09.02.31.10`; profile 0 at level 1.0, 8-bit, for whatever is unknown.
+pub(crate) fn vp9_codec(profile: Option<u8>, level: Option<u8>, depth: Option<u8>) -> String {
+    format!(
+        "vp09.{:02}.{:02}.{:02}",
+        profile.unwrap_or(0),
+        level.unwrap_or(10),
+        depth.unwrap_or(8)
+    )
+}
+
 impl VideoInfo {
     /// Fills in H.264 from an `avcC` payload, when its pictures can be copied as they are (they
     /// can if their NAL units are prefixed with 4-byte lengths, which is what nearly all are).

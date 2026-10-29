@@ -2,7 +2,7 @@
 
 ## Unreleased (0.2.0)
 
-- Describe HEVC movies by their real profile, tier and level (from `hvcC`) instead of always Main at level 4, so `canPlayType` answers for the actual stream (for example `hvc1.2.4.L93.90` for 720p Main 10), and AV1 by its real profile, level, tier and bit depth from `av1C`.
+- Describe HEVC movies by their real profile, tier and level (from `hvcC`) instead of always Main at level 4, so `canPlayType` answers for the actual stream (for example `hvc1.2.4.L93.90` for 720p Main 10), AV1 by its real profile, level, tier and bit depth from `av1C`, and VP9 from `vpcC` (MP4) or CodecPrivate features (Matroska).
 
 - Play Matroska files without a cue index (written to a pipe or recorded) from the start instead of refusing them; starting later or seeking reports the new `Unsupported::NoIndex`. Add `Movie::seekable`.
 

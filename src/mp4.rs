@@ -380,7 +380,15 @@ fn video_entry(kind: [u8; 4], e: &[u8]) -> R<VideoInfo> {
             info.name = "HEVC".into();
             info.codec = crate::vod::hevc_codec(child(kids, b"hvcC").unwrap_or(&[]));
         }
-        b"vp09" => (info.name, info.codec) = ("VP9".into(), "vp09.00.10.08".into()),
+        b"vp09" => {
+            // vpcC: version and flags, then profile, level and bit depth (its high four bits).
+            let c = child(kids, b"vpcC").unwrap_or(&[]);
+            let depth = c.get(6).map(|b| b >> 4);
+            (info.name, info.codec) = (
+                "VP9".into(),
+                crate::vod::vp9_codec(c.get(4).copied(), c.get(5).copied(), depth),
+            );
+        }
         b"av01" => {
             info.name = "AV1".into();
             info.codec = crate::vod::av1_codec(child(kids, b"av1C").unwrap_or(&[]));

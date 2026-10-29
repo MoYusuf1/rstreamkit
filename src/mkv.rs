@@ -12,7 +12,7 @@
 
 use crate::{
     Error,
-    vod::{Audio, AudioInfo, Frame, Track, VideoInfo, av1_codec, hevc_codec},
+    vod::{Audio, AudioInfo, Frame, Track, VideoInfo, av1_codec, hevc_codec, vp9_codec},
 };
 
 /// Microseconds the movie's clock is moved forward by on the output timeline. A picture can be
@@ -207,7 +207,18 @@ fn video_info(e: &Entry) -> VideoInfo {
     match e.codec.as_str() {
         "V_MPEG4/ISO/AVC" => info.set_h264(&e.private),
         "V_MPEGH/ISO/HEVC" => (info.name, info.codec) = ("HEVC".into(), hevc_codec(&e.private)),
-        "V_VP9" => (info.name, info.codec) = ("VP9".into(), "vp09.00.10.08".into()),
+        "V_VP9" => {
+            // CodecPrivate: (id, length, value) features; 1 profile, 2 level, 3 bit depth.
+            let mut feature = [None; 4];
+            let mut p = e.private.as_slice();
+            while let [id, 1, value, rest @ ..] = p {
+                if let Some(slot) = feature.get_mut(usize::from(*id)) {
+                    *slot = Some(*value);
+                }
+                p = rest;
+            }
+            (info.name, info.codec) = ("VP9".into(), vp9_codec(feature[1], feature[2], feature[3]));
+        }
         "V_VP8" => (info.name, info.codec) = ("VP8".into(), "vp8".into()),
         "V_AV1" => (info.name, info.codec) = ("AV1".into(), av1_codec(&e.private)),
         other => info.name = other.trim_start_matches("V_").into(),
@@ -870,6 +881,20 @@ mod tests {
         let main10 = [1, 0x22, 0x20, 0, 0, 0, 0xB0, 0, 0, 0, 0, 0, 153];
         assert_eq!(hevc_codec(&main10), "hvc1.2.4.H153.B0");
         assert_eq!(hevc_codec(&[1, 2]), "hvc1.1.6.L120.90");
+    }
+
+    #[test]
+    fn vp9_features_in_codec_private_give_the_codec_string() {
+        // CodecID V_VP9, then CodecPrivate: profile 2, level 3.1, 10-bit, 4:2:0 (ignored).
+        let mut track = vec![0x86, 0x85];
+        track.extend(b"V_VP9");
+        track.extend([0x63, 0xA2, 0x8C, 1, 1, 2, 2, 1, 31, 3, 1, 10, 4, 1, 1]);
+        assert_eq!(super::video_info(&entry(&track)).codec, "vp09.02.31.10");
+        // Without CodecPrivate (as FFmpeg writes it): the defaults.
+        assert_eq!(
+            super::video_info(&entry(&track[..7])).codec,
+            "vp09.00.10.08"
+        );
     }
 
     #[test]
