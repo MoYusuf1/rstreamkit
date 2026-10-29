@@ -7,8 +7,8 @@
 //!
 //! Laced sound (several frames in one block, which mkvmerge writes by default) is split into its
 //! frames, and header stripping (a prefix taken off every frame) is undone. ponytail: laced
-//! pictures are skipped (no muxer writes them), other content encodings (zlib, encryption) are
-//! refused, and a file with no cue index is refused rather than scanned.
+//! pictures are skipped (no muxer writes them) and other content encodings (zlib, encryption) are
+//! refused. A file with no cue index plays from its first cluster and can't seek.
 
 use crate::{
     Error,
@@ -277,6 +277,8 @@ pub struct Probe {
     tracks: Option<Vec<Entry>>,
     cues: Option<Vec<(u64, u64, u64)>>,
     visited: Vec<u64>,
+    /// Where the first cluster begins: where to read from when there is no cue index.
+    first_cluster: Option<u64>,
 }
 
 pub enum Step {
@@ -298,6 +300,7 @@ impl Probe {
             tracks: None,
             cues: None,
             visited: vec![],
+            first_cluster: None,
         }
     }
 
@@ -310,7 +313,7 @@ impl Probe {
                 return finish(*scale, *dur, tracks, cues.clone());
             }
             if self.scan >= self.size {
-                return Err(Error::Unsupported("the MKV has no cue index".into()));
+                return self.unindexed();
             }
             let off = match self.scan.checked_sub(at).map(usize::try_from) {
                 Some(Ok(o)) if o < bytes.len() => o,
@@ -332,6 +335,7 @@ impl Probe {
                 CLUSTER => {
                     // Media begins: the cues must be elsewhere, if the seek head says where.
                     let seg = self.segment.ok_or_else(damaged)?;
+                    self.first_cluster.get_or_insert(abs);
                     let next = |id: u32| {
                         self.seeks
                             .iter()
@@ -339,7 +343,7 @@ impl Probe {
                             .map(|s| seg + s.1)
                     };
                     let Some(to) = next(CUES).or_else(|| next(SEEK_HEAD)) else {
-                        return Err(Error::Unsupported("the MKV has no cue index".into()));
+                        return self.unindexed();
                     };
                     self.visited.push(to);
                     self.scan = to;
@@ -374,6 +378,20 @@ impl Probe {
                     None => return Err(damaged()),
                 },
             }
+        }
+    }
+
+    /// No cue index: a movie that plays from its first cluster and can't seek.
+    fn unindexed(&self) -> Result<Step, Error> {
+        match (&self.info, &self.tracks, self.first_cluster) {
+            (Some((scale, dur)), Some(tracks), Some(at)) => {
+                let mut step = finish(*scale, *dur, tracks, vec![(0, at, 0)])?;
+                if let Step::Done(parsed) = &mut step {
+                    parsed.index.indexed = false;
+                }
+                Ok(step)
+            }
+            _ => Err(Error::Unsupported("the MKV has no cue index".into())),
         }
     }
 
@@ -493,6 +511,7 @@ fn finish(
                 41_708
             },
             sound_frame: audio.as_ref().map_or(0, |(t, info)| sound_frame(t, info)),
+            indexed: true,
             stripped: (
                 video.stripped.clone(),
                 audio.as_ref().map_or(vec![], |a| a.0.stripped.clone()),
@@ -594,6 +613,8 @@ pub struct Index {
     sound_frame: i64,
     /// What header stripping took off each (picture, sound) frame, put back when reading.
     stripped: (Vec<u8>, Vec<u8>),
+    /// False for a file without a cue index: it is read from its first cluster and can't seek.
+    indexed: bool,
     /// (time in microseconds, offset of its cluster) of each place a picture can be started from.
     cues: Vec<(i64, u64)>,
 }
@@ -617,6 +638,11 @@ pub struct Cursor {
 }
 
 impl Index {
+    /// Whether the file has a cue index, so reading can start anywhere.
+    pub fn indexed(&self) -> bool {
+        self.indexed
+    }
+
     pub fn cursor(&self, at: i64) -> Cursor {
         let movie = at.saturating_sub(SHIFT);
         let i = self.cues.partition_point(|c| c.0 <= movie);
@@ -854,6 +880,7 @@ mod tests {
             default_duration: 40_000,
             sound_frame: 32_000,
             stripped: (vec![0, 0, 0, 1], vec![0x0B, 0x77]),
+            indexed: true,
             cues: vec![(0, 0)],
         };
         let mut c = Cursor {
@@ -888,6 +915,7 @@ mod tests {
             default_duration: 40_000,
             sound_frame: 32_000,
             stripped: (vec![], vec![]),
+            indexed: true,
             cues: vec![(0, 100), (2_000_000, 900_000)],
         }
     }
@@ -937,6 +965,7 @@ mod tests {
             default_duration: 40_000,
             sound_frame: 32_000,
             stripped: (vec![], vec![]),
+            indexed: true,
             cues: vec![(0, 0)],
         };
         let mut c = Cursor {

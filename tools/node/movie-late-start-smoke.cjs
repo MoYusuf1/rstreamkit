@@ -1,4 +1,4 @@
-// Movies that start late, never start, or carry laced sound: each plays or says why it can't.
+// Movies that start late, never start, carry laced sound or have no index: each plays or says why not.
 const assert=require('node:assert/strict'),fs=require('node:fs'),path=require('node:path'),os=require('node:os');
 const {execFileSync}=require('node:child_process'),{chromium,expect}=require('@playwright/test');
 (async()=>{
@@ -16,7 +16,10 @@ const {execFileSync}=require('node:child_process'),{chromium,expect}=require('@p
    undecodable:make('undecodable.mkv',['-bsf:v','filter_units=remove_types=5']),
    // Sound laced as mkvmerge writes it.
    laced:(()=>{const plain=make('plain.mkv',[]),out=path.join(temporary,'laced.mkv');
-    execFileSync('python3',[path.join(__dirname,'../lace_mkv.py'),plain,out]);return out;})(),
+    execFileSync('python3',[path.join(__dirname,'../lace_mkv.py'),plain,out]);return out;})(),   // Written to a pipe, so it has no cue index: plays from the start.
+   nocues:(()=>{const out=path.join(temporary,'nocues.mkv');fs.writeFileSync(out,execFileSync('ffmpeg',['-v','error',
+    '-f','lavfi','-i','testsrc2=size=160x90:rate=30:duration=12','-f','lavfi','-i','sine=frequency=440:sample_rate=48000:duration=12',
+    '-c:v','libx264','-preset','ultrafast','-g','30','-c:a','ac3','-f','matroska','pipe:1'],{maxBuffer:64<<20}));return out;})(),
   };
   browser=await chromium.launch({channel:'chrome'});const results=[];
   for(const [name,file] of Object.entries(cases)){
@@ -46,7 +49,8 @@ const {execFileSync}=require('node:child_process'),{chromium,expect}=require('@p
    assert.deepEqual(errors,[]);
   }
   console.log(JSON.stringify({checks:results.length,results},null,1));
-  const [clock,far,undecodable,laced]=results;
+  const [clock,far,undecodable,laced,nocues]=results;
+  assert(nocues.plays&&nocues.statuses.includes('Playing'),'a movie without cues plays from the start');
   assert(clock.plays&&clock.statuses.includes('Playing')&&clock.range_requests<20,'late clock plays without refetching');
   assert(!far.plays&&far.statuses.some(s=>/Failed/.test(s))&&far.range_requests<20,'unreachable start fails promptly');
   assert(laced.plays&&laced.statuses.includes('Playing'),'laced sound plays');

@@ -294,3 +294,57 @@ fn a_piece_ending_inside_the_trailing_index_still_ends_the_mkv() {
     let cut = play(&movie, MKV, 0.0, cues + 10 - first);
     assert_eq!(cut.len(), whole.len());
 }
+
+/// A Matroska file written to a pipe has no cue index: it plays from the start, can't seek, and
+/// every picture comes through.
+#[test]
+fn an_mkv_without_cues_plays_from_the_start() {
+    if !ffmpeg_ok() {
+        return eprintln!("ffmpeg not installed; skipping");
+    }
+    let out = Command::new("ffmpeg")
+        .args([
+            "-v",
+            "error",
+            "-f",
+            "lavfi",
+            "-i",
+            "testsrc2=size=160x90:rate=30:duration=12",
+        ])
+        .args([
+            "-f",
+            "lavfi",
+            "-i",
+            "sine=frequency=440:sample_rate=48000:duration=12",
+        ])
+        .args([
+            "-c:v",
+            "libx264",
+            "-preset",
+            "ultrafast",
+            "-g",
+            "30",
+            "-c:a",
+            "ac3",
+        ])
+        .args(["-f", "matroska", "pipe:1"])
+        .output()
+        .unwrap();
+    let file = out.stdout;
+    assert!(
+        !file.windows(4).any(|w| w == [0x1C, 0x53, 0xBB, 0x6B]),
+        "has cues"
+    );
+    let movie = Rc::new(load_mkv(&file));
+    assert!(!movie.seekable());
+    for chunk in [20_000, 300_000] {
+        let (complaints, streams) = decoded(&play(&movie, &file, 0.0, chunk), "nocues");
+        assert_eq!(complaints, "", "chunk {chunk}");
+        assert_eq!(
+            (streams[0].0.as_str(), streams[0].1),
+            ("h264", 360),
+            "chunk {chunk}"
+        );
+        assert_eq!(streams[1].0, "flac");
+    }
+}

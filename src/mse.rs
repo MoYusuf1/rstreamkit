@@ -1998,6 +1998,9 @@ mod movie {
             video.set_current_time(start);
         }
 
+        if start > 0.0 && !movie.seekable() {
+            return Err(Unsupported::NoIndex.into());
+        }
         let piece = ((movie.bytes_per_second() * PIECE_SECONDS) as u64).clamp(256 << 10, 6 << 20);
         let mut session = movie.session(start);
         // Where the next piece will begin, in seconds of the movie.
@@ -2030,6 +2033,9 @@ mod movie {
             }
             // A seek: start again from there.
             if seeked(video, t, frontier, started, start) {
+                if !movie.seekable() {
+                    return Err(Unsupported::NoIndex.into());
+                }
                 session = movie.session(t);
                 frontier = t;
                 ended = false;

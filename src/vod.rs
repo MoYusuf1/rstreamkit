@@ -190,6 +190,15 @@ impl Movie {
         self.size as f64 / self.duration.max(1.0)
     }
 
+    /// Whether playback can start anywhere. A Matroska file without cues can only be read from
+    /// its start.
+    pub fn seekable(&self) -> bool {
+        match &self.index {
+            Index::Mp4(_) => true,
+            Index::Mkv(i) => i.indexed(),
+        }
+    }
+
     /// Seconds to subtract from the source buffer's timestamps (`timestampOffset`).
     pub fn shift(&self) -> f64 {
         -(self.shift as f64) / 1e6

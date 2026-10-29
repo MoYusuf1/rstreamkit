@@ -86,6 +86,9 @@ pub enum Unsupported {
     RawStream,
     /// A media type this browser's MediaSource refuses, and what the browser said.
     MediaType { mime: String, why: String },
+    /// A movie file without an index (a Matroska file with no cues): it plays from the start, but
+    /// can't start later or seek.
+    NoIndex,
 }
 
 impl std::fmt::Display for Unsupported {
@@ -98,6 +101,9 @@ impl std::fmt::Display for Unsupported {
             Unsupported::RawStream => f.write_str(hls::RAW_STREAM),
             Unsupported::MediaType { mime, why } => {
                 write!(f, "this browser can't play {mime}: {why}")
+            }
+            Unsupported::NoIndex => {
+                f.write_str("the movie has no index, so it can only play from the start")
             }
         }
     }
