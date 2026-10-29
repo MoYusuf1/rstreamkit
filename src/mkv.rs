@@ -5,7 +5,8 @@
 //! decode order is the file order, and its times are the same set of times in ascending order, so
 //! each group of pictures gets them that way (see [`Cursor`]).
 //!
-//! ponytail: no lacing (AC-3, AAC and video are never laced in practice), no content encodings
+//! Laced sound (several frames in one block, which mkvmerge writes by default) is split into its
+//! frames. ponytail: laced pictures are skipped (no muxer writes them), no content encodings
 //! (compressed or encrypted tracks), and a file with no cue index is refused rather than scanned.
 
 use crate::{
@@ -448,15 +449,86 @@ fn finish(
         index: Index {
             scale,
             video: video.number,
-            audio: audio.map(|a| a.0.number),
+            audio: audio.as_ref().map(|a| a.0.number),
             default_duration: if video.default_duration > 0 {
                 video.default_duration
             } else {
                 41_708
             },
+            sound_frame: audio.as_ref().map_or(0, |(t, info)| sound_frame(t, info)),
             cues: points,
         },
     })))
+}
+
+/// Microseconds one sound frame lasts: the track's own default duration, or its codec's frame size.
+fn sound_frame(e: &Entry, info: &AudioInfo) -> i64 {
+    if e.default_duration > 0 {
+        return e.default_duration;
+    }
+    let samples = match e.codec.as_str() {
+        "A_AC3" | "A_EAC3" => 1536,
+        "A_MPEG/L2" | "A_MPEG/L3" => 1152,
+        c if c.starts_with("A_AAC") => 1024,
+        _ => return 0,
+    };
+    samples * 1_000_000 / i64::from(info.rate.max(1))
+}
+
+/// The frames of a laced block's payload (after its flags byte), by the lacing in `flags`.
+fn laces(flags: u8, data: &[u8]) -> Option<Vec<&[u8]>> {
+    let (&count, mut rest) = data.split_first()?;
+    let count = usize::from(count) + 1;
+    let mut sizes = Vec::with_capacity(count);
+    match flags & 0x06 {
+        // Xiph: each size but the last as a run of 255s and a final byte.
+        0x02 => {
+            for _ in 1..count {
+                let mut size = 0;
+                loop {
+                    let (&b, r) = rest.split_first()?;
+                    rest = r;
+                    size += usize::from(b);
+                    if b != 255 {
+                        break;
+                    }
+                }
+                sizes.push(size);
+            }
+        }
+        // EBML: the first size, then each next one as a signed difference.
+        0x06 => {
+            let (Some(first), n) = read_size(rest)? else {
+                return None;
+            };
+            rest = &rest[n..];
+            let mut size = i64::try_from(first).ok()?;
+            sizes.push(usize::try_from(size).ok()?);
+            for _ in 2..count {
+                let (Some(raw), n) = read_size(rest)? else {
+                    return None;
+                };
+                rest = &rest[n..];
+                size += i64::try_from(raw).ok()? - ((1i64 << (7 * n - 1)) - 1);
+                sizes.push(usize::try_from(size).ok()?);
+            }
+        }
+        // Fixed: equal sizes.
+        _ => {
+            if rest.len() % count != 0 {
+                return None;
+            }
+            sizes = vec![rest.len() / count; count - 1];
+        }
+    }
+    let mut frames = Vec::with_capacity(count);
+    for size in sizes {
+        let (frame, r) = (rest.get(..size)?, &rest[size..]);
+        frames.push(frame);
+        rest = r;
+    }
+    frames.push(rest);
+    Some(frames)
 }
 
 fn to_us(ticks: u64, scale: u64) -> i64 {
@@ -471,6 +543,8 @@ pub struct Index {
     audio: Option<u64>,
     /// Microseconds, for a picture with no duration of its own.
     default_duration: i64,
+    /// Microseconds one sound frame lasts, to time the frames of a laced block (0 if unknown).
+    sound_frame: i64,
     /// (time in microseconds, offset of its cluster) of each place a picture can be started from.
     cues: Vec<(i64, u64)>,
 }
@@ -584,12 +658,26 @@ impl Index {
             return;
         };
         let data = &p[n + 3..];
-        // ponytail: laced blocks are skipped (see the module comment).
-        if flags & 0x06 != 0 {
-            return;
-        }
         let rel = i64::from(i16::from_be_bytes([rel[0], rel[1]]));
         let pts = to_us((c.cluster + rel).max(0) as u64, self.scale) + SHIFT;
+        if flags & 0x06 != 0 {
+            // Laced: only sound (see the module comment); a malformed lace is dropped.
+            if Some(track) == self.audio
+                && let Some(frames) = laces(flags, data)
+            {
+                for (i, frame) in frames.into_iter().enumerate() {
+                    out.push(Frame {
+                        track: Track::Audio,
+                        pts: pts + i as i64 * self.sound_frame,
+                        dts: pts + i as i64 * self.sound_frame,
+                        dur: 0,
+                        key: true,
+                        data: frame.to_vec().into(),
+                    });
+                }
+            }
+            return;
+        }
         if track == self.video {
             let key = group_key.unwrap_or(flags & 0x80 != 0);
             if key {
@@ -644,7 +732,55 @@ impl Index {
 
 #[cfg(test)]
 mod tests {
-    use super::entry;
+    use super::{Cursor, Index, SHIFT, entry, laces};
+    use crate::vod::Track;
+
+    #[test]
+    fn laced_frames_split_the_same_in_all_three_lacings() {
+        let (a, b, c) = (vec![1u8; 300], vec![2u8; 3], vec![3u8; 290]);
+        let joined = [a.as_slice(), &b, &c].concat();
+        // Xiph: 300 = 255 + 45, then 3.
+        let xiph = [&[2u8, 255, 45, 3][..], &joined].concat();
+        assert_eq!(laces(0x02, &xiph).unwrap(), [&a[..], &b, &c]);
+        // EBML: 300 as a 2-byte size, then 3 - 300 = -297 as a 2-byte signed difference.
+        let delta = (-297i64 + 8191) as u16 | 0x4000;
+        let ebml = [&[2u8, 0x41, 0x2C][..], &delta.to_be_bytes(), &joined].concat();
+        assert_eq!(laces(0x06, &ebml).unwrap(), [&a[..], &b, &c]);
+        // Fixed: equal sizes only.
+        let fixed = [&[2u8][..], &[7u8; 12]].concat();
+        assert_eq!(laces(0x04, &fixed).unwrap(), [&[7u8; 4][..]; 3]);
+        assert!(laces(0x04, &[2, 1, 2, 3, 4]).is_none());
+        assert!(laces(0x02, &[2, 255]).is_none());
+    }
+
+    #[test]
+    fn a_laced_sound_block_becomes_timed_frames() {
+        let index = Index {
+            scale: 1_000_000,
+            video: 1,
+            audio: Some(2),
+            default_duration: 40_000,
+            sound_frame: 32_000,
+            cues: vec![(0, 0)],
+        };
+        let mut c = Cursor {
+            offset: 0,
+            need: 0,
+            cluster: 1000,
+            gop: vec![],
+            last_dts: i64::MIN,
+        };
+        // Track 2, relative time +10 ms, fixed lacing, three 4-byte frames.
+        let block = [&[0x82u8, 0, 10, 0x04, 2][..], &[9u8; 12]].concat();
+        let mut out = vec![];
+        index.block(&mut c, &block, None, &mut out);
+        let times: Vec<i64> = out.iter().map(|f| f.pts - SHIFT).collect();
+        assert_eq!(times, [1_010_000, 1_042_000, 1_074_000]);
+        assert!(
+            out.iter()
+                .all(|f| f.track == Track::Audio && f.data.len() == 4)
+        );
+    }
 
     #[test]
     fn flag_interlaced_one_is_interlaced_and_two_is_progressive() {
