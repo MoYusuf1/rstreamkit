@@ -14,7 +14,7 @@
 
 - Read Matroska `FlagInterlaced` as the spec defines it (1 interlaced, 2 progressive): progressive HEVC, VP9 and AV1 files made by FFmpeg were reported as interlaced.
 
-- Decode AC-3 5.1 about 23% faster with byte-identical output by reusing unchanged bit allocation and tightening mantissa unpacking.
+- Decode AC-3 5.1 about 30% faster with byte-identical output by reusing unchanged bit allocation, tightening mantissa unpacking and inlining mantissa reads.
 
 - Add an opt-in Wasm SIMD FFT: measured long/short transform time falls about 29%/25%, with matching finite outputs; default builds retain the scalar path.
 

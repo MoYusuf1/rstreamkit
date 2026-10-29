@@ -1666,3 +1666,15 @@ cd ac3
 cargo run --release --example decode_bench -- ac3_51.ac3 2 15
 cargo run --release --example decode_bench -- eac3_51.eac3 2 15
 ```
+
+Follow-up the same day: forcing `fetch_mantissa` inline into its callers. Interleaved A/B of the
+two builds (eight rounds of best-of-3, because the machine was loaded), identical PCM hashes:
+
+| 60 s input, best | Before | After |
+| --- | ---: | ---: |
+| AC-3 5.1 to stereo | 155.7 ms | 142.3 ms (8.6% less) |
+| AC-3 stereo | 76.5 ms | 69.4 ms (9.3% less) |
+| E-AC-3 5.1 to stereo | 186.9 ms | 171.1 ms (8.4% less) |
+| Full player Wasm, Brotli, before wasm-opt | 250,151 B | 250,750 B (+599) |
+
+Native times only; the player builds the decoder at opt-level `s`, where the gain was not measured.

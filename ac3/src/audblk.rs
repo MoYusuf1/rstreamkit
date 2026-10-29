@@ -1841,6 +1841,7 @@ pub(crate) fn unpack_mantissas(state: &mut Ac3State, bsi: &Bsi, br: &mut BitRead
 }
 
 #[allow(clippy::too_many_arguments)]
+#[inline(always)]
 pub(crate) fn fetch_mantissa(
     br: &mut BitReader,
     bap: u8,
