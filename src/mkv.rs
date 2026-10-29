@@ -12,7 +12,7 @@
 
 use crate::{
     Error,
-    vod::{Audio, AudioInfo, Frame, Track, VideoInfo},
+    vod::{Audio, AudioInfo, Frame, Track, VideoInfo, hevc_codec},
 };
 
 /// Microseconds the movie's clock is moved forward by on the output timeline. A picture can be
@@ -206,7 +206,7 @@ fn video_info(e: &Entry) -> VideoInfo {
     }
     match e.codec.as_str() {
         "V_MPEG4/ISO/AVC" => info.set_h264(&e.private),
-        "V_MPEGH/ISO/HEVC" => (info.name, info.codec) = ("HEVC".into(), "hvc1.1.6.L120.90".into()),
+        "V_MPEGH/ISO/HEVC" => (info.name, info.codec) = ("HEVC".into(), hevc_codec(&e.private)),
         "V_VP9" => (info.name, info.codec) = ("VP9".into(), "vp09.00.10.08".into()),
         "V_VP8" => (info.name, info.codec) = ("VP8".into(), "vp8".into()),
         "V_AV1" => (info.name, info.codec) = ("AV1".into(), "av01.0.08M.08".into()),
@@ -858,6 +858,18 @@ mod tests {
         let comp = [&[0x50, 0x34, 0x80 | comp.len() as u8][..], &comp].concat();
         let enc = [&[0x62, 0x40, 0x80 | comp.len() as u8][..], &comp].concat();
         [&[0x6D, 0x80, 0x80 | enc.len() as u8][..], &enc].concat()
+    }
+
+    #[test]
+    fn hevc_codec_strings_come_from_the_hvcc_record() {
+        use crate::vod::hevc_codec;
+        // Main, level 4 (120), progressive and frame-only constraint flags.
+        let main = [1, 0x01, 0x60, 0, 0, 0, 0x90, 0, 0, 0, 0, 0, 120];
+        assert_eq!(hevc_codec(&main), "hvc1.1.6.L120.90");
+        // Main 10, high tier, level 5.1 (153).
+        let main10 = [1, 0x22, 0x20, 0, 0, 0, 0xB0, 0, 0, 0, 0, 0, 153];
+        assert_eq!(hevc_codec(&main10), "hvc1.2.4.H153.B0");
+        assert_eq!(hevc_codec(&[1, 2]), "hvc1.1.6.L120.90");
     }
 
     #[test]

@@ -2,6 +2,8 @@
 
 ## Unreleased (0.2.0)
 
+- Describe HEVC movies by their real profile, tier and level (from `hvcC`) instead of always Main at level 4, so `canPlayType` answers for the actual stream (for example `hvc1.2.4.L93.90` for 720p Main 10).
+
 - Play Matroska files without a cue index (written to a pipe or recorded) from the start instead of refusing them; starting later or seeking reports the new `Unsupported::NoIndex`. Add `Movie::seekable`.
 
 - Start Matroska movies one round trip sooner: each range reaches the next keyframe cluster, and a keyframe's header completes the group before it. Time to Playing from a server answering in 300 ms falls from 1.34 to 0.99 s.

@@ -98,6 +98,29 @@ pub struct AudioInfo {
     pub rate: u32,
 }
 
+/// The `codecs` string for HEVC from its `hvcC` record (ISO/IEC 14496-15 annex E), e.g.
+/// `hvc1.2.4.L150.90` for Main 10 at level 5; Main at level 4 when the record is too short.
+pub(crate) fn hevc_codec(hvcc: &[u8]) -> String {
+    let Some(&[_, profile, c0, c1, c2, c3, ref constraints @ .., level]) = hvcc.get(..13) else {
+        return "hvc1.1.6.L120.90".into();
+    };
+    let space = ["", "A", "B", "C"][usize::from(profile >> 6)];
+    let tier = if profile & 0x20 != 0 { 'H' } else { 'L' };
+    let compatible = u32::from_be_bytes([c0, c1, c2, c3]).reverse_bits();
+    let mut codec = format!(
+        "hvc1.{space}{}.{compatible:X}.{tier}{level}",
+        profile & 0x1F
+    );
+    let kept = constraints
+        .iter()
+        .rposition(|&b| b != 0)
+        .map_or(0, |i| i + 1);
+    for b in &constraints[..kept] {
+        codec += &format!(".{b:X}");
+    }
+    codec
+}
+
 impl VideoInfo {
     /// Fills in H.264 from an `avcC` payload, when its pictures can be copied as they are (they
     /// can if their NAL units are prefixed with 4-byte lengths, which is what nearly all are).
