@@ -279,3 +279,18 @@ fn an_aac_movie_plays_through_ffmpeg_with_all_its_sound() {
         source[0].1
     );
 }
+
+/// A piece that ends inside the index at the end of the file (where FFmpeg writes it) still
+/// finishes the session and hands over the last group of pictures.
+#[test]
+fn a_piece_ending_inside_the_trailing_index_still_ends_the_mkv() {
+    let movie = Rc::new(load_mkv(MKV));
+    let cues = MKV
+        .windows(4)
+        .rposition(|w| w == [0x1C, 0x53, 0xBB, 0x6B])
+        .unwrap() as u64;
+    let (first, _) = movie.session(0.0).range(1).unwrap();
+    let whole = play(&movie, MKV, 0.0, MKV.len() as u64);
+    let cut = play(&movie, MKV, 0.0, cues + 10 - first);
+    assert_eq!(cut.len(), whole.len());
+}

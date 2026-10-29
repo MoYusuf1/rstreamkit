@@ -356,10 +356,7 @@ impl Session {
                 let frames = i.frames(c, start, bytes);
                 (frames, i.done(c))
             }
-            (Index::Mkv(i), Cursor::Mkv(c)) => {
-                let last = start + bytes.len() as u64 >= self.movie.size;
-                i.frames(c, start, bytes, last)
-            }
+            (Index::Mkv(i), Cursor::Mkv(c)) => i.frames(c, start, bytes, self.movie.size),
             _ => unreachable!("a session reads the kind of file it was made for"),
         };
         if frames.is_empty() && !done && bytes.len() < self.asked.1 as usize {

@@ -2,6 +2,8 @@
 
 ## Unreleased (0.2.0)
 
+- Finish a Matroska movie when a range ends inside a trailing index or tags: the session now ends and hands over its last pictures instead of leaving the browser loop asking for nothing, without yielding.
+
 - Report `Failed` when a movie's media sits buffered at the playhead for 8 s without a decoded picture, instead of waiting silently; handle `play()` promise rejections so pages log no uncaught errors.
 
 - Start movies whose first media begins up to 3 s after the start (a late Matroska clock) instead of refetching the opening forever; report `Failed` when nothing playable reaches the start.

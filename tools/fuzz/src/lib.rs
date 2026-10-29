@@ -68,7 +68,7 @@ pub fn exercise(target: &str, data: &[u8]) {
                                 parsed
                                     .index
                                     .range(&cursor, MAX_INPUT as u64, data.len() as u64);
-                            let _ = parsed.index.frames(&mut cursor, 0, data, true);
+                            let _ = parsed.index.frames(&mut cursor, 0, data, data.len() as u64);
                         }
                         break;
                     }

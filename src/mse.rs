@@ -2051,6 +2051,8 @@ mod movie {
             } else {
                 piece
             }) else {
+                // Nothing left to ask for: wait rather than spin, which would freeze the page.
+                sleep(Duration::from_millis(250)).await;
                 continue;
             };
             first_chunk = false;

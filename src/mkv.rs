@@ -510,14 +510,14 @@ impl Index {
         (c.offset < size).then(|| (c.offset, max.max(c.need).min(size - c.offset)))
     }
 
-    /// Reads the blocks in `bytes` (the file from offset `start`). The last piece of the file
-    /// also hands over the final group of pictures.
+    /// Reads the blocks in `bytes` (the file from offset `start`, `size` bytes long). The last
+    /// piece of the file also hands over the final group of pictures.
     pub fn frames(
         &self,
         c: &mut Cursor,
         start: u64,
         bytes: &[u8],
-        last: bool,
+        size: u64,
     ) -> (Vec<Frame<'static>>, bool) {
         let mut out = vec![];
         let mut i = 0;
@@ -561,7 +561,9 @@ impl Index {
             }
         }
         c.offset = jump.unwrap_or(start + i as u64);
-        // The end of the file: hand over the last group of pictures.
+        // The end of the file, read or stepped over (an index or tags last): hand over the last
+        // group of pictures.
+        let last = start + bytes.len() as u64 >= size || c.offset >= size;
         if last {
             self.flush(c, &mut out);
         }
