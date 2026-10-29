@@ -717,7 +717,7 @@ pub(crate) fn parse_audblk_into(
                             (cplcomant + 16) as f32 / 32.0
                         };
                         let shift = cplcoexp + 3 * mstrcplco;
-                        state.cpl_coord[ch][bnd] = mant * pow2_neg(shift as i32);
+                        state.cpl_coord[ch][bnd] = mant * pow2_neg(shift);
                     }
                     state.cpl_coord_valid[ch] = true;
                 }
