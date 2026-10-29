@@ -1678,3 +1678,19 @@ two builds (eight rounds of best-of-3, because the machine was loaded), identica
 | Full player Wasm, Brotli, before wasm-opt | 250,151 B | 250,750 B (+599) |
 
 Native times only; the player builds the decoder at opt-level `s`, where the gain was not measured.
+
+The same decoder changes in Wasm, which the browser player uses. `tools/node/opt-compare.cjs` with
+the Node harness built at 973a5c2 (before) and 1dc392f (after), opt-level `s`, Node 24.22.1, a
+loaded machine. PCM checksums match on every fixture.
+
+| Fixture, median | Before | After |
+| --- | ---: | ---: |
+| h264_ac3_51.ts, transmux with sound | 11.57 ms | 10.80 ms (6.6% less) |
+| h264_eac3_51.ts, transmux with sound | 13.38 ms | 12.54 ms (6.3% less) |
+| h264_ac3.ts (mono), transmux with sound | 14.23 ms | 13.44 ms (5.6% less) |
+| h264_ac3_st.ts, transmux with sound | 7.71 ms | 7.60 ms (1.5% less) |
+| FLAC encoding and MP2 rows | | within ±5%, unchanged code |
+
+So in the browser the gain is about 6%, far below the native 30%: at opt-level `s` the decoder
+was already less dominated by these loops. Harness Wasm grew 790,908 → 798,828 bytes before
+compression, which also includes the Matroska lacing and header-stripping support.
