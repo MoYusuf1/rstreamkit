@@ -577,6 +577,12 @@ fn to_us(ticks: u64, scale: u64) -> i64 {
 }
 
 /// Where to read and how to read it.
+/// Bytes past the next cue a range also covers: the cluster header, any sound blocks before the
+/// keyframe, and the keyframe's header.
+const GROUP_MARGIN: u64 = 32 << 10;
+/// The most a range is stretched to reach the next cue; a longer group is read in more pieces.
+const GROUP_LIMIT: u64 = 16 << 20;
+
 pub struct Index {
     /// Nanoseconds per timecode tick.
     scale: u64,
@@ -624,7 +630,16 @@ impl Index {
     }
 
     pub fn range(&self, c: &Cursor, max: u64, size: u64) -> Option<(u64, u64)> {
-        (c.offset < size).then(|| (c.offset, max.max(c.need).min(size - c.offset)))
+        // Reach the next cue's cluster (where the next group of pictures starts) and the header of
+        // its first block: the pictures before it only go out once that keyframe is seen, so a
+        // shorter range would cost another round trip before anything plays.
+        let group = self
+            .cues
+            .iter()
+            .map(|cue| cue.1)
+            .find(|&o| o > c.offset)
+            .map_or(0, |o| (o - c.offset + GROUP_MARGIN).min(GROUP_LIMIT));
+        (c.offset < size).then(|| (c.offset, max.max(c.need).max(group).min(size - c.offset)))
     }
 
     /// Reads the blocks in `bytes` (the file from offset `start`, `size` bytes long). The last
@@ -649,7 +664,18 @@ impl Index {
             let total = h as u64 + len;
             if i as u64 + total > bytes.len() as u64 {
                 match id {
-                    TIMECODE | SIMPLE_BLOCK | BLOCK_GROUP => c.need = total,
+                    TIMECODE | SIMPLE_BLOCK | BLOCK_GROUP => {
+                        c.need = total;
+                        // A keyframe's header is enough to know the group before it is complete.
+                        let body = &bytes[i + h..];
+                        if id == SIMPLE_BLOCK
+                            && let Some((Some(track), n)) = read_size(body)
+                            && track == self.video
+                            && body.get(n + 2).is_some_and(|flags| flags & 0x80 != 0)
+                        {
+                            self.flush(c, &mut out);
+                        }
+                    }
                     // Something we don't read (cues, tags, attachments): step over it unread.
                     _ => jump = Some(start + i as u64 + total),
                 }
@@ -775,7 +801,7 @@ impl Index {
 
 #[cfg(test)]
 mod tests {
-    use super::{Cursor, Index, SHIFT, entry, laces};
+    use super::{Cursor, GROUP_MARGIN, Index, SHIFT, entry, laces};
     use crate::vod::Track;
 
     #[test]
@@ -852,6 +878,54 @@ mod tests {
                 &[0, 0, 0, 1, 0x65]
             ]
         );
+    }
+
+    fn index() -> Index {
+        Index {
+            scale: 1_000_000,
+            video: 1,
+            audio: Some(2),
+            default_duration: 40_000,
+            sound_frame: 32_000,
+            stripped: (vec![], vec![]),
+            cues: vec![(0, 100), (2_000_000, 900_000)],
+        }
+    }
+
+    fn cursor(offset: u64) -> Cursor {
+        Cursor {
+            offset,
+            need: 0,
+            cluster: 0,
+            gop: vec![],
+            last_dts: i64::MIN,
+        }
+    }
+
+    #[test]
+    fn a_range_reaches_the_next_keyframe_cluster() {
+        let index = index();
+        assert_eq!(
+            index.range(&cursor(100), 1000, 10 << 20),
+            Some((100, 900_000 - 100 + GROUP_MARGIN))
+        );
+        // Past the last cue, the asked size stands.
+        assert_eq!(
+            index.range(&cursor(950_000), 1000, 10 << 20),
+            Some((950_000, 1000))
+        );
+    }
+
+    #[test]
+    fn a_keyframe_header_completes_the_group_before_it() {
+        let index = index();
+        let mut c = cursor(0);
+        // A keyframe and a picture, then only the start of the next keyframe's block.
+        let block = |flags: u8| [0xA3, 0x85, 0x81, 0, 0, flags, 0x65].to_vec();
+        let bytes = [block(0x80), block(0), vec![0xA3, 0x88, 0x81, 0, 0, 0x80]].concat();
+        let (frames, _) = index.frames(&mut c, 0, &bytes, 1 << 20);
+        assert_eq!(frames.len(), 2);
+        assert_eq!(c.offset, 14);
     }
 
     #[test]

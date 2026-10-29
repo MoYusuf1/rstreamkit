@@ -1694,3 +1694,25 @@ loaded machine. PCM checksums match on every fixture.
 So in the browser the gain is about 6%, far below the native 30%: at opt-level `s` the decoder
 was already less dominated by these loops. Harness Wasm grew 790,908 → 798,828 bytes before
 compression, which also includes the Matroska lacing and header-stripping support.
+
+## Matroska starts one round trip sooner (2026-10-29)
+
+Matroska pictures go out a whole group at a time (their decode times come from the group), so
+nothing could play until the next keyframe had been read. The first range was a fixed 768 KB;
+a 2 s group at 6 Mb/s is about 1.5 MB, so playback waited for a second range. Ranges now reach
+the next cue's cluster plus 32 KB (capped at 16 MB), and the header of the next keyframe block
+completes the group without waiting for its body.
+
+`tools/node/movie-latency-smoke.cjs`: 60 s 1280×720 6 Mb/s H.264 + AC-3 5.1, every range answered
+after a fixed delay, Chrome 155, unoptimized full player, two runs each (ranges shown).
+
+| Measure | Before | After |
+| --- | ---: | ---: |
+| MKV, 800 ms per range: time to Playing | 3.35 s | 2.50-2.51 s |
+| MKV, 300 ms per range: time to Playing | 1.34-1.35 s | 0.99-1.00 s |
+| MKV, 300 ms: time to 20 s buffered ahead | 2.88 s | 2.54-2.60 s |
+| MP4 (unchanged code), 300 ms: time to Playing | 0.96 s | 0.97 s |
+
+A local route with injected latency, not a real provider; real transfer time for the larger
+first range is not modelled. Repeat: serve `tools/web`, then
+`RSTREAMKIT_LATENCY_MS=300 NODE_PATH=tools/browser/node_modules node tools/node/movie-latency-smoke.cjs`.

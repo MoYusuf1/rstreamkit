@@ -2,6 +2,8 @@
 
 ## Unreleased (0.2.0)
 
+- Start Matroska movies one round trip sooner: each range reaches the next keyframe cluster, and a keyframe's header completes the group before it. Time to Playing from a server answering in 300 ms falls from 1.34 to 0.99 s.
+
 - Play Matroska tracks with header-stripping compression (older mkvmerge's default for AC-3 and H.264) instead of refusing them; other content encodings are still refused.
 
 - Read laced Matroska sound (Xiph, fixed-size and EBML lacing, as mkvmerge writes by default): laced blocks were dropped, so such movies had no sound track data and nothing playable in the browser's combined buffer.
