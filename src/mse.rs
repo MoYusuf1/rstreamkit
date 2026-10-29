@@ -1923,7 +1923,9 @@ mod movie {
     /// Before playback starts, an unmoved playhead is only waiting at a gap, not a seek: restarting
     /// there would fetch the same piece forever.
     fn seeked(video: &HtmlVideoElement, t: f64, frontier: f64, started: bool, start: f64) -> bool {
-        !buffered_at(video, t) && (t - frontier).abs() > 1.0 && (started || t != start)
+        !buffered_at(video, t)
+            && (t - frontier).abs() > 1.0
+            && (started || (t - start).abs() > 0.01)
     }
 
     /// Frees what is buffered far behind the playhead, and far beyond where a seek left it.
