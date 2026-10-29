@@ -130,7 +130,7 @@ fn entry(b: &[u8]) -> Entry {
                         0xBA => e.video.1 = uint(p) as u32,
                         0x54B0 => e.video.2 = uint(p) as u32,
                         0x54BA => e.video.3 = uint(p) as u32,
-                        0x9A => e.video.4 = uint(p) > 1,
+                        0x9A => e.video.4 = uint(p) == 1, // FlagInterlaced: 0 unknown, 1 interlaced, 2 progressive
                         _ => {}
                     }
                 }
@@ -637,5 +637,19 @@ impl Index {
                 data: held.data.into(),
             });
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::entry;
+
+    #[test]
+    fn flag_interlaced_one_is_interlaced_and_two_is_progressive() {
+        // A Video element (0xE0) holding only FlagInterlaced (0x9A) with a one-byte value.
+        let flag = |v: u8| entry(&[0xE0, 0x83, 0x9A, 0x81, v]).video.4;
+        assert!(flag(1));
+        assert!(!flag(2));
+        assert!(!flag(0));
     }
 }
