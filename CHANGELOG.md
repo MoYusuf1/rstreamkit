@@ -2,6 +2,8 @@
 
 ## Unreleased (0.2.0)
 
+- Play Matroska tracks with header-stripping compression (older mkvmerge's default for AC-3 and H.264) instead of refusing them; other content encodings are still refused.
+
 - Read laced Matroska sound (Xiph, fixed-size and EBML lacing, as mkvmerge writes by default): laced blocks were dropped, so such movies had no sound track data and nothing playable in the browser's combined buffer.
 
 - Finish a Matroska movie when a range ends inside a trailing index or tags: the session now ends and hands over its last pictures instead of leaving the browser loop asking for nothing, without yielding.

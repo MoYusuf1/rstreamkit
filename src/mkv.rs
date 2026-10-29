@@ -6,8 +6,9 @@
 //! each group of pictures gets them that way (see [`Cursor`]).
 //!
 //! Laced sound (several frames in one block, which mkvmerge writes by default) is split into its
-//! frames. ponytail: laced pictures are skipped (no muxer writes them), no content encodings
-//! (compressed or encrypted tracks), and a file with no cue index is refused rather than scanned.
+//! frames, and header stripping (a prefix taken off every frame) is undone. ponytail: laced
+//! pictures are skipped (no muxer writes them), other content encodings (zlib, encryption) are
+//! refused, and a file with no cue index is refused rather than scanned.
 
 use crate::{
     Error,
@@ -102,7 +103,39 @@ struct Entry {
     default_duration: i64,
     video: (u32, u32, u32, u32, bool),
     audio: (f64, u16),
+    /// Compressed or encrypted in a way not read here.
     encoded: bool,
+    /// The bytes header stripping took off the front of every frame (empty without it).
+    stripped: Vec<u8>,
+}
+
+/// The prefix a track's one content encoding strips from each frame, when that is all it does
+/// (header stripping, mkvmerge's old default for AC-3 and H.264); `None` for anything else.
+fn stripped_header(encodings: &[u8]) -> Option<Vec<u8>> {
+    let mut all = elements(encodings).filter(|(id, _)| *id == 0x6240);
+    let (_, encoding) = all.next()?;
+    if all.next().is_some() {
+        return None;
+    }
+    let (mut scope, mut kind, mut algo, mut prefix) = (1, 0, 0, vec![]);
+    for (id, p) in elements(encoding) {
+        match id {
+            0x5032 => scope = uint(p),
+            0x5033 => kind = uint(p),
+            0x5034 => {
+                for (id, p) in elements(p) {
+                    match id {
+                        0x4254 => algo = uint(p),
+                        0x4255 => prefix = p.to_vec(),
+                        _ => {}
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    // Frames only (scope 1), compression (type 0), header stripping (algorithm 3).
+    (scope == 1 && kind == 0 && algo == 3).then_some(prefix)
 }
 
 fn entry(b: &[u8]) -> Entry {
@@ -115,6 +148,7 @@ fn entry(b: &[u8]) -> Entry {
         video: (0, 0, 0, 0, false),
         audio: (8000.0, 1),
         encoded: false,
+        stripped: vec![],
     };
     for (id, p) in elements(b) {
         match id {
@@ -123,7 +157,10 @@ fn entry(b: &[u8]) -> Entry {
             0x86 => e.codec = String::from_utf8_lossy(p).into_owned(),
             0x63A2 => e.private = p.to_vec(),
             0x23E383 => e.default_duration = (uint(p) / 1000) as i64,
-            0x6D80 => e.encoded = true,
+            0x6D80 => match stripped_header(p) {
+                Some(prefix) => e.stripped = prefix,
+                None => e.encoded = true,
+            },
             0xE0 => {
                 for (id, p) in elements(p) {
                     match id {
@@ -456,6 +493,10 @@ fn finish(
                 41_708
             },
             sound_frame: audio.as_ref().map_or(0, |(t, info)| sound_frame(t, info)),
+            stripped: (
+                video.stripped.clone(),
+                audio.as_ref().map_or(vec![], |a| a.0.stripped.clone()),
+            ),
             cues: points,
         },
     })))
@@ -545,6 +586,8 @@ pub struct Index {
     default_duration: i64,
     /// Microseconds one sound frame lasts, to time the frames of a laced block (0 if unknown).
     sound_frame: i64,
+    /// What header stripping took off each (picture, sound) frame, put back when reading.
+    stripped: (Vec<u8>, Vec<u8>),
     /// (time in microseconds, offset of its cluster) of each place a picture can be started from.
     cues: Vec<(i64, u64)>,
 }
@@ -672,7 +715,7 @@ impl Index {
                         dts: pts + i as i64 * self.sound_frame,
                         dur: 0,
                         key: true,
-                        data: frame.to_vec().into(),
+                        data: [self.stripped.1.as_slice(), frame].concat().into(),
                     });
                 }
             }
@@ -686,7 +729,7 @@ impl Index {
             c.gop.push(Held {
                 pts,
                 key,
-                data: data.to_vec(),
+                data: [self.stripped.0.as_slice(), data].concat(),
             });
         } else if Some(track) == self.audio {
             out.push(Frame {
@@ -695,7 +738,7 @@ impl Index {
                 dts: pts,
                 dur: 0,
                 key: true,
-                data: data.to_vec().into(),
+                data: [self.stripped.1.as_slice(), data].concat().into(),
             });
         }
     }
@@ -753,6 +796,64 @@ mod tests {
         assert!(laces(0x02, &[2, 255]).is_none());
     }
 
+    /// A ContentEncodings element holding one compression with `algo` and, if given, settings.
+    fn encodings(algo: u8, settings: &[u8]) -> Vec<u8> {
+        let mut comp = vec![0x42, 0x54, 0x81, algo];
+        if !settings.is_empty() {
+            comp.extend([0x42, 0x55, 0x80 | settings.len() as u8]);
+            comp.extend(settings);
+        }
+        let comp = [&[0x50, 0x34, 0x80 | comp.len() as u8][..], &comp].concat();
+        let enc = [&[0x62, 0x40, 0x80 | comp.len() as u8][..], &comp].concat();
+        [&[0x6D, 0x80, 0x80 | enc.len() as u8][..], &enc].concat()
+    }
+
+    #[test]
+    fn header_stripping_is_read_and_other_encodings_refused() {
+        let stripped = entry(&encodings(3, &[0x0B, 0x77]));
+        assert_eq!(
+            (stripped.encoded, stripped.stripped),
+            (false, vec![0x0B, 0x77])
+        );
+        // zlib (algorithm 0) is still refused.
+        assert!(entry(&encodings(0, &[])).encoded);
+    }
+
+    #[test]
+    fn stripped_bytes_are_put_back_on_every_frame() {
+        let index = Index {
+            scale: 1_000_000,
+            video: 1,
+            audio: Some(2),
+            default_duration: 40_000,
+            sound_frame: 32_000,
+            stripped: (vec![0, 0, 0, 1], vec![0x0B, 0x77]),
+            cues: vec![(0, 0)],
+        };
+        let mut c = Cursor {
+            offset: 0,
+            need: 0,
+            cluster: 0,
+            gop: vec![],
+            last_dts: i64::MIN,
+        };
+        let mut out = vec![];
+        // A laced pair of sound frames, then a keyframe picture and a flush.
+        let sound = [&[0x82u8, 0, 0, 0x04, 1][..], &[5u8; 4]].concat();
+        index.block(&mut c, &sound, None, &mut out);
+        index.block(&mut c, &[0x81, 0, 0, 0x80, 0x65], None, &mut out);
+        index.flush(&mut c, &mut out);
+        let data: Vec<&[u8]> = out.iter().map(|f| f.data.as_ref()).collect();
+        assert_eq!(
+            data,
+            [
+                &[0x0B, 0x77, 5, 5][..],
+                &[0x0B, 0x77, 5, 5],
+                &[0, 0, 0, 1, 0x65]
+            ]
+        );
+    }
+
     #[test]
     fn a_laced_sound_block_becomes_timed_frames() {
         let index = Index {
@@ -761,6 +862,7 @@ mod tests {
             audio: Some(2),
             default_duration: 40_000,
             sound_frame: 32_000,
+            stripped: (vec![], vec![]),
             cues: vec![(0, 0)],
         };
         let mut c = Cursor {
