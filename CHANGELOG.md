@@ -2,6 +2,8 @@
 
 ## Unreleased (0.2.0)
 
+- Report `Failed` when a movie's media sits buffered at the playhead for 8 s without a decoded picture, instead of waiting silently; handle `play()` promise rejections so pages log no uncaught errors.
+
 - Start movies whose first media begins up to 3 s after the start (a late Matroska clock) instead of refetching the opening forever; report `Failed` when nothing playable reaches the start.
 
 - Read Matroska `FlagInterlaced` as the spec defines it (1 interlaced, 2 progressive): progressive HEVC, VP9 and AV1 files made by FFmpeg were reported as interlaced.

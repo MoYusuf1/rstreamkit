@@ -12,6 +12,8 @@ const {execFileSync}=require('node:child_process'),{chromium,expect}=require('@p
    clock:make('clock.mkv',['-output_ts_offset','0.3']),
    // Too far to jump: the engine must say so instead of waiting.
    far:make('far.mkv',['-output_ts_offset','8']),
+   // Buffered at the start but never decodable (keyframe slices removed): the engine must say so.
+   undecodable:make('undecodable.mkv',['-bsf:v','filter_units=remove_types=5']),
   };
   browser=await chromium.launch({channel:'chrome'});const results=[];
   for(const [name,file] of Object.entries(cases)){
@@ -32,7 +34,7 @@ const {execFileSync}=require('node:child_process'),{chromium,expect}=require('@p
    const started=Date.now();
    await page.locator('#play').click();
    let ok=true;
-   try{await expect.poll(()=>page.locator('#video').evaluate(v=>v.currentTime),{timeout:15000}).toBeGreaterThan(3);}catch{ok=false;}
+   try{await expect.poll(()=>page.locator('#video').evaluate(v=>v.currentTime),{timeout:15000}).toBeGreaterThan(3);}catch{ok=false;await page.waitForTimeout(name==='undecodable'?2000:0);}
    const report=await page.evaluate(()=>({sample:sample(),ready:document.querySelector('#video').readyState,
     buffered:[...Array(document.querySelector('#video').buffered.length).keys()].map(i=>[document.querySelector('#video').buffered.start(i),document.querySelector('#video').buffered.end(i)])}));
    results.push({name,plays:ok,ms:Date.now()-started,range_requests:requests,ready:report.ready,buffered:report.buffered,
@@ -40,9 +42,10 @@ const {execFileSync}=require('node:child_process'),{chromium,expect}=require('@p
    await page.close();
    assert.deepEqual(errors,[]);
   }
-  const [clock,far]=results;
+  const [clock,far,undecodable]=results;
   assert(clock.plays&&clock.statuses.includes('Playing')&&clock.range_requests<20,'late clock plays without refetching');
   assert(!far.plays&&far.statuses.some(s=>/Failed/.test(s))&&far.range_requests<20,'unreachable start fails promptly');
+  assert(!undecodable.plays&&undecodable.statuses.some(s=>/Failed/.test(s)),'undecodable start fails');
   console.log(JSON.stringify({checks:results.length,results},null,1));
  }finally{await browser?.close();fs.rmSync(temporary,{recursive:true,force:true});}
 })().catch(e=>{console.error(e);process.exit(1);});

@@ -151,7 +151,7 @@ impl Player {
                     self.go_live.set(true);
                 }
             }
-            let _ = self.video.play();
+            play(&self.video);
         }
     }
     pub fn seek(&self, seconds: f64) {
@@ -822,6 +822,16 @@ fn parse_media(f: &Fetched) -> Result<hls::Media, Failure> {
     }
 }
 
+/// Starts playback. Awaiting the returned promise marks its rejection (a pause or a new source
+/// before it settles) as handled, so the page doesn't log an uncaught error.
+fn play(video: &HtmlVideoElement) {
+    if let Ok(promise) = video.play() {
+        wasm_bindgen_futures::spawn_local(async move {
+            let _ = JsFuture::from(promise).await;
+        });
+    }
+}
+
 /// Seconds of media buffered ahead of the playhead (0 if none).
 fn buffered_ahead(video: &HtmlVideoElement) -> f64 {
     let b = video.buffered();
@@ -1424,7 +1434,7 @@ async fn run(
                 {
                     video.set_current_time(start);
                 }
-                let _ = video.play();
+                play(video);
                 say(Status::Playing);
             }
             if buffered_ahead(video) >= 0.5 {
@@ -1696,7 +1706,7 @@ async fn run_ts(
                 }
                 if !started {
                     started = true;
-                    let _ = video.play();
+                    play(video);
                     if !stop.get() {
                         report(Status::Playing);
                     }
@@ -1899,6 +1909,8 @@ mod movie {
     /// The furthest the first buffered media may begin after the start and still be jumped to. A
     /// movie whose clock, or whose sound, starts a little late leaves a gap the browser won't cross.
     const START_GAP: f64 = 3.0;
+    /// How long media may sit buffered at the playhead without a picture before playback fails.
+    const NO_PICTURE: f64 = 8.0;
 
     fn buffered_at(video: &HtmlVideoElement, t: f64) -> bool {
         let b = video.buffered();
@@ -1991,11 +2003,29 @@ mod movie {
         let mut started = false;
         let mut ended = false;
         let mut first_chunk = true;
+        // Since when media has been buffered at the playhead without the browser decoding it.
+        let mut undecoded_since: Option<f64> = None;
         loop {
             if stop.get() {
                 return Ok(());
             }
             let t = video.current_time();
+            if started
+                && !video.seeking()
+                && video.ready_state() < web_sys::HtmlMediaElement::HAVE_CURRENT_DATA
+                && buffered_at(video, t)
+            {
+                let now = js_sys::Date::now() / 1000.0;
+                let since = *undecoded_since.get_or_insert(now);
+                if now - since > NO_PICTURE {
+                    return Err(format!(
+                        "no picture decoded at {t:.1} s although the media there is buffered"
+                    )
+                    .into());
+                }
+            } else {
+                undecoded_since = None;
+            }
             // A seek: start again from there.
             if seeked(video, t, frontier, started, start) {
                 session = movie.session(t);
@@ -2070,7 +2100,7 @@ mod movie {
             }
             if !started && buffered_at(video, video.current_time().max(start)) {
                 started = true;
-                let _ = video.play();
+                play(video);
                 say(Status::Playing);
             }
         }

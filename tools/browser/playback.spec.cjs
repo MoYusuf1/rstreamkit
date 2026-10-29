@@ -178,7 +178,7 @@ test('a movie whose clock starts late plays; one that cannot start says so', asy
     timeout: 80000, maxBuffer: 1024 * 1024,
   });
   await testInfo.attach('movie-late-start-report', { body: stdout, contentType: 'application/json' });
-  expect(JSON.parse(stdout).checks).toBe(2);
+  expect(JSON.parse(stdout).checks).toBe(3);
 });
 
 test("all four player builds load exactly three startup assets", async ({ baseURL }, testInfo) => {
