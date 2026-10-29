@@ -189,6 +189,21 @@ pub struct ChannelState {
     /// `spxattencod[ch]` — 5-bit index into Table E3.14
     /// (`SPX_ATTEN_TABLE`). Only meaningful when `spx_atten_active`.
     pub spx_atten_code: u8,
+    /// Inputs of the last [`run_bit_allocation`] on this channel and the exponents it read. When a
+    /// block repeats them (reused exponents and parameters), its outputs are already in place.
+    ba_key: Option<BitAllocKey>,
+    ba_exp: [u8; N_COEFFS],
+}
+
+/// Every value besides the exponents that [`run_bit_allocation`] reads.
+#[derive(Clone, Copy, PartialEq)]
+struct BitAllocKey {
+    start: usize,
+    end: usize,
+    codes: [u8; 11],
+    is_coupling: bool,
+    deltnseg: usize,
+    delt: [[u8; 8]; 3],
 }
 
 impl Default for ChannelState {
@@ -219,6 +234,8 @@ impl ChannelState {
             spx_sblend: [0.0; 18],
             spx_atten_active: false,
             spx_atten_code: 0,
+            ba_key: None,
+            ba_exp: [0; N_COEFFS],
         }
     }
 }
@@ -1287,6 +1304,42 @@ pub(crate) fn run_bit_allocation(
     if end <= start {
         return;
     }
+    let dba = if is_coupling {
+        MAX_FBW
+    } else {
+        ch.min(MAX_FBW)
+    };
+    let key = BitAllocKey {
+        start,
+        end,
+        codes: [
+            fscod,
+            fsnroffst,
+            fgaincod,
+            state.sdcycod,
+            state.fdcycod,
+            state.sgaincod,
+            state.dbpbcod,
+            state.floorcod,
+            state.snroffst_coarse,
+            state.cpl_fleak,
+            state.cpl_sleak,
+        ],
+        is_coupling,
+        deltnseg: state.deltnseg[dba],
+        delt: [state.deltoffst[dba], state.deltlen[dba], state.deltba[dba]],
+    };
+    // Same inputs as last time: psd, bndpsd, mask and bap already hold the result. Tracing reruns
+    // so its dump still appears.
+    let c = &mut state.channels[ch];
+    if c.ba_key == Some(key)
+        && c.ba_exp[start..end] == c.exp[start..end]
+        && crate::trace_var("AC3_TRACE_FRAME").is_err()
+    {
+        return;
+    }
+    c.ba_key = Some(key);
+    c.ba_exp[start..end].copy_from_slice(&c.exp[start..end]);
     // 1) Map exponents into PSD (§7.2.2.2).
     for bin in start..end {
         let e = state.channels[ch].exp[bin] as i32;
@@ -1661,46 +1714,76 @@ pub(crate) fn unpack_mantissas(state: &mut Ac3State, bsi: &Bsi, br: &mut BitRead
                 ch, end, dith
             );
         }
-        for bin in 0..end {
-            let bap = state.channels[ch].bap[bin];
-            let bit_pos_before = if trace_this { br.bit_position() } else { 0 };
-            let val = fetch_mantissa(
-                br,
-                bap,
-                &mut grp1,
-                &mut grp1_n,
-                &mut grp2,
-                &mut grp2_n,
-                &mut grp4,
-                &mut grp4_n,
-                false,
-            )?;
-            // Dither for bap=0 mantissas (§7.3.4): when dithflag is
-            // set, replace the zero-level mantissa with an LFSR-driven
-            // pseudo-random value scaled by 0.707 before the standard
-            // `>> exponent` coefficient reconstruction. This fills
-            // inaudible masked bands with near-noise instead of
-            // silence, preventing coloration of subsequent DSP stages
-            // (especially rematrix and the IMDCT post-chain).
-            let final_val = if bap == 0 && dith {
-                dither_lfsr(&mut state.dither_lfsr_state)
-            } else {
-                val
-            };
-            let e = state.channels[ch].exp[bin] as i32;
-            state.channels[ch].coeffs[bin] = final_val * pow2_neg(e);
-            if trace_this && bin < 32 {
-                eprintln!(
-                    "TRACE-MANT ch{} bin={:3} bap={:2} exp={:2} bit_pos_before={} mant={:.5} dither_used={} coeff={:.5e}",
-                    ch,
-                    bin,
+        if !trace_this {
+            // Borrow the channel's arrays once; indexing the whole state per coefficient kept the
+            // compiler from holding them in registers. Same arithmetic, same order.
+            let lfsr = &mut state.dither_lfsr_state;
+            let c = &mut state.channels[ch];
+            let bins = c.bap[..end]
+                .iter()
+                .zip(&c.exp[..end])
+                .zip(&mut c.coeffs[..end]);
+            for ((&bap, &e), coeff) in bins {
+                let val = fetch_mantissa(
+                    br,
                     bap,
-                    e,
-                    bit_pos_before,
-                    val,
-                    bap == 0 && dith,
-                    state.channels[ch].coeffs[bin]
-                );
+                    &mut grp1,
+                    &mut grp1_n,
+                    &mut grp2,
+                    &mut grp2_n,
+                    &mut grp4,
+                    &mut grp4_n,
+                    false,
+                )?;
+                let final_val = if bap == 0 && dith {
+                    dither_lfsr(lfsr)
+                } else {
+                    val
+                };
+                *coeff = final_val * pow2_neg(e as i32);
+            }
+        } else {
+            for bin in 0..end {
+                let bap = state.channels[ch].bap[bin];
+                let bit_pos_before = br.bit_position();
+                let val = fetch_mantissa(
+                    br,
+                    bap,
+                    &mut grp1,
+                    &mut grp1_n,
+                    &mut grp2,
+                    &mut grp2_n,
+                    &mut grp4,
+                    &mut grp4_n,
+                    false,
+                )?;
+                // Dither for bap=0 mantissas (§7.3.4): when dithflag is
+                // set, replace the zero-level mantissa with an LFSR-driven
+                // pseudo-random value scaled by 0.707 before the standard
+                // `>> exponent` coefficient reconstruction. This fills
+                // inaudible masked bands with near-noise instead of
+                // silence, preventing coloration of subsequent DSP stages
+                // (especially rematrix and the IMDCT post-chain).
+                let final_val = if bap == 0 && dith {
+                    dither_lfsr(&mut state.dither_lfsr_state)
+                } else {
+                    val
+                };
+                let e = state.channels[ch].exp[bin] as i32;
+                state.channels[ch].coeffs[bin] = final_val * pow2_neg(e);
+                if bin < 32 {
+                    eprintln!(
+                        "TRACE-MANT ch{} bin={:3} bap={:2} exp={:2} bit_pos_before={} mant={:.5} dither_used={} coeff={:.5e}",
+                        ch,
+                        bin,
+                        bap,
+                        e,
+                        bit_pos_before,
+                        val,
+                        bap == 0 && dith,
+                        state.channels[ch].coeffs[bin]
+                    );
+                }
             }
         }
         if state.cpl_in_use && state.channels[ch].in_coupling && !got_cplchan {

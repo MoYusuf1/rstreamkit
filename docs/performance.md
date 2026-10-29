@@ -1630,3 +1630,39 @@ The benchmark drivers record their hashes, input/PCM hashes and Wasm hashes;
 matching build.json files record effective compiler flags and exact source hashes.
 Audio and transform outputs match across the repeated campaigns. Keep the
 full report limitations with any extracted numbers.
+
+## Dolby parsing: reused bit allocation and a tighter mantissa loop (2026-10-29)
+
+Two exact changes to the AC-3 decoder's per-block parsing. Bit allocation now remembers the
+inputs of its last run per channel (exponents, bit-allocation codes, SNR offsets, delta
+segments) and skips the work when a block repeats them, which encoders do whenever they reuse
+exponents. The mantissa loop borrows the channel's arrays once instead of indexing the whole
+decoder state for every coefficient. Arithmetic and its order are unchanged.
+
+Inputs were generated with FFmpeg 9.0.2: 60 seconds of six distinct channels (tones and
+noise) as 448 kb/s AC-3 5.1, its 192 kb/s stereo downmix and 384 kb/s E-AC-3 5.1. The
+end-to-end movie is the same AC-3 looped to 10 minutes with 320×180 H.264 in Matroska.
+Ryzen 5 7500X3D, Linux, Rust 1.99.1, release build without LTO.
+
+| Measure (best of 15, in-process) | Before | After |
+| --- | ---: | ---: |
+| 60 s AC-3 5.1 to stereo | 169.8 ms | 131.4 ms (23% less) |
+| 60 s AC-3 5.1, six channels out | 175.8 ms | 146.0 ms (17% less) |
+| 60 s AC-3 stereo | 68.3 ms | 63.7 ms (7% less) |
+| 60 s E-AC-3 5.1 to stereo | 175.1 ms | 156.9 ms (10% less) |
+| `rstreamkit movie.mkv out.mp4`, 10 min 5.1, median of 7 | 2.428 s | 2.058 s (15% less) |
+
+Every decoded PCM byte hashes the same before and after (FNV-1a over all four outputs) and
+the command's MP4 output is byte-identical. The decoder's 559 tests and the workspace's 153
+pass. Not measured: Wasm timing and download size (wasm-bindgen was not installed), real
+broadcast audio, and FFmpeg on this machine. Fat LTO on the native build gave a further
+6–9% in a trial; it is not part of this change.
+
+Repeat (inputs from the FFmpeg commands in the commit, any AC-3 or E-AC-3 elementary
+stream works):
+
+```sh
+cd ac3
+cargo run --release --example decode_bench -- ac3_51.ac3 2 15
+cargo run --release --example decode_bench -- eac3_51.eac3 2 15
+```
