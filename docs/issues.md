@@ -46,6 +46,24 @@ closed after their provider/audio fixes landed.
 | #48 Footprint | Per-flavor budgets; zero-list video scan and one-buffer stereo conversion. Conversion requested bytes fall 12,288 → 6,144; full player remains under 245,000 Brotli bytes. | Retained-symbol and build-profile audits recorded. FLAC allocation requests fall 30,749 → 18,461 B per measured frame. Full default startup now counts 236,798 Brotli bytes (236,161 for opt-in SIMD); five fresh Chrome processes per build record readiness and initial Wasm memory. Same-feature 20% reduction remains unmet; broader playback memory/CPU comparisons remain. |
 | #59 Mono Dolby silence | Correct center-slot routing in LoRo/LtRt; positive/negative unit regression, 66.6 dB independent FFmpeg comparison and non-silent equal Chrome audio channels. Full download shrinks 163 Brotli bytes. | Landed in PR #60; issue closed. Edge/Safari remain separate acceptance. |
 
+## Host-app movie reports (2026-10-29)
+
+A host app's experimental player recorded two silent movie stalls on real provider files: a 1080p
+MKV with 1.8 s buffered at `readyState` 1 for 293 s, and a resumed MKV episode with nothing
+buffered. Neither provider file was available here, so each cause below was reproduced with a
+generated file in Chrome, fixed, and kept as a Chrome regression in
+`tools/node/movie-late-start-smoke.cjs`.
+
+| Cause | Fix | Evidence |
+| --- | --- | --- |
+| First media a little after zero (late clock) taken for a seek; the opening refetched forever | dd34500 | Before: 526 range requests in 15 s, never plays; after: plays, 5 requests |
+| Laced sound blocks (mkvmerge's default) dropped; empty combined buffer | f206821 | Before: `readyState` 1; after: 0-12 s buffered and playing |
+| Buffered media never decoded, or nothing playable at the start, reported nothing | 4b6c1ea, dd34500 | `Failed` with a reason after 8 s / once 25 s are buffered elsewhere |
+| A range ending inside the trailing Cues left the session unfinished and the loop spinning | 205f303 | Native regression test |
+| Matroska `FlagInterlaced` read backwards | b24539e | Unit test for 0, 1, 2 |
+
+Not confirmed against the original files; the host app pins 72f8cdd until it updates.
+
 ## Desktop browser matrix
 
 All results below refer to Linux Chromium 154 in the desktop test browser unless
