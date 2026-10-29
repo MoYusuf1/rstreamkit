@@ -2,6 +2,8 @@
 
 ## Unreleased (0.2.0)
 
+- Start movies whose first media begins up to 3 s after the start (a late Matroska clock) instead of refetching the opening forever; report `Failed` when nothing playable reaches the start.
+
 - Read Matroska `FlagInterlaced` as the spec defines it (1 interlaced, 2 progressive): progressive HEVC, VP9 and AV1 files made by FFmpeg were reported as interlaced.
 
 - Decode AC-3 5.1 about 23% faster with byte-identical output by reusing unchanged bit allocation and tightening mantissa unpacking.

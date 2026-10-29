@@ -1896,12 +1896,22 @@ mod movie {
     const PIECE_SECONDS: f64 = 5.0;
     /// The first piece is small so the picture starts quickly.
     const FIRST_CHUNK: u64 = 768 << 10;
+    /// The furthest the first buffered media may begin after the start and still be jumped to. A
+    /// movie whose clock, or whose sound, starts a little late leaves a gap the browser won't cross.
+    const START_GAP: f64 = 3.0;
 
     fn buffered_at(video: &HtmlVideoElement, t: f64) -> bool {
         let b = video.buffered();
         (0..b.length()).any(
             |i| matches!((b.start(i), b.end(i)), (Ok(s), Ok(e)) if s <= t + 0.05 && t < e - 0.05),
         )
+    }
+
+    /// The playhead is somewhere nothing is buffered, and not where the reading is up to: a seek.
+    /// Before playback starts, an unmoved playhead is only waiting at a gap, not a seek: restarting
+    /// there would fetch the same piece forever.
+    fn seeked(video: &HtmlVideoElement, t: f64, frontier: f64, started: bool, start: f64) -> bool {
+        !buffered_at(video, t) && (t - frontier).abs() > 1.0 && (started || t != start)
     }
 
     /// Frees what is buffered far behind the playhead, and far beyond where a seek left it.
@@ -1986,9 +1996,8 @@ mod movie {
                 return Ok(());
             }
             let t = video.current_time();
-            // The playhead is somewhere nothing is buffered, and not where the reading is up to: a
-            // seek. Start again from there.
-            if !buffered_at(video, t) && (t - frontier).abs() > 1.0 {
+            // A seek: start again from there.
+            if seeked(video, t, frontier, started, start) {
                 session = movie.session(t);
                 frontier = t;
                 ended = false;
@@ -2021,7 +2030,7 @@ mod movie {
             }
             // A seek during the download: what was fetched belongs to the old place.
             let t = video.current_time();
-            if !buffered_at(video, t) && (t - frontier).abs() > 1.0 {
+            if seeked(video, t, frontier, started, start) {
                 continue;
             }
             let mut fragment = session
@@ -2033,7 +2042,7 @@ mod movie {
             }
             // Yielding lets a seek arrive while sound is being decoded too.
             let t = video.current_time();
-            if !buffered_at(video, t) && (t - frontier).abs() > 1.0 {
+            if seeked(video, t, frontier, started, start) {
                 continue;
             }
             evict(video, &sb, &ms).await?;
@@ -2041,6 +2050,24 @@ mod movie {
                 append(video, &sb, &ms, &mut fragment).await?;
             }
             frontier = session.reached();
+            if !started {
+                let b = video.buffered();
+                let ranges =
+                    (0..b.length()).filter_map(|i| Some((b.start(i).ok()?, b.end(i).ok()?)));
+                if let Some(at) = crate::live::gap_target(ranges, video.current_time(), START_GAP) {
+                    video.set_current_time(at);
+                }
+            }
+            if !started
+                && !buffered_at(video, video.current_time())
+                && (frontier - start > MOVIE_AHEAD || session.done())
+            {
+                return Err(format!(
+                    "nothing playable at {start:.1} s: {:.1} s of the movie is buffered, none of it there",
+                    buffered_duration(video)
+                )
+                .into());
+            }
             if !started && buffered_at(video, video.current_time().max(start)) {
                 started = true;
                 let _ = video.play();

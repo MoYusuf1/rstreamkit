@@ -1,0 +1,48 @@
+// Movies whose first picture or sound begins after zero must still start, not refetch the start.
+const assert=require('node:assert/strict'),fs=require('node:fs'),path=require('node:path'),os=require('node:os');
+const {execFileSync}=require('node:child_process'),{chromium,expect}=require('@playwright/test');
+(async()=>{
+ const temporary=fs.mkdtempSync(path.join(os.tmpdir(),'rstreamkit-late-'));let browser;
+ try{
+  const make=(name,args)=>{const out=path.join(temporary,name);execFileSync('ffmpeg',['-v','error',
+   '-f','lavfi','-i','testsrc2=size=160x90:rate=30:duration=12','-f','lavfi','-i','sine=frequency=440:sample_rate=48000:duration=12',
+   ...args,'-c:v','libx264','-preset','ultrafast','-g','30','-c:a','ac3','-ac','6','-b:a','384k',out]);return out;};
+  const cases={
+   // The whole clock starts late, as in files cut from a broadcast.
+   clock:make('clock.mkv',['-output_ts_offset','0.3']),
+   // Too far to jump: the engine must say so instead of waiting.
+   far:make('far.mkv',['-output_ts_offset','8']),
+  };
+  browser=await chromium.launch({channel:'chrome'});const results=[];
+  for(const [name,file] of Object.entries(cases)){
+   const page=await browser.newPage(),errors=[];let requests=0;page.on('pageerror',e=>errors.push(e.message));
+   const data=fs.readFileSync(file);
+   await page.route('**/late-movie.mkv',route=>{
+    const match=route.request().headers().range?.match(/^bytes=(\d+)-(\d*)$/);
+    if(!match)return route.fulfill({body:data});
+    requests++;
+    const start=Number(match[1]),end=Math.min(match[2]?Number(match[2]):data.length-1,data.length-1);
+    return route.fulfill({status:206,headers:{'Content-Range':'bytes '+start+'-'+end+'/'+data.length,'Accept-Ranges':'bytes'},body:data.subarray(start,end+1)});
+   });
+   await page.goto(new URL('/player.html?build=full',process.env.RSTREAMKIT_URL||'http://127.0.0.1:8765').href);
+   await page.waitForFunction(()=>window.ready);
+   await page.evaluate(()=>{document.querySelector('#video').muted=true;});
+   await page.locator('#mode').selectOption('movie');
+   await page.locator('#url').fill('/late-movie.mkv');
+   const started=Date.now();
+   await page.locator('#play').click();
+   let ok=true;
+   try{await expect.poll(()=>page.locator('#video').evaluate(v=>v.currentTime),{timeout:15000}).toBeGreaterThan(3);}catch{ok=false;}
+   const report=await page.evaluate(()=>({sample:sample(),ready:document.querySelector('#video').readyState,
+    buffered:[...Array(document.querySelector('#video').buffered.length).keys()].map(i=>[document.querySelector('#video').buffered.start(i),document.querySelector('#video').buffered.end(i)])}));
+   results.push({name,plays:ok,ms:Date.now()-started,range_requests:requests,ready:report.ready,buffered:report.buffered,
+    statuses:report.sample.session.statuses.map(s=>s.status)});
+   await page.close();
+   assert.deepEqual(errors,[]);
+  }
+  const [clock,far]=results;
+  assert(clock.plays&&clock.statuses.includes('Playing')&&clock.range_requests<20,'late clock plays without refetching');
+  assert(!far.plays&&far.statuses.some(s=>/Failed/.test(s))&&far.range_requests<20,'unreachable start fails promptly');
+  console.log(JSON.stringify({checks:results.length,results},null,1));
+ }finally{await browser?.close();fs.rmSync(temporary,{recursive:true,force:true});}
+})().catch(e=>{console.error(e);process.exit(1);});
