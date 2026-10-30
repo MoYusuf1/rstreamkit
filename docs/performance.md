@@ -1755,3 +1755,23 @@ about a third of the segment, so appending while the segment downloads could bri
 frame to roughly 0.5 s here. It needs the transmuxer to emit fragments before a segment ends
 (today `Transmuxer::finish` turns a whole segment into one fragment), and a retry or a skipped
 corrupt segment after part of it was appended must not duplicate or tear media. Not done yet.
+
+## Dolby decoder at opt-level 3 in Wasm: not worth its size (2026-10-30)
+
+Whether the Wasm player's `s` setting for `rstreamkit-ac3` is why native decoder speedups showed
+only about 6% in Wasm. Node harness (`tools/harness`, its own `s` profile) built twice with only
+`profile.release.package.rstreamkit-ac3.opt-level` changed, wasm-bindgen `--target nodejs`, no
+wasm-opt (not installed here). `tools/node/opt-compare.cjs` run three times in each order;
+medians of the per-run medians. PCM checksums and FLAC byte counts matched in every run.
+
+| Fixture, transmux with sound | `s` | `3` |
+| --- | ---: | ---: |
+| h264_ac3.ts (mono) | 11.65 ms | 11.21 ms (3.8% less) |
+| h264_ac3_st.ts | 6.58 ms | 6.36 ms (3.4% less) |
+| h264_ac3_51.ts | 9.53 ms | 9.14 ms (4.0% less) |
+| h264_eac3_51.ts | 10.81 ms | 10.36 ms (4.1% less) |
+| Harness Wasm before wasm-opt | 812,965 B | 914,287 B (+101,322) |
+
+FLAC-only and MP2 rows moved under 1%. Kept `s`: 4% of a few milliseconds per segment does not
+buy about 100 KB before compression in a 245,000-byte Brotli budget. The Wasm/native gap is not
+the opt-level; Brotli sizes after wasm-opt were not measured.
