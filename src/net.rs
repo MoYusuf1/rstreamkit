@@ -13,6 +13,12 @@ pub trait Clock {
     async fn sleep(&self, duration: Duration);
 }
 
+impl<C: Clock> Clock for &C {
+    async fn sleep(&self, duration: Duration) {
+        (**self).sleep(duration).await;
+    }
+}
+
 /// A retry operation either failed with its original error or was cancelled between attempts.
 #[derive(Debug, PartialEq)]
 #[non_exhaustive]
@@ -232,6 +238,37 @@ pub async fn append_fragments(
         sink.append(&mut fragment.mdat).await?;
     }
     Ok(())
+}
+
+/// How long a request may wait for its response headers. Slow providers have been seen taking 13 s
+/// to answer a playlist, so this stays well above that; a server that never answers then becomes a
+/// temporary failure the retry loop reports as reconnecting, instead of a silent hang.
+pub const HEADERS_TIMEOUT: Duration = Duration::from_secs(20);
+
+/// A [`Fetch`] whose requests fail with [`FetchError::Temporary`] when no response arrives within
+/// [`HEADERS_TIMEOUT`]; the request future is dropped then, which cancels it. The body is not
+/// timed: a large download on a slow link may take as long as it takes. The browser player wraps
+/// the app's `Fetch` in this.
+pub struct Timed<C, F>(pub C, pub F);
+
+impl<C: Clock, F: Fetch> Fetch for Timed<C, F> {
+    async fn get(&self, url: &str, range: Option<Range<u64>>) -> Result<Response, FetchError> {
+        let mut request = std::pin::pin!(self.1.get(url, range));
+        let mut timer = std::pin::pin!(self.0.sleep(HEADERS_TIMEOUT));
+        std::future::poll_fn(|cx| {
+            // The request first, so an answer that is ready when the timer fires still wins.
+            if let std::task::Poll::Ready(r) = request.as_mut().poll(cx) {
+                return std::task::Poll::Ready(r);
+            }
+            timer.as_mut().poll(cx).map(|()| {
+                Err(FetchError::Temporary(format!(
+                    "no answer within {} s",
+                    HEADERS_TIMEOUT.as_secs()
+                )))
+            })
+        })
+        .await
+    }
 }
 
 /// Download TS incrementally, checking both advertised size and the actual body.

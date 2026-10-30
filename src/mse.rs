@@ -229,6 +229,7 @@ pub fn start(
     let wake = Rc::new(RefCell::new(None));
     let waking = wake.clone();
     let mut report = report;
+    let http = crate::net::Timed(BrowserClock, http);
     wasm_bindgen_futures::spawn_local(async move {
         match cancellable(
             &stopped,
@@ -1873,6 +1874,7 @@ mod movie {
         let wake = Rc::new(RefCell::new(None));
         let waking = wake.clone();
         let mut report = report;
+        let http = crate::net::Timed(BrowserClock, http);
         wasm_bindgen_futures::spawn_local(async move {
             if let Some(Err(e)) = cancellable(
                 &stopped,

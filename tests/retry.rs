@@ -1,5 +1,7 @@
 //! Test the browser's retry orchestration with fake time and real transport parsing.
-use rstreamkit::net::{Clock, Fetch, FetchError, Response, RetryError, download_segment, retry};
+use rstreamkit::net::{
+    Clock, Fetch, FetchError, HEADERS_TIMEOUT, Response, RetryError, Timed, download_segment, retry,
+};
 use std::{
     cell::{Cell, RefCell},
     future::{Future, pending, ready},
@@ -275,4 +277,44 @@ fn dropping_retry_releases_pending_request() {
     );
     drop(task);
     assert!(dropped.get());
+}
+
+/// A provider that accepts the request and never answers.
+struct Silent;
+impl Fetch for Silent {
+    async fn get(&self, _: &str, _: Option<Range<u64>>) -> Result<Response, FetchError> {
+        pending().await
+    }
+}
+
+#[test]
+fn a_server_that_never_answers_times_out_and_is_retried() {
+    let clock = FakeClock::default();
+    let silent = Timed(&clock, Silent);
+    let reports = RefCell::new(Vec::new());
+    let result = run(retry(
+        &clock,
+        || false,
+        || silent.get("https://test/live.m3u8", None),
+        temporary,
+        |attempt| reports.borrow_mut().push(attempt),
+    ));
+    assert!(
+        matches!(result, Err(RetryError::Failed(FetchError::Temporary(ref why))) if why.contains("no answer"))
+    );
+    assert_eq!(
+        *reports.borrow(),
+        [1, 2, 3, 4, 5, 6],
+        "reported as reconnecting"
+    );
+    // Seven timeouts plus the 31 s of backoff between them.
+    assert_eq!(clock.now.get(), 7 * HEADERS_TIMEOUT.as_secs() + 31);
+}
+
+#[test]
+fn an_answer_ready_when_the_timer_fires_still_wins() {
+    let clock = FakeClock::default();
+    let host = provider(&clock);
+    let response = run(Timed(&clock, host).get("https://test/segment.ts", None)).unwrap();
+    assert_eq!(response.status, 200);
 }
