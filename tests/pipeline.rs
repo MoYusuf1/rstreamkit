@@ -439,3 +439,38 @@ fn consecutive_segments_across_the_33_bit_clock_wrap_stay_continuous() {
         previous = Some(at);
     }
 }
+
+/// The same across the wrap when the stream arrives in pieces (raw TS, a live channel's first
+/// segment): every fragment keeps both tracks, and neither goes backwards.
+#[test]
+fn a_stream_in_pieces_across_the_33_bit_clock_wrap_keeps_both_tracks_moving() {
+    let d = ts::demux(SEGMENT).unwrap();
+    let first = d.video[0].dts as i64;
+    let span = (d.video.last().unwrap().dts - d.video[0].dts) as i64 + 3003;
+    let start = WRAP - 2 * span - span / 3;
+    let stream: Vec<u8> = (0..5)
+        .flat_map(|k| shifted(SEGMENT, start + k * span - first))
+        .collect();
+    let mut c = rstreamkit::Continuous::default();
+    let mut outputs = vec![];
+    for piece in stream.chunks(64 << 10) {
+        outputs.extend(c.feed(piece).unwrap());
+    }
+    outputs.push(c.finish().unwrap());
+    let mut previous: Option<Vec<u64>> = None;
+    for (n, out) in outputs.iter().enumerate() {
+        let fragment = out.fragment();
+        if fragment.is_empty() {
+            continue;
+        }
+        let at = tfdts(&fragment);
+        assert_eq!(at.len(), 2, "fragment {n}: video and audio");
+        if let Some(before) = &previous {
+            assert!(
+                at[0] > before[0] && at[1] > before[1],
+                "fragment {n}: {at:?} after {before:?}"
+            );
+        }
+        previous = Some(at);
+    }
+}

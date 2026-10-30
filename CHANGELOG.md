@@ -2,6 +2,7 @@
 
 ## Unreleased (0.2.0)
 
+- Keep sound in a stream that arrives in pieces (raw TS, a live channel's first segment) when the clock wraps part way through a group of pictures; it was held back and that fragment went out with no sound.
 - Keep pictures and sound in order in a segment that straddles the 33-bit clock wrap (every 26.5 hours of a broadcast clock). They were sorted by raw timestamp, so the part after the wrap came first and the next segment was re-based about 124 ms early.
 
 - Show a live channel's first picture about twice as soon: the browser player appends the first segment's first keyframe group while the rest of it downloads, instead of waiting for the whole segment. With 6 s 1080p segments at 40 Mb/s, the first frame falls from 1.20 to 0.58 s. Add `Transmuxer::take`, which gives a still-arriving `Segment`'s complete keyframe groups. `Continuous` no longer reports AC-3 or MP2 as skipped when AAC plays beside it, or refuses H.264 with another video track beside it, matching whole segments.

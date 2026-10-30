@@ -568,7 +568,7 @@ impl Demuxer {
             return Ok(None);
         };
         let cutoff = self.out.video[cut].pts;
-        let clock_reset = self.out.video[cut].dts < self.out.video[cut - 1].dts;
+        let clock_reset = earlier(self.out.video[cut].dts, self.out.video[cut - 1].dts);
         let bytes: usize = self.out.video[..cut].iter().map(|v| v.len as usize).sum();
         // The next fragment's buffer starts at this one's size, so it doesn't grow (and copy, and
         // fault in fresh pages) all over again for every group of pictures.
@@ -678,6 +678,13 @@ fn since(t: u64, first: u64) -> u64 {
     t.wrapping_add(WRAP / 4).wrapping_sub(first) & (WRAP - 1)
 }
 
+/// Whether timestamp `a` comes before `b` on a 33-bit clock that wraps: the nearer way round wins.
+fn earlier(a: u64, b: u64) -> bool {
+    const WRAP: u64 = 1 << 33;
+    let ahead = b.wrapping_sub(a) & (WRAP - 1);
+    ahead != 0 && ahead < WRAP / 2
+}
+
 // Compare audio within its current clock epoch. A new encoder's small PTS
 // must not leap ahead of older queued samples just because its clock restarted.
 fn split_clock<T>(
@@ -688,11 +695,11 @@ fn split_clock<T>(
 ) -> (Vec<T>, Vec<T>) {
     let epoch_end = samples
         .windows(2)
-        .position(|w| pts(&w[1]) < pts(&w[0]))
+        .position(|w| earlier(pts(&w[1]), pts(&w[0])))
         .map_or(samples.len(), |at| at + 1);
     let (mut before, mut after) = (Vec::new(), Vec::new());
     for (at, sample) in samples.into_iter().enumerate() {
-        if at < epoch_end && (reset || pts(&sample) < cutoff) {
+        if at < epoch_end && (reset || earlier(pts(&sample), cutoff)) {
             before.push(sample);
         } else {
             after.push(sample);
