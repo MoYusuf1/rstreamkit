@@ -27,8 +27,9 @@ and without installing FFmpeg.
 - If a piece of the stream is missing or broken, it skips it instead of stopping.
 - If every piece fails (a dead channel, a broken key), it stops within seconds and says why,
   instead of buffering forever.
-- If the server takes the request and never answers, it gives up after 20 seconds and tries again,
-  instead of freezing forever. Slow servers that do answer still work.
+- If the server takes the request and never answers, or starts sending and then goes quiet, it
+  gives up after 20 seconds and tries again, instead of freezing forever. Slow servers that do
+  answer still work.
 - Pause for a long time, press play, and it catches back up to live.
 - Switch channels quickly and often without old channels leaking in.
 - Picks a lower quality when the connection is slow and goes back up when it recovers.

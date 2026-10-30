@@ -154,7 +154,7 @@ fn playlist(path: &Path, out: &mut Out) -> Result {
     // fMP4 (CMAF) segments are already fragments: only their clocks are made continuous.
     let mut cmaf = rstreamkit::cmaf::Rebaser::default();
     let mut map_read = None;
-    for s in &media.segments {
+    for (i, s) in media.segments.iter().enumerate() {
         // shortcut: no AES here; decrypting natively needs an AES implementation the crate doesn't
         // carry (the browser uses WebCrypto). Add one if encrypted recordings matter.
         if s.key.is_some() {
@@ -167,6 +167,9 @@ fn playlist(path: &Path, out: &mut Out) -> Result {
                 Some(r) => read_at(&mut File::open(&path)?, r.start, r.end - r.start)?,
             })
         };
+        if i > 0 && map_read.is_some() != s.map.is_some() {
+            return Err(format!("{}: a playlist mixing TS and fMP4 segments", s.uri).into());
+        }
         let mut bytes = read(&s.uri, &s.byte_range)?;
         if let Some(map) = &s.map {
             if map_read.as_ref() != Some(map) {

@@ -123,6 +123,22 @@ fn every_kind_of_input_comes_out_with_the_same_pictures() {
     convert(&cmaf.join("index.m3u8"), &out);
     assert_eq!(pictures(&out), pictures(&fixture("movie_aac.mp4")));
     decodes_cleanly(&out);
+    // TS and fMP4 segments in one playlist can't share one init: refused, not written.
+    let mixed = cmaf.join("mixed.m3u8");
+    let index = std::fs::read_to_string(cmaf.join("index.m3u8")).unwrap();
+    std::fs::write(
+        &mixed,
+        // A map applies to every segment after it, so the TS segment has to come first.
+        index.replace("#EXT-X-MAP", &format!("#EXTINF:4,\n{ts_uri}\n#EXT-X-MAP")),
+    )
+    .unwrap();
+    let refused = Command::new(BIN)
+        .arg(&mixed)
+        .arg(dir.join("mixed.mp4"))
+        .output()
+        .unwrap();
+    assert!(!refused.status.success());
+    assert!(String::from_utf8_lossy(&refused.stderr).contains("mixing TS and fMP4"));
 
     // Piped through, standard input to standard output: the same bytes as file to file.
     let mut child = Command::new(BIN)

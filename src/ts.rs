@@ -748,6 +748,23 @@ pub fn demux(data: &[u8]) -> Result<Demuxed, Error> {
 #[cfg(test)]
 mod tests {
     #[test]
+    fn earlier_takes_the_nearer_way_round_the_33_bit_clock() {
+        use super::{earlier, since};
+        const WRAP: u64 = 1 << 33;
+        assert!(earlier(1, 2) && !earlier(2, 1) && !earlier(5, 5));
+        // Across the wrap: just before it comes before just after it.
+        assert!(earlier(WRAP - 1, 0) && !earlier(0, WRAP - 1));
+        // Half the clock apart is neither way; just under half is.
+        assert!(!earlier(0, WRAP / 2) && !earlier(WRAP / 2, 0));
+        assert!(earlier(0, WRAP / 2 - 1) && earlier(WRAP / 2 + 1, 0));
+        // Sort keys keep the order across the wrap, and a little before the first sample.
+        let first = WRAP - 100;
+        assert!(since(first - 50, first) < since(first, first));
+        assert!(since(first, first) < since(WRAP - 1, first));
+        assert!(since(WRAP - 1, first) < since(10, first));
+    }
+
+    #[test]
     fn completed_audio_pes_is_available_without_another_packet_start() {
         let clip = include_bytes!("../tests/fixtures/h264_ac3_51.ts");
         let expected = super::demux(clip).unwrap().sound.len();
