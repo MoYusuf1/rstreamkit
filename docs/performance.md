@@ -1754,7 +1754,7 @@ about 5 ms, and the next segment is only requested after that. The first 2 s key
 about a third of the segment, so appending while the segment downloads could bring the first
 frame to roughly 0.5 s here. It needs the transmuxer to emit fragments before a segment ends
 (today `Transmuxer::finish` turns a whole segment into one fragment), and a retry or a skipped
-corrupt segment after part of it was appended must not duplicate or tear media. Not done yet.
+corrupt segment after part of it was appended must not duplicate or tear media. Done below.
 
 ## Dolby decoder at opt-level 3 in Wasm: not worth its size (2026-10-30)
 
@@ -1775,3 +1775,28 @@ medians of the per-run medians. PCM checksums and FLAC byte counts matched in ev
 FLAC-only and MP2 rows moved under 1%. Kept `s`: 4% of a few milliseconds per segment does not
 buy about 100 KB before compression in a 245,000-byte Brotli budget. The Wasm/native gap is not
 the opt-level; Brotli sizes after wasm-opt were not measured.
+
+## Live HLS plays its first keyframe group while the first segment downloads (2026-10-30)
+
+The first segment of a live TS playlist (no separate audio rendition, key, map or byte range) is
+fed to the transmuxer as it arrives; once the keyframe after the first group is in,
+`Transmuxer::take` turns that group into an init and fragment, which are appended and played
+while the rest downloads. The rest comes out of `finish` as before, and every later segment takes
+the unchanged path, so its output is identical. A download that fails before anything was
+appended is fetched again with the usual retries; one that fails after is not retried (that would
+append the group twice) but skipped like an unavailable segment, the next glued on where the group
+ended.
+
+Same setup as above (1920×1080/25 H.264 at 6 Mb/s + AAC, 6 s TS segments of about 4.4 MB with 2 s
+keyframe groups, live playlist, CDP 40 Mb/s and 100 ms latency, cache off, a fresh context per
+run), Chrome 156, full player builds of 19dbdba (before) and this change (after), eight
+interleaved pairs:
+
+| Build | First decoded frame from start() | `Playing` |
+| --- | ---: | ---: |
+| Before | 1,194-1,229 ms, median 1,199 | 1,175-1,190 ms |
+| After | 574-591 ms, median 581 | 557-562 ms |
+
+About 0.62 s sooner: the first frame now waits for the playlist and a third of the segment. No run
+waited for data in the 3 s after the first frame. The unoptimized full Wasm grows 4,154 bytes
+(1,197 Brotli bytes before wasm-opt, which is not installed here).

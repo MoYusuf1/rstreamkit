@@ -126,7 +126,7 @@ capacity exceeds four times the new URI length (with a 256-byte minimum).
 
 ### Cooperative browser audio
 
-On Wasm, Transmuxer::finish_yielded, Continuous::feed_yielded and
+On Wasm, Transmuxer::finish_yielded, Transmuxer::take_yielded, Continuous::feed_yielded and
 Continuous::finish_yielded keep the synchronous output bytes while yielding
 during sound decoding. The browser checks elapsed work every eight audio frames
 and yields after roughly eight milliseconds; one frame can exceed the budget.

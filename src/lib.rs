@@ -256,6 +256,27 @@ impl Transmuxer {
         self.assemble(d)
     }
 
+    /// The next whole keyframe group of a segment still arriving, once the keyframe after it is in,
+    /// to append before the rest is downloaded. [`finish`](Self::finish) then gives what is left.
+    pub fn take(&mut self, segment: &mut Segment) -> Result<Option<Output>, Error> {
+        match segment.demuxer.take_fragment()? {
+            Some(d) => self.assemble(d).map(Some),
+            None => Ok(None),
+        }
+    }
+
+    /// Like [`take`](Self::take), yielding between small batches of decoded audio frames.
+    #[cfg(target_arch = "wasm32")]
+    pub async fn take_yielded(&mut self, segment: &mut Segment) -> Result<Option<Output>, Error> {
+        match segment.demuxer.take_fragment()? {
+            Some(d) => self
+                .assemble_yielded(d, &mut YieldSlice::new())
+                .await
+                .map(Some),
+            None => Ok(None),
+        }
+    }
+
     /// Browser-friendly decoding: yield between small batches of audio frames.
     #[cfg(target_arch = "wasm32")]
     pub async fn finish_yielded(&mut self, segment: Segment) -> Result<Output, Error> {
@@ -1057,6 +1078,35 @@ mod tests {
             assert_eq!((size, &p.mdat[4..8]), (p.mdat.len(), &b"mdat"[..]));
         }
         assert_eq!(pieces.init.unwrap().bytes, whole.init.unwrap().bytes);
+    }
+
+    /// Keyframe groups taken while a segment arrives, then the rest, hold exactly the media of the
+    /// segment pushed whole, in order, and the first group comes out before the download ends.
+    #[test]
+    fn groups_taken_while_a_segment_arrives_add_up_to_the_whole() {
+        let clip: &[u8] = include_bytes!("../tests/fixtures/h264_ac3.ts");
+        let whole = Transmuxer::default().push(clip).unwrap();
+        let mut t = Transmuxer::default();
+        let mut segment = t.segment(clip.len());
+        let (mut parts, mut first_at) = (vec![], None);
+        for (i, c) in clip.chunks(1316).enumerate() {
+            segment.feed(c);
+            while let Some(out) = t.take(&mut segment).unwrap() {
+                first_at.get_or_insert(i);
+                parts.push(out);
+            }
+        }
+        parts.push(t.finish(segment).unwrap());
+        assert!(first_at.unwrap() < clip.len() / 1316 / 2, "{first_at:?}");
+        assert_eq!(
+            parts[0].init.as_ref().unwrap().bytes,
+            whole.init.as_ref().unwrap().bytes
+        );
+        let payload = |o: &Output| o.fragments.iter().map(|f| f.mdat.len() - 8).sum::<usize>();
+        assert_eq!(parts.iter().map(payload).sum::<usize>(), payload(&whole));
+        let video: Vec<u64> = parts.iter().map(|o| base_times(&o.fragment())[0]).collect();
+        assert_eq!(video[0], 0);
+        assert!(video.windows(2).all(|w| w[0] < w[1]), "{video:?}");
     }
 
     /// A download that fails part way is dropped, and the transmuxer has not noticed: the next

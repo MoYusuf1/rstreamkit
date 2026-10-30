@@ -743,6 +743,99 @@ async fn download_segment(
         .map_err(Fail::from)
 }
 
+/// A live stream's first segment, its first keyframe group appended (and playing) while the rest
+/// downloads, so the first picture waits for that group, not the whole segment. `None` when it
+/// failed before anything was appended: the caller downloads it again the usual way. After that, a
+/// failed download is not tried again, which would append those pictures twice: it is an error, and
+/// the segment is skipped like any unavailable one, the next glued on where this one stopped.
+#[allow(clippy::too_many_arguments)]
+async fn stream_first(
+    http: &impl Fetch,
+    url: &str,
+    stop: &Cell<bool>,
+    tx: &RefCell<Transmuxer>,
+    video: &HtmlVideoElement,
+    ms: &MediaSource,
+    sb: &mut Option<SourceBuffer>,
+    partial: bool,
+    early: &mut usize,
+    report: &mut dyn FnMut(Status),
+) -> Result<Option<Result<crate::Output, Failure>>, Failure> {
+    let Ok(r) = http.get(url, None).await else {
+        return Ok(None);
+    };
+    if !(200..300).contains(&r.status) || r.content_length.is_some_and(|n| n > SEGMENT_LIMIT as u64)
+    {
+        return Ok(None);
+    }
+    let mut segment = tx
+        .borrow()
+        .segment(r.content_length.map_or(0, |n| n as usize));
+    let mut body = r.body;
+    let mut total = 0;
+    while let Some(chunk) = std::future::poll_fn(|cx| body.as_mut().poll_next(cx)).await {
+        let chunk = match chunk {
+            Ok(chunk) if chunk.len() <= SEGMENT_LIMIT - total => chunk,
+            _ if sb.is_none() => return Ok(None),
+            Ok(_) => return Ok(Some(Err(too_big(&host_of(url), SEGMENT_LIMIT).into()))),
+            Err(why) => return Ok(Some(Err(format!("download failed part way: {why}").into()))),
+        };
+        total += chunk.len();
+        segment.feed(&chunk);
+        if sb.is_some() {
+            continue;
+        }
+        let mut transmuxer = std::mem::take(&mut *tx.borrow_mut());
+        let taken = transmuxer.take_yielded(&mut segment).await;
+        *tx.borrow_mut() = transmuxer;
+        let mut out = match taken {
+            Ok(Some(out)) => out,
+            Ok(None) => continue,
+            Err(e) => return Ok(Some(Err(e.into()))),
+        };
+        if stop.get() {
+            return Ok(None);
+        }
+        if let Some(codec) = out.skipped_audio
+            && !partial
+        {
+            return Err(Unsupported::Sound(codec).into());
+        }
+        if let Some(mut init) = out.init {
+            if init.interlaced && !partial {
+                return Err(Unsupported::Interlaced.into());
+            }
+            let buffer = ms
+                .add_source_buffer(&init.mime)
+                .map_err(|e| Unsupported::MediaType {
+                    mime: init.mime.clone(),
+                    why: js_err(e),
+                })?;
+            append(video, &buffer, ms, &mut init.bytes).await?;
+            *sb = Some(buffer);
+        }
+        let buffer = sb.as_ref().ok_or("no media buffer")?;
+        *early = out
+            .fragments
+            .iter()
+            .map(|f| f.moof.len() + f.mdat.len())
+            .sum();
+        crate::net::append_fragments(
+            &mut out.fragments,
+            &mut BrowserSink {
+                video,
+                buffer,
+                ms,
+                prefetch: &mut None,
+            },
+        )
+        .await?;
+        begin(video, buffer);
+        report(Status::Playing);
+    }
+    Ok(Some(finish_segment(tx, segment).await))
+}
+
 // One speculative download, polled alongside browser appends. No decoded state is changed
 // until the caller consumes it, and dropping it cancels the reader/request.
 type DownloadFuture<'a> = Pin<Box<dyn Future<Output = Result<Segment, Fail>> + 'a>>;
@@ -834,6 +927,16 @@ fn play(video: &HtmlVideoElement) {
 }
 
 /// Seconds of media buffered ahead of the playhead (0 if none).
+/// Starts playback at the first buffered media.
+fn begin(video: &HtmlVideoElement, buffer: &SourceBuffer) {
+    if let Some(start) = buffer.buffered().ok().and_then(|b| b.start(0).ok())
+        && video.current_time() < start
+    {
+        video.set_current_time(start);
+    }
+    play(video);
+}
+
 fn buffered_ahead(video: &HtmlVideoElement) -> f64 {
     let b = video.buffered();
     match b.length().checked_sub(1).and_then(|last| b.end(last).ok()) {
@@ -1165,6 +1268,8 @@ async fn run(
                 tx.borrow_mut().discontinuity();
             }
             let mut download_seconds = None;
+            // Bytes of this segment already appended while it downloaded.
+            let mut early = 0;
             let speculative = prefetch.as_ref().is_some_and(|p| p.uri == seg.uri);
             let fetched = if prefetch.as_ref().is_some_and(|p| p.uri == seg.uri) {
                 let mut pending = prefetch.take().unwrap();
@@ -1198,18 +1303,39 @@ async fn run(
                 }
             } else {
                 prefetch = None;
-                fetch_segment(
-                    http,
-                    &url,
-                    SEGMENT_LIMIT,
-                    stop,
-                    &tx,
-                    seg,
-                    &latest.url,
-                    &format,
-                    &mut say,
-                )
-                .await
+                // Only before anything plays; a separate audio rendition needs its own init first.
+                let streamed = if sb.is_none()
+                    && audio_url.is_none()
+                    && !media.ended
+                    && seg.key.is_none()
+                    && seg.map.is_none()
+                    && seg.byte_range.is_none()
+                {
+                    stream_first(
+                        http, &url, stop, &tx, video, &ms, &mut sb, partial, &mut early, &mut say,
+                    )
+                    .await?
+                } else {
+                    None
+                };
+                started |= sb.is_some();
+                match streamed {
+                    Some(result) => result,
+                    None => {
+                        fetch_segment(
+                            http,
+                            &url,
+                            SEGMENT_LIMIT,
+                            stop,
+                            &tx,
+                            seg,
+                            &latest.url,
+                            &format,
+                            &mut say,
+                        )
+                        .await
+                    }
+                }
             };
             let mut out = match fetched {
                 Ok(out) => out,
@@ -1236,11 +1362,12 @@ async fn run(
             if stop.get() {
                 return Ok(());
             }
-            let appended: usize = out
-                .fragments
-                .iter()
-                .map(|f| f.moof.len() + f.mdat.len())
-                .sum();
+            let appended: usize = early
+                + out
+                    .fragments
+                    .iter()
+                    .map(|f| f.moof.len() + f.mdat.len())
+                    .sum::<usize>();
             let seconds = if seg.duration > 0.0 {
                 seg.duration
             } else {
@@ -1308,11 +1435,12 @@ async fn run(
             }
             // Include merged rendition audio, including any decoded FLAC, in the memory
             // estimate. React immediately to a bitrate spike, then decay gradually.
-            let appended: usize = out
-                .fragments
-                .iter()
-                .map(|f| f.moof.len() + f.mdat.len())
-                .sum();
+            let appended: usize = early
+                + out
+                    .fragments
+                    .iter()
+                    .map(|f| f.moof.len() + f.mdat.len())
+                    .sum::<usize>();
             bytes_per_second = crate::live::buffer_rate(bytes_per_second, appended, seconds);
             if !video.paused()
                 && prefetch.is_none()
@@ -1430,12 +1558,7 @@ async fn run(
             }
             if !started {
                 started = true;
-                if let Some(start) = buffer.buffered().ok().and_then(|b| b.start(0).ok())
-                    && video.current_time() < start
-                {
-                    video.set_current_time(start);
-                }
-                play(video);
+                begin(video, buffer);
                 say(Status::Playing);
             }
             if buffered_ahead(video) >= 0.5 {

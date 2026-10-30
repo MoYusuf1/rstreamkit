@@ -548,7 +548,9 @@ impl Demuxer {
         if self.invalid_sync {
             return Err(Error::NoSync);
         }
-        if let Some(codec) = &self.foreign_video {
+        if self.video_pid.is_none()
+            && let Some(codec) = &self.foreign_video
+        {
             return Err(Error::NoVideo(Some(codec.clone())));
         }
         if self.scrambled {
@@ -604,8 +606,10 @@ impl Demuxer {
             skipped_audio: self.undecodable_audio.clone(),
         };
         if self.audio_pid.is_some() {
+            // As in `finish`: AAC plays, so other sound alongside it is not missing.
             out.sound.clear();
             out.sound_kind = None;
+            out.skipped_audio = None;
         }
         sort_video(&mut out, self.video_base);
         Ok(Some(out))
