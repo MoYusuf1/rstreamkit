@@ -93,6 +93,37 @@ fn every_kind_of_input_comes_out_with_the_same_pictures() {
     assert_eq!(pictures(&out), [once.clone(), once].concat());
     decodes_cleanly(&out);
 
+    // An fMP4 (CMAF) playlist, as FFmpeg writes one: an init map and .m4s fragments.
+    let cmaf = dir.join("cmaf");
+    std::fs::create_dir_all(&cmaf).unwrap();
+    let made = Command::new("ffmpeg")
+        .args(["-v", "error", "-y", "-i"])
+        .arg(fixture("movie_aac.mp4"))
+        .args([
+            "-c",
+            "copy",
+            "-f",
+            "hls",
+            "-hls_time",
+            "2",
+            "-hls_playlist_type",
+            "vod",
+        ])
+        .args([
+            "-hls_segment_type",
+            "fmp4",
+            "-hls_fmp4_init_filename",
+            "init.mp4",
+        ])
+        .arg(cmaf.join("index.m3u8"))
+        .status()
+        .unwrap();
+    assert!(made.success());
+    let out = dir.join("cmaf.mp4");
+    convert(&cmaf.join("index.m3u8"), &out);
+    assert_eq!(pictures(&out), pictures(&fixture("movie_aac.mp4")));
+    decodes_cleanly(&out);
+
     // Piped through, standard input to standard output: the same bytes as file to file.
     let mut child = Command::new(BIN)
         .args(["-", "-"])

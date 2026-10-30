@@ -1,6 +1,6 @@
 //! `rstreamkit INPUT OUTPUT`: repackage a stream or a movie file as fragmented MP4, natively.
 //!
-//! INPUT is MPEG-TS (one segment or a whole recording), an HLS playlist of local TS segments, an MP4
+//! INPUT is MPEG-TS (one segment or a whole recording), an HLS playlist of local TS or fMP4 segments, an MP4
 //! or a Matroska file, or `-` for MPEG-TS on standard input. OUTPUT is a file, or `-` for standard
 //! output. Pictures are copied as they are; sound a browser can't play (AC-3, E-AC-3, MP2) becomes
 //! FLAC. Nothing here launches or links FFmpeg.
@@ -28,7 +28,7 @@ use rstreamkit::{Continuous, Output, Transmuxer, hls, mkv, mp4, vod::Movie};
 type Result<T = ()> = std::result::Result<T, Box<dyn Error>>;
 
 const USAGE: &str = "usage: rstreamkit INPUT OUTPUT
-  INPUT   MPEG-TS, an HLS playlist of local TS segments, MP4 or Matroska; - reads MPEG-TS from stdin
+  INPUT   MPEG-TS, an HLS playlist of local TS or fMP4 segments, MP4 or Matroska; - reads MPEG-TS from stdin
   OUTPUT  fragmented MP4; - writes it to stdout";
 
 /// How much is read at a time. Measured: 1 MiB moves a 2 GB movie through in a fifth of the time
@@ -151,19 +151,34 @@ fn playlist(path: &Path, out: &mut Out) -> Result {
         _ => return Err("an HLS playlist of a kind this tool doesn't read".into()),
     };
     let mut t = Transmuxer::default();
+    // fMP4 (CMAF) segments are already fragments: only their clocks are made continuous.
+    let mut cmaf = rstreamkit::cmaf::Rebaser::default();
+    let mut map_read = None;
     for s in &media.segments {
-        if s.key.is_some() || s.map.is_some() {
-            return Err(format!(
-                "{}: encrypted and fMP4 segments aren't read here yet",
-                s.uri
-            )
-            .into());
+        // shortcut: no AES here; decrypting natively needs an AES implementation the crate doesn't
+        // carry (the browser uses WebCrypto). Add one if encrypted recordings matter.
+        if s.key.is_some() {
+            return Err(format!("{}: encrypted segments aren't read here yet", s.uri).into());
         }
-        let path = local(dir, &s.uri)?;
-        let bytes = match &s.byte_range {
-            None => std::fs::read(&path)?,
-            Some(r) => read_at(&mut File::open(&path)?, r.start, r.end - r.start)?,
+        let read = |uri: &str, range: &Option<std::ops::Range<u64>>| -> Result<Vec<u8>> {
+            let path = local(dir, uri)?;
+            Ok(match range {
+                None => std::fs::read(&path)?,
+                Some(r) => read_at(&mut File::open(&path)?, r.start, r.end - r.start)?,
+            })
         };
+        let mut bytes = read(&s.uri, &s.byte_range)?;
+        if let Some(map) = &s.map {
+            if map_read.as_ref() != Some(map) {
+                let init = read(&map.uri, &map.byte_range)?;
+                cmaf.init(&init)?;
+                out.init(init)?;
+                map_read = Some(map.clone());
+            }
+            cmaf.fragment(&mut bytes, s.duration)?;
+            out.send(bytes)?;
+            continue;
+        }
         if s.discontinuity {
             t.discontinuity();
         }

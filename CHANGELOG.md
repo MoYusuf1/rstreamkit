@@ -2,6 +2,8 @@
 
 ## Unreleased (0.2.0)
 
+- The command-line tool reads HLS playlists of fMP4 (CMAF) segments as well as TS: the init map is written once and each fragment's clock is made continuous. Encrypted playlists are still refused, with a reason.
+
 - The browser player gives up on a request that gets no response within 20 s (`net::HEADERS_TIMEOUT`) and retries it like any other temporary failure, reporting `Reconnecting`, instead of waiting forever on a server that accepted the connection and never answered. Slow providers that answer in 8-13 s still work. Add `net::Timed`, which wraps any `Fetch` with this limit for native hosts too.
 
 - A movie that never starts or never decodes a picture now fails with its tracks and what the browser was given, for example `(MKV, H.264 1920x1080, AC-3 6 ch 48000 Hz, 5400.0 s; given as video/mp4; codecs="avc1.640028,flac")`, so a stall report doesn't need a probe of the file. Add `Movie::summary`.
