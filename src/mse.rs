@@ -459,8 +459,12 @@ impl Stream for Chunks {
 
 impl Drop for Chunks {
     fn drop(&mut self) {
+        // Cancelling a body that already failed rejects; await it so that is not an uncaught error.
         if let Some(reader) = &self.reader {
-            let _ = reader.cancel();
+            let cancelled = JsFuture::from(reader.cancel());
+            wasm_bindgen_futures::spawn_local(async move {
+                let _ = cancelled.await;
+            });
         }
     }
 }
@@ -588,10 +592,14 @@ const SKIP_LIMIT: u32 = 5;
 
 async fn decrypt(bytes: &[u8], key: &[u8], iv: &[u8; 16]) -> Result<Vec<u8>, Fail> {
     if key.len() != 16 {
-        // A key server that is down often answers with a short text page: say what it said.
+        // A key server that is down often answers with a short text page: say what it said, as
+        // plain words only, since a host may show statuses in its page.
         let text = std::str::from_utf8(key)
             .ok()
-            .filter(|t| t.chars().all(|c| c.is_ascii_graphic() || c == ' '))
+            .filter(|t| {
+                t.chars()
+                    .all(|c| c.is_ascii_alphanumeric() || " .,:;!?-'()/_".contains(c))
+            })
             .map(|t| format!(": \"{}\"", t.chars().take(80).collect::<String>()))
             .unwrap_or_default();
         return Err(Fail::Final(format!(
@@ -916,6 +924,9 @@ impl crate::net::Sink for BrowserSink<'_, '_, '_> {
 }
 
 fn too_big(host: &str, limit: usize) -> String {
+    if limit == KEY_LIMIT {
+        return format!("{host} sent more than {limit} bytes for an AES-128 key, which is 16");
+    }
     let what = if limit == PLAYLIST_LIMIT {
         "a playlist"
     } else {
@@ -960,7 +971,6 @@ fn play(video: &HtmlVideoElement) {
     }
 }
 
-/// Seconds of media buffered ahead of the playhead (0 if none).
 /// Starts playback at the first buffered media.
 fn begin(video: &HtmlVideoElement, buffer: &SourceBuffer) {
     if let Some(start) = buffer.buffered().ok().and_then(|b| b.start(0).ok())
@@ -971,6 +981,7 @@ fn begin(video: &HtmlVideoElement, buffer: &SourceBuffer) {
     play(video);
 }
 
+/// Seconds of media buffered ahead of the playhead (0 if none).
 fn buffered_ahead(video: &HtmlVideoElement) -> f64 {
     let b = video.buffered();
     match b.length().checked_sub(1).and_then(|last| b.end(last).ok()) {
@@ -1385,7 +1396,11 @@ async fn run(
                     stats.borrow_mut().dropped_segments += 1;
                     tx.borrow_mut().discontinuity();
                     say(Status::Note(format!("skipping unavailable segment: {why}")));
-                    skipped_in_a_row += 1;
+                    // Part of a streamed first segment may have played before it failed.
+                    skipped_in_a_row = if early > 0 { 0 } else { skipped_in_a_row + 1 };
+                    if skipped_in_a_row >= SKIP_LIMIT {
+                        return Err(format!("{why} ({SKIP_LIMIT} segments in a row)").into());
+                    }
                     if master_base.is_some() {
                         next_variant = abr.failed(
                             &variants,
@@ -1395,9 +1410,6 @@ async fn run(
                         if next_variant.is_some() {
                             break;
                         }
-                    }
-                    if skipped_in_a_row >= SKIP_LIMIT {
-                        return Err(format!("{why} ({SKIP_LIMIT} segments in a row)").into());
                     }
                     continue;
                 }

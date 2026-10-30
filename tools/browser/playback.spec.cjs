@@ -87,7 +87,10 @@ test('stopping cancels an unfinished fetch before a new session', async ({ page 
   } finally { release(); }
 });
 
-test('a live channel whose key server is broken fails with its answer instead of buffering forever', async ({ page }) => {
+for (const [answer, expected] of [
+  ['Cannot read stream: key unavailable', /AES-128 key is 35 bytes, not 16: \\?"Cannot read stream: key unavailable.*segments in a row/],
+  ['<html>' + 'x'.repeat(2000) + '</html>', /more than 1024 bytes for an AES-128 key, which is 16.*segments in a row/],
+]) test(`a live channel whose key server answers ${answer.length} bytes fails with why instead of buffering forever`, async ({ page }) => {
   const errors = await open(page);
   // The browser fixture as an AES-128 live window growing by a segment a second. The key is
   // fetched before any segment is decrypted, so the segments themselves needn't be encrypted.
@@ -102,11 +105,11 @@ test('a live channel whose key server is broken fails with its answer instead of
       body: `${head}\n#EXT-X-MEDIA-SEQUENCE:${n}\n#EXT-X-KEY:METHOD=AES-128,URI="key.bin",IV=0x1\n` +
         `${segments.slice(n, n + 3).join('\n')}\n` });
   });
-  await page.route('**/media/key.bin', route => route.fulfill({ contentType: 'text/plain', body: 'Cannot read stream: key unavailable' }));
+  await page.route('**/media/key.bin', route => route.fulfill({ contentType: 'text/plain', body: answer }));
   await page.locator('#url').fill('/media/browser.m3u8');
   await page.locator('#play').click();
   await expect.poll(() => page.evaluate(() => window.sample().session.statuses.map(s => s.status).find(s => s.startsWith('Failed'))),
-    { timeout: 30000 }).toMatch(/AES-128 key is 35 bytes, not 16: \\?"Cannot read stream: key unavailable.*segments in a row/);
+    { timeout: 30000 }).toMatch(expected);
   expect(errors).toEqual([]);
 });
 
