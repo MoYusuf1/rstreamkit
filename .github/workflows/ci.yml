@@ -12,7 +12,7 @@ jobs:
   check:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Rust toolchain
         run: |
           rustup update stable
@@ -48,7 +48,7 @@ jobs:
   msrv:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - run: rustup toolchain install 1.88.0 --profile minimal --target wasm32-unknown-unknown
       - run: cargo +1.88.0 check --all-features
       - run: cargo +1.88.0 check --no-default-features
@@ -60,7 +60,7 @@ jobs:
   wasm-audio:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - run: rustup target add wasm32-unknown-unknown
       - run: rustup component add rustfmt clippy
       - run: cargo fmt --manifest-path tools/player/Cargo.toml --check
@@ -90,7 +90,7 @@ jobs:
           node tools/node/opt-compare.cjs tools/results/scalar/balanced/rstreamkit_harness.js tools/results/simd/balanced/rstreamkit_harness.js > tools/results/simd-audio.json
       - name: Experimental SIMD size budgets
         run: python3 tools/size.py --simd --artifacts-dir tools/results/simd-player --check-budgets --output tools/results/size-simd.json
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         if: always()
         with:
           name: player-size
@@ -99,7 +99,7 @@ jobs:
             tools/results/size-simd.json
             tools/results/fft-compare.json
             tools/results/simd-audio.json
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v7
         with:
           node-version: 24
           cache: npm
@@ -113,7 +113,7 @@ jobs:
       - name: Chrome playback regressions
         working-directory: tools/browser
         run: npm test -- --project=chrome
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         if: always()
         with:
           name: browser-regressions
@@ -125,12 +125,12 @@ jobs:
     runs-on: ubuntu-latest
     continue-on-error: true
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - run: rustup target add wasm32-unknown-unknown
       - run: cargo install wasm-bindgen-cli --version 0.2.128 --locked
       - run: sudo apt-get update && sudo apt-get install -y ffmpeg
       - run: bash tools/profile.sh > profile.jsonl
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         if: always()
         with:
           name: wasm-profile
@@ -139,7 +139,7 @@ jobs:
   parser-fuzz:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Check development-only fuzz targets
         run: |
           rustup component add rustfmt clippy
@@ -147,7 +147,7 @@ jobs:
           cargo clippy --manifest-path tools/fuzz/Cargo.toml --all-targets --features coverage -- -D warnings
       - name: Seeded bounded parser smoke (5,000 cases)
         run: python3 tools/fuzz/run.py --cases 1000 --seed 20261010
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         if: always()
         with:
           name: parser-fuzz
