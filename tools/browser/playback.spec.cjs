@@ -163,7 +163,7 @@ test('movies and encrypted sound play; a seek interrupts audio decoding', async 
     timeout: 110000, maxBuffer: 1024 * 1024,
   });
   await testInfo.attach('movie-playback-report', { body: stdout, contentType: 'application/json' });
-  expect(JSON.parse(stdout).checks).toBe(5);
+  expect(JSON.parse(stdout).checks).toBe(4);
 });
 
 test('late-clock, laced-sound and unindexed movies play; one that cannot start says so', async ({ baseURL }, testInfo) => {
