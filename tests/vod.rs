@@ -153,6 +153,14 @@ fn an_mkv_is_understood_the_same_way() {
     assert!((movie.duration - 6.0).abs() < 0.1, "{}", movie.duration);
     assert_eq!(movie.verdict(&|t| !t.contains("ac-3")), Verdict::Rust);
     assert_eq!(movie.shift(), -1.0, "room for the picture to be reordered");
+    let a = movie.audio.as_ref().unwrap();
+    assert_eq!(
+        movie.summary(),
+        format!(
+            "MKV, H.264 320x{}, AC-3 {} ch {} Hz, {:.1} s",
+            movie.video.height, a.channels, a.rate, movie.duration
+        )
+    );
 }
 
 #[test]

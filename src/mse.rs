@@ -2024,7 +2024,9 @@ mod movie {
                 let since = *undecoded_since.get_or_insert(now);
                 if now - since > NO_PICTURE {
                     return Err(format!(
-                        "no picture decoded at {t:.1} s although the media there is buffered"
+                        "no picture decoded at {t:.1} s although the media there is buffered ({}; given as {})",
+                        movie.summary(),
+                        init.mime
                     )
                     .into());
                 }
@@ -2103,8 +2105,10 @@ mod movie {
                 && (frontier - start > MOVIE_AHEAD || session.done())
             {
                 return Err(format!(
-                    "nothing playable at {start:.1} s: {:.1} s of the movie is buffered, none of it there",
-                    buffered_duration(video)
+                    "nothing playable at {start:.1} s: {:.1} s of the movie is buffered, none of it there ({}; given as {})",
+                    buffered_duration(video),
+                    movie.summary(),
+                    init.mime
                 )
                 .into());
             }

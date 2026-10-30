@@ -252,6 +252,25 @@ impl Movie {
         }
     }
 
+    /// The tracks in one line for failure messages, e.g. `MKV, H.264 1920x1080 interlaced,
+    /// AC-3 6 ch 48000 Hz, 7200.0 s`, so a report says what the file was without a probe tool.
+    pub fn summary(&self) -> String {
+        let container = match self.container {
+            Container::Mp4 => "MP4",
+            Container::Matroska => "MKV",
+        };
+        let v = &self.video;
+        let interlaced = if v.interlaced { " interlaced" } else { "" };
+        let audio = match &self.audio {
+            Some(a) => format!("{} {} ch {} Hz", a.name, a.channels, a.rate),
+            None => "no sound".into(),
+        };
+        format!(
+            "{container}, {} {}x{}{interlaced}, {audio}, {:.1} s",
+            v.name, v.width, v.height, self.duration
+        )
+    }
+
     /// Seconds to subtract from the source buffer's timestamps (`timestampOffset`).
     pub fn shift(&self) -> f64 {
         -(self.shift as f64) / 1e6

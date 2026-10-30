@@ -55,5 +55,6 @@ const {execFileSync}=require('node:child_process'),{chromium,expect}=require('@p
   assert(!far.plays&&far.statuses.some(s=>/Failed/.test(s))&&far.range_requests<20,'unreachable start fails promptly');
   assert(laced.plays&&laced.statuses.includes('Playing'),'laced sound plays');
   assert(!undecodable.plays&&undecodable.statuses.some(s=>/Failed/.test(s)),'undecodable start fails');
+  assert(undecodable.statuses.some(s=>/no picture decoded.*\(MKV, H\.264 .*given as video\//.test(s)),'the failure names the tracks');
  }finally{await browser?.close();fs.rmSync(temporary,{recursive:true,force:true});}
 })().catch(e=>{console.error(e);process.exit(1);});
