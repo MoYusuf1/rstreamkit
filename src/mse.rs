@@ -640,6 +640,7 @@ async fn decrypt(bytes: &[u8], key: &[u8], iv: &[u8; 16]) -> Result<Vec<u8>, Fai
 
 /// A segment, downloaded straight into the transmuxer as it arrives, so no copy of it is ever held
 /// whole. A download that fails part way is tried again from the start, into a fresh segment.
+/// `failed` is an attempt already made, which counts as the first.
 #[allow(clippy::too_many_arguments)]
 async fn fetch_segment(
     http: &impl Fetch,
@@ -650,11 +651,20 @@ async fn fetch_segment(
     info: &hls::Segment,
     base: &str,
     format: &RefCell<Format>,
+    mut failed: Option<Fail>,
     report: &mut dyn FnMut(Status),
 ) -> Result<crate::Output, Failure> {
     with_retries(
         stop,
-        || fetch_segment_once(http, url, limit, tx, info, base, format),
+        || {
+            let failed = failed.take();
+            async move {
+                match failed {
+                    Some(why) => Err(why),
+                    None => fetch_segment_once(http, url, limit, tx, info, base, format).await,
+                }
+            }
+        },
         report,
     )
     .await
@@ -759,8 +769,9 @@ async fn download_segment(
 }
 
 /// A live stream's first segment, its first keyframe group appended (and playing) while the rest
-/// downloads, so the first picture waits for that group, not the whole segment. `None` when it
-/// failed before anything was appended: the caller downloads it again the usual way. After that, a
+/// downloads, so the first picture waits for that group, not the whole segment. `Err(Fail)` when it
+/// failed before anything was appended: the caller retries it the usual way, this being the first
+/// attempt. After that, a
 /// failed download is not tried again, which would append those pictures twice: it is an error, and
 /// the segment is skipped like any unavailable one, the next glued on where this one stopped.
 #[allow(clippy::too_many_arguments)]
@@ -775,13 +786,20 @@ async fn stream_first(
     partial: bool,
     early: &mut usize,
     report: &mut dyn FnMut(Status),
-) -> Result<Option<Result<crate::Output, Failure>>, Failure> {
-    let Ok(r) = http.get(url, None).await else {
-        return Ok(None);
+) -> Result<Result<Result<crate::Output, Failure>, Fail>, Failure> {
+    let r = match http.get(url, None).await {
+        Ok(r) => r,
+        Err(e) => return Ok(Err(e.into())),
     };
-    if !(200..300).contains(&r.status) || r.content_length.is_some_and(|n| n > SEGMENT_LIMIT as u64)
-    {
-        return Ok(None);
+    let exceeded = || Fail::Final(format!("segment exceeded {SEGMENT_LIMIT} byte limit"));
+    if matches!(r.status, 404 | 410) {
+        return Ok(Err(Fail::Final(format!("HTTP {}", r.status))));
+    }
+    if !(200..300).contains(&r.status) {
+        return Ok(Err(Fail::Retry(format!("HTTP {}", r.status))));
+    }
+    if r.content_length.is_some_and(|n| n > SEGMENT_LIMIT as u64) {
+        return Ok(Err(exceeded()));
     }
     let mut segment = tx
         .borrow()
@@ -791,9 +809,10 @@ async fn stream_first(
     while let Some(chunk) = std::future::poll_fn(|cx| body.as_mut().poll_next(cx)).await {
         let chunk = match chunk {
             Ok(chunk) if chunk.len() <= SEGMENT_LIMIT - total => chunk,
-            _ if sb.is_none() => return Ok(None),
-            Ok(_) => return Ok(Some(Err(too_big(&host_of(url), SEGMENT_LIMIT).into()))),
-            Err(why) => return Ok(Some(Err(format!("download failed part way: {why}").into()))),
+            Ok(_) if sb.is_none() => return Ok(Err(exceeded())),
+            Err(why) if sb.is_none() => return Ok(Err(Fail::Retry(why))),
+            Ok(_) => return Ok(Ok(Err(too_big(&host_of(url), SEGMENT_LIMIT).into()))),
+            Err(why) => return Ok(Ok(Err(format!("download failed part way: {why}").into()))),
         };
         total += chunk.len();
         segment.feed(&chunk);
@@ -806,10 +825,10 @@ async fn stream_first(
         let mut out = match taken {
             Ok(Some(out)) => out,
             Ok(None) => continue,
-            Err(e) => return Ok(Some(Err(e.into()))),
+            Err(e) => return Ok(Ok(Err(e.into()))),
         };
         if stop.get() {
-            return Ok(None);
+            return Ok(Err(Fail::Retry("playback stopped".into())));
         }
         if let Some(codec) = out.skipped_audio
             && !partial
@@ -848,7 +867,7 @@ async fn stream_first(
         begin(video, buffer);
         report(Status::Playing);
     }
-    Ok(Some(finish_segment(tx, segment).await))
+    Ok(Ok(finish_segment(tx, segment).await))
 }
 
 // One speculative download, polled alongside browser appends. No decoded state is changed
@@ -1298,6 +1317,9 @@ async fn run(
                     .or_else(|| Some((js_sys::Date::now() / 1000.0 - pending.started).max(0.001)));
                 match downloaded {
                     Ok(segment) => finish_segment(&tx, segment).await,
+                    // Missing or refused: asking again gets the same answer. Only the
+                    // speculative size cap is worth a full download.
+                    Err(Fail::Final(why)) if !why.ends_with("byte limit") => Err(why.into()),
                     Err(_) => {
                         // A capped/failed speculative body is not a complete download
                         // timing sample. Do not infer throughput from the fallback's
@@ -1312,6 +1334,7 @@ async fn run(
                             seg,
                             &latest.url,
                             &format,
+                            None,
                             &mut say,
                         )
                         .await
@@ -1330,14 +1353,15 @@ async fn run(
                     stream_first(
                         http, &url, stop, &tx, video, &ms, &mut sb, partial, &mut early, &mut say,
                     )
-                    .await?
+                    .await
+                    .map(Some)?
                 } else {
                     None
                 };
                 started |= sb.is_some();
                 match streamed {
-                    Some(result) => result,
-                    None => {
+                    Some(Ok(result)) => result,
+                    failed => {
                         fetch_segment(
                             http,
                             &url,
@@ -1347,6 +1371,7 @@ async fn run(
                             seg,
                             &latest.url,
                             &format,
+                            failed.and_then(Result::err),
                             &mut say,
                         )
                         .await
@@ -1748,6 +1773,7 @@ async fn get_rendition(
             segment,
             &latest.url,
             &state.format,
+            None,
             report,
         )
         .await?;
