@@ -76,7 +76,7 @@ const playlist = '#EXTM3U\n#EXT-X-TARGETDURATION:5\n' +
         statuses: window.sample().session.statuses.map(item => item.status) }));
       assert.equal(result.updating, true);
       if (fault === 'remove-unrelated') {
-        assert(result.statuses.includes('Ended'), 'unrelated removal must still complete');
+        assert(result.statuses.includes('Ended'), 'unrelated removal must still complete: ' + JSON.stringify(result.statuses));
         assert(!result.statuses.some(s => /Failed|BrowserError/.test(s)));
       } else {
         assert(result.statuses.some(s => s.startsWith('Failed')), 'source closure must settle the task');
