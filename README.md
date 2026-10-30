@@ -21,6 +21,8 @@ and without installing FFmpeg.
 
 **Live TV that keeps going**
 
+- Channels start fast: the first picture shows while the first piece is still downloading
+  (about 0.6 s instead of 1.2 s on a 40 Mb/s connection).
 - If the stream drops for a few seconds, it reconnects by itself and carries on.
 - If a piece of the stream is missing or broken, it skips it instead of stopping.
 - If the server takes the request and never answers, it gives up after 20 seconds and tries again,
@@ -29,6 +31,7 @@ and without installing FFmpeg.
 - Switch channels quickly and often without old channels leaking in.
 - Picks a lower quality when the connection is slow and goes back up when it recovers.
 - Keeps its memory use capped during long watches.
+- Survives the TV clock rolling over (every 26.5 hours) without a hiccup.
 
 **Movies and episodes**
 
@@ -66,7 +69,8 @@ and file reading and writing. The output was checked against the input.
 
 ## Use it
 
-- Repackage a file: `rstreamkit recording.ts recording.mp4`.
+- Repackage a file: `rstreamkit recording.ts recording.mp4`. Recordings, MP4, MKV and HLS
+  playlists (TS or fMP4 pieces) all work.
 - Build a browser player, or use the engine in a Rust app.
 
 [All measurements](docs/performance.md) · [Developer guide](docs/api.md) · [Demo and tests](tools/README.md) · [Roadmap](docs/roadmap.md) · [Contributor guide](docs/technical-breakdown.md)
