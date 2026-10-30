@@ -493,6 +493,7 @@ impl From<FetchError> for Fail {
 }
 
 /// Browser timer adapter for the shared retry loop.
+#[derive(Clone)]
 struct BrowserClock;
 impl crate::net::Clock for BrowserClock {
     async fn sleep(&self, duration: Duration) {

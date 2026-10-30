@@ -1,6 +1,7 @@
 //! Test the browser's retry orchestration with fake time and real transport parsing.
 use rstreamkit::net::{
-    Clock, Fetch, FetchError, HEADERS_TIMEOUT, Response, RetryError, Timed, download_segment, retry,
+    BODY_TIMEOUT, Clock, Fetch, FetchError, HEADERS_TIMEOUT, Response, RetryError, Timed,
+    download_segment, retry,
 };
 use std::{
     cell::{Cell, RefCell},
@@ -289,8 +290,8 @@ impl Fetch for Silent {
 
 #[test]
 fn a_server_that_never_answers_times_out_and_is_retried() {
-    let clock = FakeClock::default();
-    let silent = Timed(&clock, Silent);
+    let clock: &'static FakeClock = Box::leak(Box::default());
+    let silent = Timed(clock, Silent);
     let reports = RefCell::new(Vec::new());
     let result = run(retry(
         &clock,
@@ -313,8 +314,47 @@ fn a_server_that_never_answers_times_out_and_is_retried() {
 
 #[test]
 fn an_answer_ready_when_the_timer_fires_still_wins() {
-    let clock = FakeClock::default();
-    let host = provider(&clock);
-    let response = run(Timed(&clock, host).get("https://test/segment.ts", None)).unwrap();
+    let clock: &'static FakeClock = Box::leak(Box::default());
+    let host = provider(clock);
+    let response = run(Timed(clock, host).get("https://test/segment.ts", None)).unwrap();
     assert_eq!(response.status, 200);
+}
+
+/// A provider that sends its headers, then never another byte.
+struct Stalled;
+struct Never;
+impl futures_core::Stream for Never {
+    type Item = Result<Vec<u8>, String>;
+    fn poll_next(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        Poll::Pending
+    }
+}
+impl Fetch for Stalled {
+    async fn get(&self, url: &str, _: Option<Range<u64>>) -> Result<Response, FetchError> {
+        Ok(Response {
+            status: 200,
+            url: url.into(),
+            content_type: "video/mp2t".into(),
+            content_length: None,
+            range_total: None,
+            body: Box::pin(Never),
+        })
+    }
+}
+
+#[test]
+fn a_body_that_stops_after_its_headers_fails_and_is_retried() {
+    let clock: &'static FakeClock = Box::leak(Box::default());
+    let stalled = Timed(clock, Stalled);
+    let result = run(retry(
+        clock,
+        || false,
+        || download_segment(&stalled, "https://test/segment.ts", 1 << 20, None),
+        temporary,
+        |_| {},
+    ));
+    assert!(
+        matches!(result, Err(RetryError::Failed(FetchError::Temporary(ref why))) if why.contains("no data"))
+    );
+    assert_eq!(clock.now.get(), 7 * BODY_TIMEOUT.as_secs() + 31);
 }

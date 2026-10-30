@@ -246,12 +246,12 @@ pub async fn append_fragments(
 pub const HEADERS_TIMEOUT: Duration = Duration::from_secs(20);
 
 /// A [`Fetch`] whose requests fail with [`FetchError::Temporary`] when no response arrives within
-/// [`HEADERS_TIMEOUT`]; the request future is dropped then, which cancels it. The body is not
-/// timed: a large download on a slow link may take as long as it takes. The browser player wraps
-/// the app's `Fetch` in this.
+/// [`HEADERS_TIMEOUT`]; the request future is dropped then, which cancels it. Its body fails when no
+/// data arrives for [`BODY_TIMEOUT`]; a slow but moving download may take as long as it takes. The
+/// browser player wraps the app's `Fetch` in this.
 pub struct Timed<C, F>(pub C, pub F);
 
-impl<C: Clock, F: Fetch> Fetch for Timed<C, F> {
+impl<C: Clock + Clone + Unpin + 'static, F: Fetch> Fetch for Timed<C, F> {
     async fn get(&self, url: &str, range: Option<Range<u64>>) -> Result<Response, FetchError> {
         let mut request = std::pin::pin!(self.1.get(url, range));
         let mut timer = std::pin::pin!(self.0.sleep(HEADERS_TIMEOUT));
@@ -268,6 +268,47 @@ impl<C: Clock, F: Fetch> Fetch for Timed<C, F> {
             })
         })
         .await
+        .map(|mut response| {
+            response.body = Box::pin(Idle {
+                clock: self.0.clone(),
+                body: response.body,
+                timer: None,
+            });
+            response
+        })
+    }
+}
+
+/// How long a response body may go without a byte before it fails: a server that sent its headers
+/// and then went quiet is retried like one that never answered.
+pub const BODY_TIMEOUT: Duration = Duration::from_secs(20);
+
+/// A body that fails after [`BODY_TIMEOUT`] without data; the timer restarts at every chunk.
+struct Idle<C> {
+    clock: C,
+    body: Body,
+    timer: Option<Pin<Box<dyn Future<Output = ()>>>>,
+}
+
+impl<C: Clock + Clone + Unpin + 'static> Stream for Idle<C> {
+    type Item = Result<Vec<u8>, String>;
+    fn poll_next(
+        mut self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Self::Item>> {
+        let this = &mut *self;
+        if let std::task::Poll::Ready(item) = this.body.as_mut().poll_next(cx) {
+            this.timer = None;
+            return std::task::Poll::Ready(item);
+        }
+        let clock = this.clock.clone();
+        let timer = this
+            .timer
+            .get_or_insert_with(|| Box::pin(async move { clock.sleep(BODY_TIMEOUT).await }));
+        timer.as_mut().poll(cx).map(|()| {
+            this.timer = None;
+            Some(Err(format!("no data for {} s", BODY_TIMEOUT.as_secs())))
+        })
     }
 }
 
