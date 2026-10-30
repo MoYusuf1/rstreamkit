@@ -25,6 +25,8 @@ and without installing FFmpeg.
   (about 0.6 s instead of 1.2 s on a 40 Mb/s connection).
 - If the stream drops for a few seconds, it reconnects by itself and carries on.
 - If a piece of the stream is missing or broken, it skips it instead of stopping.
+- If every piece fails (a dead channel, a broken key), it stops within seconds and says why,
+  instead of buffering forever.
 - If the server takes the request and never answers, it gives up after 20 seconds and tries again,
   instead of freezing forever. Slow servers that do answer still work.
 - Pause for a long time, press play, and it catches back up to live.

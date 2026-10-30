@@ -87,6 +87,29 @@ test('stopping cancels an unfinished fetch before a new session', async ({ page 
   } finally { release(); }
 });
 
+test('a live channel whose key server is broken fails with its answer instead of buffering forever', async ({ page }) => {
+  const errors = await open(page);
+  // The browser fixture as an AES-128 live window growing by a segment a second. The key is
+  // fetched before any segment is decrypted, so the segments themselves needn't be encrypted.
+  const started = Date.now();
+  await page.route('**/media/browser.m3u8', async route => {
+    const lines = (await (await route.fetch()).text()).split('\n');
+    const segments = [];
+    for (let i = 0; i < lines.length; i++) if (lines[i].startsWith('#EXTINF')) segments.push(lines[i] + '\n' + lines[i + 1]);
+    const n = Math.min(segments.length - 3, Math.floor((Date.now() - started) / 1000));
+    const head = lines.filter(l => /^#EXT(M3U|-X-VERSION|-X-TARGETDURATION)/.test(l)).join('\n');
+    await route.fulfill({ contentType: 'application/vnd.apple.mpegurl',
+      body: `${head}\n#EXT-X-MEDIA-SEQUENCE:${n}\n#EXT-X-KEY:METHOD=AES-128,URI="key.bin",IV=0x1\n` +
+        `${segments.slice(n, n + 3).join('\n')}\n` });
+  });
+  await page.route('**/media/key.bin', route => route.fulfill({ contentType: 'text/plain', body: 'Cannot read stream: key unavailable' }));
+  await page.locator('#url').fill('/media/browser.m3u8');
+  await page.locator('#play').click();
+  await expect.poll(() => page.evaluate(() => window.sample().session.statuses.map(s => s.status).find(s => s.startsWith('Failed'))),
+    { timeout: 30000 }).toMatch(/AES-128 key is 35 bytes, not 16: \\?"Cannot read stream: key unavailable.*segments in a row/);
+  expect(errors).toEqual([]);
+});
+
 test('live playback skips an unavailable segment and keeps moving', async ({ page }, testInfo) => {
   const errors = await open(page);
   await page.route('**/media/browser.m3u8', async route => {

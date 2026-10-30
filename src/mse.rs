@@ -580,9 +580,24 @@ struct Format {
     map: Option<(String, hls::Map, Option<hls::Key>)>,
 }
 
+/// Room for a wrong answer from a key server to be read and shown; a real key is 16 bytes.
+const KEY_LIMIT: usize = 1 << 10;
+/// Segments skipped one after another, with nothing played between, before playback gives up:
+/// one bad segment is passed over, but a broken key or a dead channel fails every one.
+const SKIP_LIMIT: u32 = 5;
+
 async fn decrypt(bytes: &[u8], key: &[u8], iv: &[u8; 16]) -> Result<Vec<u8>, Fail> {
     if key.len() != 16 {
-        return Err(Fail::Final("AES-128 key must contain 16 bytes".into()));
+        // A key server that is down often answers with a short text page: say what it said.
+        let text = std::str::from_utf8(key)
+            .ok()
+            .filter(|t| t.chars().all(|c| c.is_ascii_graphic() || c == ' '))
+            .map(|t| format!(": \"{}\"", t.chars().take(80).collect::<String>()))
+            .unwrap_or_default();
+        return Err(Fail::Final(format!(
+            "the AES-128 key is {} bytes, not 16{text}",
+            key.len()
+        )));
     }
     let inner = async {
         let global = js_sys::global();
@@ -659,7 +674,7 @@ async fn fetch_segment_once(
         let mut fetched = fetch_resource(http, url, info.byte_range.clone(), limit).await?;
         if let Some(key) = &info.key {
             let key_url = resolve(base, &key.uri).map_err(Fail::Final)?;
-            let key_bytes = fetch_resource(http, &key_url, None, 16).await?.body;
+            let key_bytes = fetch_resource(http, &key_url, None, KEY_LIMIT).await?.body;
             fetched.body = decrypt(&fetched.body, &key_bytes, &key.iv_for(info.seq)).await?;
         }
         if let Some(map) = &info.map {
@@ -675,7 +690,7 @@ async fn fetch_segment_once(
                         Fail::Final("encrypted initialization needs explicit IV".into())
                     })?;
                     let key_url = resolve(base, &key.uri).map_err(Fail::Final)?;
-                    let key_bytes = fetch_resource(http, &key_url, None, 16).await?.body;
+                    let key_bytes = fetch_resource(http, &key_url, None, KEY_LIMIT).await?.body;
                     bytes = decrypt(&bytes, &key_bytes, &iv).await?;
                 }
                 let mime = format
@@ -1200,6 +1215,7 @@ async fn run(
     let mut window = crate::live::Window::default();
     let mut bytes_per_second = 0.0;
     let mut started = false;
+    let mut skipped_in_a_row = 0;
     let mut warned_audio = false;
     let mut frontier = 0.0;
     let mut jump_requested = false;
@@ -1344,6 +1360,7 @@ async fn run(
                     stats.borrow_mut().dropped_segments += 1;
                     tx.borrow_mut().discontinuity();
                     say(Status::Note(format!("skipping unavailable segment: {why}")));
+                    skipped_in_a_row += 1;
                     if master_base.is_some() {
                         next_variant = abr.failed(
                             &variants,
@@ -1354,11 +1371,15 @@ async fn run(
                             break;
                         }
                     }
+                    if skipped_in_a_row >= SKIP_LIMIT {
+                        return Err(format!("{why} ({SKIP_LIMIT} segments in a row)").into());
+                    }
                     continue;
                 }
                 Err(e) => return Err(e),
             };
             abr.succeeded();
+            skipped_in_a_row = 0;
             if stop.get() {
                 return Ok(());
             }

@@ -2,6 +2,8 @@
 
 ## Unreleased (0.2.0)
 
+- Live playback fails after 5 segments in a row are skipped with nothing played between them, with the last reason, instead of buffering forever (a broken key server or a dead channel fails every segment). A key server's wrong answer is quoted: `the AES-128 key is 35 bytes, not 16: "Cannot read stream: key unavailable"`.
+
 - Keep sound in a stream that arrives in pieces (raw TS, a live channel's first segment) when the clock wraps part way through a group of pictures; it was held back and that fragment went out with no sound.
 - Keep pictures and sound in order in a segment that straddles the 33-bit clock wrap (every 26.5 hours of a broadcast clock). They were sorted by raw timestamp, so the part after the wrap came first and the next segment was re-based about 124 ms early.
 
