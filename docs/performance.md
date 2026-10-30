@@ -1734,3 +1734,24 @@ PCM byte stays identical. Same 60 s FFmpeg 5.1 input as above, `decode_bench`, r
 Not kept: the compiler already vectorizes the scalar butterflies, and the gain is too small to
 justify new `unsafe` code. A real gain would need a different factorization (split-radix or
 radix-4), which changes rounding, so it would need a tolerance gate instead of a hash.
+
+## Live HLS startup is one whole segment download (2026-10-30)
+
+Where a live channel's first picture waits, before changing anything. 36 s of 1920×1080/25 H.264
+at 6 Mb/s + AAC as 6 s TS segments (about 4.3 MB each) behind a live playlist without ENDLIST,
+served by `tools/server.py`, Chrome 155 with CDP network emulation at 40 Mb/s and 100 ms latency,
+full player build, three runs:
+
+| Step | Time from start() |
+| --- | ---: |
+| Media playlist answered | 107-109 ms |
+| First segment (third from the live edge) fully downloaded | 1,156-1,172 ms |
+| `Playing` reported | 1,159-1,173 ms |
+| First decoded frame | 1,213-1,222 ms |
+
+Everything after the playlist is the first segment's download: transmuxing and appending take
+about 5 ms, and the next segment is only requested after that. The first 2 s keyframe group is
+about a third of the segment, so appending while the segment downloads could bring the first
+frame to roughly 0.5 s here. It needs the transmuxer to emit fragments before a segment ends
+(today `Transmuxer::finish` turns a whole segment into one fragment), and a retry or a skipped
+corrupt segment after part of it was appended must not duplicate or tear media. Not done yet.
