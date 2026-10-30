@@ -800,7 +800,12 @@ async fn stream_first(
         Ok(r) => r,
         Err(e) => return Ok(Err(e.into())),
     };
-    let exceeded = || Fail::Final(format!("segment exceeded {SEGMENT_LIMIT} byte limit"));
+    let exceeded = || {
+        Fail::Final(format!(
+            "segment exceeded {SEGMENT_LIMIT} {}",
+            crate::net::OVER_LIMIT
+        ))
+    };
     if matches!(r.status, 404 | 410) {
         return Ok(Err(Fail::Final(format!("HTTP {}", r.status))));
     }
@@ -1331,7 +1336,9 @@ async fn run(
                     Ok(segment) => finish_segment(&tx, segment).await,
                     // Missing or refused: asking again gets the same answer. Only the
                     // speculative size cap is worth a full download.
-                    Err(Fail::Final(why)) if !why.ends_with("byte limit") => Err(why.into()),
+                    Err(Fail::Final(why)) if !why.ends_with(crate::net::OVER_LIMIT) => {
+                        Err(why.into())
+                    }
                     Err(_) => {
                         // A capped/failed speculative body is not a complete download
                         // timing sample. Do not infer throughput from the fallback's

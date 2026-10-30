@@ -312,6 +312,10 @@ impl<C: Clock + Clone + Unpin + 'static> Stream for Idle<C> {
     }
 }
 
+/// How a segment that outgrew its size cap ends its error message; the browser player matches on
+/// it to download again in full what a capped speculative download gave up on.
+pub(crate) const OVER_LIMIT: &str = "byte limit";
+
 /// Download TS incrementally, checking both advertised size and the actual body.
 /// Dropping this future drops the response body, cancelling host transport work.
 pub async fn download_segment(
@@ -327,7 +331,7 @@ pub async fn download_segment(
     if !(200..300).contains(&r.status) {
         return Err(FetchError::Temporary(format!("HTTP {}", r.status)));
     }
-    let too_big = || FetchError::Permanent(format!("segment exceeded {} byte limit", limit));
+    let too_big = || FetchError::Permanent(format!("segment exceeded {limit} {OVER_LIMIT}"));
     if r.content_length.is_some_and(|n| n > limit as u64) {
         return Err(too_big());
     }
