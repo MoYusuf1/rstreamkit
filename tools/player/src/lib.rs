@@ -43,7 +43,8 @@ pub fn live(url: String) -> Result<(), JsValue> {
 
 #[cfg(feature = "vod")]
 #[wasm_bindgen]
-pub async fn movie(url: String) -> Result<(), JsValue> {
+/// `start` is where to begin, in seconds (resuming); 0 when left out.
+pub async fn movie(url: String, start: Option<f64>) -> Result<(), JsValue> {
     let video = video()?;
     stop();
     let generation = GENERATION.with(Cell::get);
@@ -52,7 +53,14 @@ pub async fn movie(url: String) -> Result<(), JsValue> {
         .map_err(|e| JsValue::from_str(&e))?;
     if GENERATION.with(Cell::get) == generation {
         PLAYER.with(|p| {
-            *p.borrow_mut() = Some(mse::play_movie(video, movie, url, mse::Direct, 0.0, report));
+            *p.borrow_mut() = Some(mse::play_movie(
+                video,
+                movie,
+                url,
+                mse::Direct,
+                start.unwrap_or(0.0),
+                report,
+            ));
         });
     }
     Ok(())

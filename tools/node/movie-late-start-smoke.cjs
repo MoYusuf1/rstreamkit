@@ -1,4 +1,5 @@
-// Movies that start late, never start, carry laced sound or have no index: each plays or says why not.
+// Movies that start late, never start, carry laced sound, have no index or are resumed part way:
+// each plays or says why not.
 const assert=require('node:assert/strict'),fs=require('node:fs'),path=require('node:path'),os=require('node:os');
 const {execFileSync}=require('node:child_process'),{chromium,expect}=require('@playwright/test');
 (async()=>{
@@ -20,7 +21,10 @@ const {execFileSync}=require('node:child_process'),{chromium,expect}=require('@p
    nocues:(()=>{const out=path.join(temporary,'nocues.mkv');fs.writeFileSync(out,execFileSync('ffmpeg',['-v','error',
     '-f','lavfi','-i','testsrc2=size=160x90:rate=30:duration=12','-f','lavfi','-i','sine=frequency=440:sample_rate=48000:duration=12',
     '-c:v','libx264','-preset','ultrafast','-g','30','-c:a','ac3','-f','matroska','pipe:1'],{maxBuffer:64<<20}));return out;})(),
+   // Resumed 6 s in, as an app does for a half-watched episode.
+   resume:make('resume.mkv',[]),
   };
+  const from={resume:6};
   browser=await chromium.launch({channel:'chrome'});const results=[];
   for(const [name,file] of Object.entries(cases)){
    const page=await browser.newPage(),errors=[];let requests=0;page.on('pageerror',e=>errors.push(e.message));
@@ -38,9 +42,10 @@ const {execFileSync}=require('node:child_process'),{chromium,expect}=require('@p
    await page.locator('#mode').selectOption('movie');
    await page.locator('#url').fill('/late-movie.mkv');
    const started=Date.now();
-   await page.locator('#play').click();
+   if(from[name])page.evaluate(at=>window.start('/late-movie.mkv','movie',at),from[name]).catch(e=>errors.push(String(e)));
+   else await page.locator('#play').click();
    let ok=true;
-   try{await expect.poll(()=>page.locator('#video').evaluate(v=>v.currentTime),{timeout:15000}).toBeGreaterThan(3);}catch{ok=false;await page.waitForTimeout(name==='undecodable'?2000:0);}
+   try{await expect.poll(()=>page.locator('#video').evaluate(v=>v.currentTime),{timeout:15000}).toBeGreaterThan((from[name]??0)+3);}catch{ok=false;await page.waitForTimeout(name==='undecodable'?2000:0);}
    const report=await page.evaluate(()=>({sample:sample(),ready:document.querySelector('#video').readyState,
     buffered:[...Array(document.querySelector('#video').buffered.length).keys()].map(i=>[document.querySelector('#video').buffered.start(i),document.querySelector('#video').buffered.end(i)])}));
    results.push({name,plays:ok,ms:Date.now()-started,range_requests:requests,ready:report.ready,buffered:report.buffered,
@@ -49,7 +54,8 @@ const {execFileSync}=require('node:child_process'),{chromium,expect}=require('@p
    assert.deepEqual(errors,[]);
   }
   console.log(JSON.stringify({checks:results.length,results},null,1));
-  const [clock,far,undecodable,laced,nocues]=results;
+  const [clock,far,undecodable,laced,nocues,resume]=results;
+  assert(resume.plays&&resume.statuses.includes('Playing')&&resume.buffered.every(([a])=>a>=5),'a resumed movie plays from where it was left');
   assert(nocues.plays&&nocues.statuses.includes('Playing'),'a movie without cues plays from the start');
   assert(clock.plays&&clock.statuses.includes('Playing')&&clock.range_requests<20,'late clock plays without refetching');
   assert(!far.plays&&far.statuses.some(s=>/Failed/.test(s))&&far.range_requests<20,'unreachable start fails promptly');

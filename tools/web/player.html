@@ -43,13 +43,13 @@ function watchFrame(current){
   watchFrame(current);
  });
 }
-window.start=async(url,mode='live')=>{
+window.start=async(url,mode='live',at)=>{
  if(typeof kit[mode]!=='function')throw Error(`${mode} is not included in ${flavor}`);
  kit.stop();
  if(frameCallback!==undefined)video.cancelVideoFrameCallback?.(frameCallback);
  session={started:performance.now(),url:new URL(url,location).href,mode,visible:!document.hidden,visibility_at:performance.now(),visible_ms:0,hidden_ms:0,first_frame_ms:null,last_frame:null,quality_at_start:quality(),longtask_count:0,longtask_ms:0,longtasks:[],status_count:0,statuses:[],memory:[],memory_samples:0,waiting_count:0,waiting_ms:0,waiting_at:null,waits:[],active:true};
  watchFrame(session);
- try{await kit[mode](session.url)}catch(error){window.onStatus(String(error));throw error}
+ try{await kit[mode](session.url,at)}catch(error){window.onStatus(String(error));throw error}
 };
 window.stop=()=>{finishWaiting();finishVisibility(performance.now());if(session){session.active=false;session.ended=performance.now()}kit.stop();if(frameCallback!==undefined)video.cancelVideoFrameCallback?.(frameCallback)};
 setInterval(()=>{if(session?.active){session.memory_samples++;boundedPush(session.memory,{ms:performance.now()-session.started,wasm_bytes:kit.memory_bytes(),buffered_seconds:Array.from({length:video.buffered.length},(_,i)=>video.buffered.end(i)-video.buffered.start(i)).reduce((a,b)=>a+b,0),current_time:video.currentTime})}},1000);
