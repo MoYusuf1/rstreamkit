@@ -1716,3 +1716,21 @@ after a fixed delay, Chrome 155, unoptimized full player, two runs each (ranges 
 A local route with injected latency, not a real provider; real transfer time for the larger
 first range is not modelled. Repeat: serve `tools/web`, then
 `RSTREAMKIT_LATENCY_MS=300 NODE_PATH=tools/browser/node_modules node tools/node/movie-latency-smoke.cjs`.
+
+## Dolby transforms: exact speedups measured and dropped (2026-10-29)
+
+How much of native AC-3 decoding the IMDCT is, and whether it can be made faster while every
+PCM byte stays identical. Same 60 s FFmpeg 5.1 input as above, `decode_bench`, release build.
+
+- Skipping the full-bandwidth IMDCT, window and overlap-add (wrong output, timing only): best
+  117.9 → 86.7 ms, so that stage is about 26%. A standalone loop of 62,028 long IMDCTs (the
+  same count) takes 28.9 ms. The 5.1 to stereo downmix is a few milliseconds.
+- SSE2 butterflies (a port of the Wasm SIMD ones, same operations and order) plus writing the
+  pre-twiddle straight into bit-reversed order: the standalone IMDCT drops 28.9 → 26.9 ms, but
+  six interleaved best-of-3 rounds give 114.2 → 113.4 ms (AC-3 5.1) and 129.5 → 126.8 ms
+  (E-AC-3 5.1), near the noise of a loaded machine. The bit-reversal change alone: 116.4 →
+  115.7 and 128.7 → 129.0 ms. PCM hashes matched in every run.
+
+Not kept: the compiler already vectorizes the scalar butterflies, and the gain is too small to
+justify new `unsafe` code. A real gain would need a different factorization (split-radix or
+radix-4), which changes rounding, so it would need a tolerance gate instead of a hash.
