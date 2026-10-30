@@ -86,7 +86,17 @@ class Handler(SimpleHTTPRequestHandler):
                 except (BrokenPipeError, ConnectionResetError): pass
                 return
             kind = 'application/vnd.apple.mpegurl' if name.endswith('.m3u8') else 'application/octet-stream'
-            return self.send(path.read_bytes(), kind)
+            data = path.read_bytes()
+            if 'cut' in q:
+                # Promise the whole file, send this fraction of it, and hang up: a download that breaks part way.
+                self.send_response(200); self.send_header('Content-Type', kind)
+                self.send_header('Content-Length', str(len(data))); self.end_headers()
+                # The pause lets the browser hand over what arrived before it learns of the hang-up.
+                try: self.wfile.write(data[:int(len(data) * float(q['cut'][0]))]); self.wfile.flush(); time.sleep(1)
+                except (BrokenPipeError, ConnectionResetError): pass
+                self.close_connection = True
+                return
+            return self.send(data, kind)
         super().do_GET()
 if __name__ == '__main__':
     print('Test bed: http://127.0.0.1:8765', flush=True)
