@@ -218,3 +218,31 @@ test("all four player builds load exactly three startup assets", async ({ baseUR
   await testInfo.attach("startup-report", { body: stdout, contentType: "application/json" });
   expect(JSON.parse(stdout).runs).toHaveLength(4);
 });
+
+// Provider-failure and live-policy smokes, each a standalone Chrome script that prints its checks.
+// They read RSTREAMKIT_URL as the whole page address.
+for (const [script, checks, seconds, what] of [
+  ['retry-smoke', 2, 60, 'retries wait on the player timer and stop when cancelled'],
+  ['session-smoke', 1, 60, 'a session starts, plays and stops cleanly'],
+  ['mono-smoke', 1, 60, 'mono Dolby sound is heard, not silence'],
+  ['abr-failure-smoke', 1, 60, 'unusable high-quality segments fall back without ending playback'],
+  ['abr-smoke', 1, 90, 'quality follows a slow provider down and back up'],
+  ['buffer-smoke', 4, 120, 'the live buffer stays within its limits'],
+  ['resilience-smoke', 4, 300, 'a missing, garbled, failing or silent segment does not stop live playback'],
+]) {
+  test(`${what} (${script})`, async ({ baseURL }, testInfo) => {
+    test.skip(testInfo.project.name !== 'chrome', 'This helper launches installed Chrome.');
+    test.setTimeout(seconds * 1000);
+    const path = require('node:path');
+    const { promisify } = require('node:util');
+    const { execFile } = require('node:child_process');
+    const { stdout } = await promisify(execFile)(process.execPath, [path.join(__dirname, `../node/${script}.cjs`)], {
+      env: { ...process.env, RSTREAMKIT_URL: new URL('/player.html?build=full', baseURL).href,
+        NODE_PATH: process.env.NODE_PATH || path.join(__dirname, 'node_modules') },
+      timeout: seconds * 1000 - 5000, maxBuffer: 4 * 1024 * 1024,
+    });
+    await testInfo.attach(`${script}-report`, { body: stdout, contentType: 'application/json' });
+    // Some print progress lines first; the report is the last line.
+    expect(JSON.parse(stdout.trim().split('\n').pop()).checks).toBe(checks);
+  });
+}
