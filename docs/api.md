@@ -42,6 +42,23 @@ selection. `stats()` returns a snapshot of appended bitrate, buffer/latency and
 skipped segments, including `live_window_seconds` (zero for finite media).
 `Player::resume` requests fresh live media after a pause longer than that window.
 Hosts controlling the video element directly must own the equivalent resume policy.
+
+### What a host does with each `mse::Status`
+
+The player watches for stalls itself, so a host needs no timer of its own; a host timer that
+hands playback elsewhere after a few seconds can cut off a stream that was about to recover.
+
+| Status | Meaning | Host |
+| --- | --- | --- |
+| `Buffering` | Waiting for media: at the start, or with under half a second buffered. | Show a spinner. |
+| `Playing` | Media is playing. | Hide it. |
+| `Reconnecting { attempt }` | A request failed or got no answer within 20 s and is retried (waits of 1, 2, 4, 8, 8, 8 s; 7 attempts in all), or a live playlist stopped growing. | Say "reconnecting"; keep waiting. |
+| `Note(text)` | Something the viewer may want to know; playback goes on (a segment was skipped, sound left out). | Log or show briefly. |
+| `Unsupported(why)` | This stream can't be played as it is (interlaced, no sound decoder, raw stream, no cue index for a seek). | Hand the stream to a converter, or say why. |
+| `Failed(text)` | Gave up, with the reason in words: retries ran out, 5 live segments in a row were skipped, or a movie's buffered media never produced a picture within 8 s (with its tracks named). | Show `text`, or fall back. |
+| `Ended` | A finite stream finished. | Done. |
+
+`Status` is `non_exhaustive`: treat a variant you don't know like `Note`, not as an error.
 The existing mse transport paths re-export the net types.
 Explicit `Transmuxer::passthrough_ac3(true)` enables AC-3 or simple E-AC-3 compressed
 samples. Probe MSE codec support before opting in. Six-block E-AC-3 with one
