@@ -646,8 +646,12 @@ impl Demuxer {
         // PES of different streams arrive interleaved and the last ones are flushed in any order;
         // restore decode order.
         sort_video(&mut out, self.video_base);
-        out.audio.sort_by_key(|s| s.pts);
-        out.sound.sort_by_key(|s| s.pts);
+        if let Some(first) = out.audio.first().map(|s| s.pts) {
+            out.audio.sort_by_key(|s| since(s.pts, first));
+        }
+        if let Some(first) = out.sound.first().map(|s| s.pts) {
+            out.sound.sort_by_key(|s| since(s.pts, first));
+        }
         if self.audio_pid.is_some() {
             // AAC plays as it is; it wins over anything else the stream carries.
             out.sound.clear();
@@ -661,6 +665,13 @@ impl Demuxer {
         }
         Ok(out)
     }
+}
+
+/// A sort key for a 33-bit timestamp that keeps the order across the clock's wrap (every 26.5
+/// hours): ticks since a quarter of the clock before `first`, the segment's first timestamp.
+fn since(t: u64, first: u64) -> u64 {
+    const WRAP: u64 = 1 << 33;
+    t.wrapping_add(WRAP / 4).wrapping_sub(first) & (WRAP - 1)
 }
 
 // Compare audio within its current clock epoch. A new encoder's small PTS
@@ -689,7 +700,11 @@ fn split_clock<T>(
 /// Puts the pictures in decode order. They nearly always arrive that way, and then nothing moves;
 /// a stream that doesn't gets its buffer rebuilt in order (`base` is what the buffer began with).
 fn sort_video(out: &mut Demuxed, base: usize) {
-    if out.video.windows(2).all(|w| w[0].dts <= w[1].dts) {
+    let Some(first) = out.video.first().map(|s| s.dts) else {
+        return;
+    };
+    let key = |s: &VideoSample| since(s.dts, first);
+    if out.video.windows(2).all(|w| key(&w[0]) <= key(&w[1])) {
         return;
     }
     let old = std::mem::take(&mut out.video_data);
@@ -702,7 +717,7 @@ fn sort_video(out: &mut Demuxed, base: usize) {
             (s, from)
         })
         .collect();
-    pictures.sort_by_key(|(s, _)| s.dts);
+    pictures.sort_by_key(|(s, _)| key(s));
     out.video_data = Vec::with_capacity(old.len());
     out.video_data.extend_from_slice(&old[..base]);
     for (s, from) in &pictures {

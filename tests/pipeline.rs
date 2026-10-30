@@ -372,3 +372,70 @@ mod sound {
         }
     }
 }
+
+const WRAP: i64 = 1 << 33; // PES timestamps are 33 bits
+
+/// `segment` with every PES timestamp moved by `delta` ticks, modulo 2^33: the same media on
+/// another clock, wrapping like a broadcast clock does every 26.5 hours.
+fn shifted(segment: &[u8], delta: i64) -> Vec<u8> {
+    let mut out = segment.to_vec();
+    for packet in out.as_chunks_mut::<188>().0 {
+        let payload = match (packet[3] >> 4) & 3 {
+            1 => 4,
+            3 => 5 + packet[4] as usize,
+            _ => continue,
+        };
+        if packet[1] & 0x40 == 0 || packet[payload..payload + 3] != [0, 0, 1] {
+            continue;
+        }
+        let flags = packet[payload + 7] >> 6;
+        for (at, present) in [(payload + 9, flags & 2 != 0), (payload + 14, flags == 3)] {
+            if !present {
+                continue;
+            }
+            let b = &packet[at..at + 5];
+            let t = (u64::from(b[0] >> 1) & 7) << 30
+                | u64::from(b[1]) << 22
+                | u64::from(b[2] >> 1) << 15
+                | u64::from(b[3]) << 7
+                | u64::from(b[4] >> 1);
+            let t = (t as i64 + delta).rem_euclid(WRAP) as u64;
+            packet[at] = (packet[at] & 0xF0) | (((t >> 30) & 7) as u8) << 1 | 1;
+            packet[at + 1] = (t >> 22) as u8;
+            packet[at + 2] = (((t >> 15) & 0x7F) as u8) << 1 | 1;
+            packet[at + 3] = (t >> 7) as u8;
+            packet[at + 4] = ((t & 0x7F) as u8) << 1 | 1;
+        }
+    }
+    out
+}
+
+/// A live channel watched long enough crosses the 33-bit clock wrap. Consecutive segments on
+/// either side of it, and one with the wrap in its middle, must carry on one after the other,
+/// not be taken for a jump or a restart.
+#[test]
+fn consecutive_segments_across_the_33_bit_clock_wrap_stay_continuous() {
+    let d = ts::demux(SEGMENT).unwrap();
+    let first = d.video[0].dts as i64;
+    let span = (d.video.last().unwrap().dts - d.video[0].dts) as i64 + 3003;
+    // Segment k plays from `start + k * span`; segment 2 ends past the wrap, segment 3 starts
+    // after it, and the wrap falls half way through segment 2.
+    let start = WRAP - 2 * span - span / 2;
+    let mut t = Transmuxer::default();
+    let mut previous: Option<Vec<u64>> = None;
+    for k in 0..5 {
+        let segment = shifted(SEGMENT, start + k * span - first);
+        let at = tfdts(&t.push(&segment).unwrap().fragment());
+        assert_eq!(at.len(), 2, "video and audio");
+        if let Some(before) = &previous {
+            assert!(
+                at[0].abs_diff(before[0] + span as u64) < 3003,
+                "segment {k}: video at {} after {}, a segment is {span}",
+                at[0],
+                before[0]
+            );
+            assert!(at[1] > before[1], "segment {k}: sound went backwards");
+        }
+        previous = Some(at);
+    }
+}
