@@ -98,6 +98,9 @@ pub struct Demuxed {
     /// Set when the segment has audio a browser can't play itself (AC-3, MP2, ...). It is dropped
     /// unless `sound` holds its decoded frames, which the transmuxer then plays instead.
     pub skipped_audio: Option<String>,
+    /// Decode time of the picture after the last one, when a cut mid-stream knows it: the last
+    /// picture's duration, instead of a guess.
+    pub next_dts: Option<u64>,
 }
 
 fn codec_name(stream_type: u8) -> String {
@@ -314,6 +317,8 @@ pub struct Demuxer {
     carry: Vec<u8>,
     synced: bool,
     invalid_sync: bool,
+    /// `take_pictures` reached the end of the first keyframe group.
+    first_group_taken: bool,
     scrambled: bool,
     /// What the pictures' buffer started with, so a rebuild keeps it.
     video_base: usize,
@@ -545,6 +550,20 @@ impl Demuxer {
     /// Completed pictures before the next keyframe, retaining PSI and partial PES state.
     /// The output preserves the initial video prefix supplied to `new`.
     pub fn take_fragment(&mut self) -> Result<Option<Demuxed>, Error> {
+        self.cut(true)
+    }
+
+    /// The first keyframe group's completed pictures as they arrive: all but the latest, whose
+    /// duration the next one gives, once the sound they play with is in. Nothing after that group,
+    /// where a new init could be due. Otherwise as [`take_fragment`](Self::take_fragment).
+    pub(crate) fn take_pictures(&mut self) -> Result<Option<Demuxed>, Error> {
+        if self.first_group_taken {
+            return Ok(None);
+        }
+        self.cut(false)
+    }
+
+    fn cut(&mut self, whole_groups: bool) -> Result<Option<Demuxed>, Error> {
         if self.invalid_sync {
             return Err(Error::NoSync);
         }
@@ -556,18 +575,35 @@ impl Demuxer {
         if self.scrambled {
             return Err(Error::Scrambled);
         }
-        let Some(cut) = self
+        let pictures = self.out.video.len();
+        let group_end = self
             .out
             .video
             .iter()
             .enumerate()
             .skip(1)
             .find(|(_, v)| v.key)
-            .map(|(i, _)| i)
-        else {
+            .map(|(i, _)| i);
+        let cut = if whole_groups {
+            group_end
+        } else {
+            group_end.or((pictures > 1).then(|| pictures - 1))
+        };
+        let Some(cut) = cut else {
             return Ok(None);
         };
         let cutoff = self.out.video[cut].pts;
+        // A track the init would lack would have to be added later, which a browser can't do in place.
+        // Its first sample also sets where the timeline starts, as it would for the whole segment.
+        let audio_in = if self.audio_pid.is_some() {
+            self.out.aac.is_some() && self.out.audio.iter().any(|s| s.pts < cutoff)
+        } else {
+            self.sound.is_none() || self.out.sound.iter().any(|s| s.pts < cutoff)
+        };
+        if !whole_groups && !audio_in {
+            return Ok(None);
+        }
+        self.first_group_taken |= !whole_groups && group_end.is_some();
         let clock_reset = earlier(self.out.video[cut].dts, self.out.video[cut - 1].dts);
         let bytes: usize = self.out.video[..cut].iter().map(|v| v.len as usize).sum();
         // The next fragment's buffer starts at this one's size, so it doesn't grow (and copy, and
@@ -604,6 +640,7 @@ impl Demuxer {
             sound_kind: self.sound.map(|(_, k)| k),
             simple_eac3: self.out.simple_eac3,
             skipped_audio: self.undecodable_audio.clone(),
+            next_dts: (!clock_reset).then(|| self.out.video[0].dts),
         };
         if self.audio_pid.is_some() {
             // As in `finish`: AAC plays, so other sound alongside it is not missing.

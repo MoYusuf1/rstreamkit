@@ -256,10 +256,13 @@ impl Transmuxer {
         self.assemble(d)
     }
 
-    /// The next whole keyframe group of a segment still arriving, once the keyframe after it is in,
-    /// to append before the rest is downloaded. [`finish`](Self::finish) then gives what is left.
+    /// The pictures of a segment's first keyframe group that are in so far, all but the latest
+    /// (the next one gives its duration), with the sound up to them, to append before the rest is
+    /// downloaded: the first picture can show as soon as it arrives. Each part decodes on its own,
+    /// since pictures only refer to earlier ones in decode order. [`finish`](Self::finish) then gives
+    /// what is left.
     pub fn take(&mut self, segment: &mut Segment) -> Result<Option<Output>, Error> {
-        match segment.demuxer.take_fragment()? {
+        match segment.demuxer.take_pictures()? {
             Some(d) => self.assemble(d).map(Some),
             None => Ok(None),
         }
@@ -268,7 +271,7 @@ impl Transmuxer {
     /// Like [`take`](Self::take), yielding between small batches of decoded audio frames.
     #[cfg(target_arch = "wasm32")]
     pub async fn take_yielded(&mut self, segment: &mut Segment) -> Result<Option<Output>, Error> {
-        match segment.demuxer.take_fragment()? {
+        match segment.demuxer.take_pictures()? {
             Some(d) => self
                 .assemble_yielded(d, &mut YieldSlice::new())
                 .await
@@ -526,6 +529,7 @@ impl Transmuxer {
 
         let mut runs = vec![];
         if !video.is_empty() {
+            let next = d.next_dts.map(|t| self.unwrap(t));
             let mut last_dur = 3003; // ~29.97 fps, only used if the segment has a single frame
             let mut at = MDAT_HEADER;
             let samples: Vec<_> = d
@@ -533,9 +537,11 @@ impl Transmuxer {
                 .iter()
                 .enumerate()
                 .map(|(i, s)| {
-                    let dur = video
-                        .get(i + 1)
-                        .map_or(last_dur, |n| n.0.saturating_sub(video[i].0) as u32);
+                    let dur = match (video.get(i + 1), next) {
+                        (Some(n), _) => n.0.saturating_sub(video[i].0) as u32,
+                        (None, Some(n)) if n > video[i].0 => (n - video[i].0) as u32,
+                        _ => last_dur,
+                    };
                     last_dur = dur;
                     let data = &d.video_data[at..at + s.len as usize];
                     at += s.len as usize;
@@ -1080,12 +1086,21 @@ mod tests {
         assert_eq!(pieces.init.unwrap().bytes, whole.init.unwrap().bytes);
     }
 
-    /// Keyframe groups taken while a segment arrives, then the rest, hold exactly the media of the
-    /// segment pushed whole, in order, and the first group comes out before the download ends.
+    /// Pictures taken while a segment arrives, then the rest, hold exactly the media of the segment
+    /// pushed whole, in order, ending at the same time on both tracks (no duration guessed), and
+    /// the first part, with its sound track, comes out early in the download.
     #[test]
-    fn groups_taken_while_a_segment_arrives_add_up_to_the_whole() {
-        let clip: &[u8] = include_bytes!("../tests/fixtures/h264_ac3.ts");
-        let whole = Transmuxer::default().push(clip).unwrap();
+    fn pictures_taken_while_a_segment_arrives_add_up_to_the_whole() {
+        for clip in [
+            &include_bytes!("../tests/fixtures/h264_ac3.ts")[..],
+            include_bytes!("../tests/fixtures/bbb_480p.ts"),
+        ] {
+            pictures_add_up(clip);
+        }
+    }
+    fn pictures_add_up(clip: &[u8]) {
+        let mut w = Transmuxer::default();
+        let whole = w.push(clip).unwrap();
         let mut t = Transmuxer::default();
         let mut segment = t.segment(clip.len());
         let (mut parts, mut first_at) = (vec![], None);
@@ -1097,13 +1112,16 @@ mod tests {
             }
         }
         parts.push(t.finish(segment).unwrap());
-        assert!(first_at.unwrap() < clip.len() / 1316 / 2, "{first_at:?}");
+        assert!(first_at.unwrap() < clip.len() / 1316 / 6, "{first_at:?}");
+        assert!(parts.len() > 2, "{}", parts.len());
         assert_eq!(
             parts[0].init.as_ref().unwrap().bytes,
             whole.init.as_ref().unwrap().bytes
         );
+        assert!(parts[1..].iter().all(|o| o.init.is_none()));
         let payload = |o: &Output| o.fragments.iter().map(|f| f.mdat.len() - 8).sum::<usize>();
         assert_eq!(parts.iter().map(payload).sum::<usize>(), payload(&whole));
+        assert_eq!((t.vend, t.aend), (w.vend, w.aend));
         let video: Vec<u64> = parts.iter().map(|o| base_times(&o.fragment())[0]).collect();
         assert_eq!(video[0], 0);
         assert!(video.windows(2).all(|w| w[0] < w[1]), "{video:?}");

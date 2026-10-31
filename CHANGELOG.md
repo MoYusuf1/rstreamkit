@@ -2,6 +2,8 @@
 
 ## Unreleased (0.2.0)
 
+- Show a live channel's first picture as soon as it has arrived: the first keyframe group of the first segment is appended picture by picture as it downloads, and playback moves once 1 s is buffered. With 6 s 1080p segments, the first picture falls from 0.58 to 0.29 s at 40 Mb/s and from 1.82 to 0.46 s at 8 Mb/s. `Transmuxer::take` now gives those pictures rather than whole keyframe groups. Fragments cut mid-stream, including `Continuous` keyframe groups, give their last picture its real duration instead of repeating the previous gap, which could re-base the clock on streams with uneven frame spacing. Add `ts::Demuxed::next_dts`.
+
 - Live playback fails after 5 segments in a row are skipped with nothing played between them, with the last reason, instead of buffering forever (a broken key server or a dead channel fails every segment). A key server's wrong answer is quoted: `the AES-128 key is 35 bytes, not 16: "Cannot read stream: key unavailable"`.
 
 - Keep sound in a stream that arrives in pieces (raw TS, a live channel's first segment) when the clock wraps part way through a group of pictures; it was held back and that fragment went out with no sound.

@@ -777,12 +777,15 @@ async fn download_segment(
         .map_err(Fail::from)
 }
 
-/// A live stream's first segment, its first keyframe group appended (and playing) while the rest
-/// downloads, so the first picture waits for that group, not the whole segment. `Err(Fail)` when it
-/// failed before anything was appended: the caller retries it the usual way, this being the first
-/// attempt. After that, a
-/// failed download is not tried again, which would append those pictures twice: it is an error, and
-/// the segment is skipped like any unavailable one, the next glued on where this one stopped.
+/// Seconds buffered before a streamed first segment starts moving.
+const START_AHEAD: f64 = 1.0;
+
+/// A live stream's first segment, its first keyframe group appended picture by picture as it
+/// arrives while the rest downloads: the first picture shows as soon as it is in, and playback
+/// starts with [`START_AHEAD`] buffered. `Err(Fail)` when it failed before anything was appended:
+/// the caller retries it the usual way, this being the first attempt. After that, a failed download
+/// is not tried again, which would append those pictures twice: it is an error, and the segment is
+/// skipped like any unavailable one, the next glued on where this one stopped.
 #[allow(clippy::too_many_arguments)]
 async fn stream_first(
     http: &impl Fetch,
@@ -830,9 +833,6 @@ async fn stream_first(
         };
         total += chunk.len();
         segment.feed(&chunk);
-        if sb.is_some() {
-            continue;
-        }
         let mut transmuxer = std::mem::take(&mut *tx.borrow_mut());
         let taken = transmuxer.take_yielded(&mut segment).await;
         *tx.borrow_mut() = transmuxer;
@@ -849,9 +849,14 @@ async fn stream_first(
         {
             return Err(Unsupported::Sound(codec).into());
         }
+        let first = sb.is_none();
         if let Some(mut init) = out.init {
             if init.interlaced && !partial {
                 return Err(Unsupported::Interlaced.into());
+            }
+            if !first {
+                // A keyframe group has one set of parameters; a second init would need a new buffer.
+                return Err("the stream changed its parameters inside a keyframe group".into());
             }
             let buffer = ms
                 .add_source_buffer(&init.mime)
@@ -863,11 +868,11 @@ async fn stream_first(
             *sb = Some(buffer);
         }
         let buffer = sb.as_ref().ok_or("no media buffer")?;
-        *early = out
+        *early += out
             .fragments
             .iter()
             .map(|f| f.moof.len() + f.mdat.len())
-            .sum();
+            .sum::<usize>();
         crate::net::append_fragments(
             &mut out.fragments,
             &mut BrowserSink {
@@ -878,8 +883,13 @@ async fn stream_first(
             },
         )
         .await?;
-        begin(video, buffer);
-        report(Status::Playing);
+        // The first picture shows at once; it moves once there is enough not to stall straight away.
+        if first {
+            to_start(video, buffer);
+        } else if video.paused() && buffered_ahead(video) >= START_AHEAD {
+            play(video);
+            report(Status::Playing);
+        }
     }
     Ok(Ok(finish_segment(tx, segment).await))
 }
@@ -979,12 +989,17 @@ fn play(video: &HtmlVideoElement) {
 
 /// Starts playback at the first buffered media.
 fn begin(video: &HtmlVideoElement, buffer: &SourceBuffer) {
+    to_start(video, buffer);
+    play(video);
+}
+
+/// Moves to the first buffered media, whose picture then shows.
+fn to_start(video: &HtmlVideoElement, buffer: &SourceBuffer) {
     if let Some(start) = buffer.buffered().ok().and_then(|b| b.start(0).ok())
         && video.current_time() < start
     {
         video.set_current_time(start);
     }
-    play(video);
 }
 
 /// Seconds of media buffered ahead of the playhead (0 if none).
@@ -1377,7 +1392,7 @@ async fn run(
                 } else {
                     None
                 };
-                started |= sb.is_some();
+                started |= !video.paused();
                 match streamed {
                     Some(Ok(result)) => result,
                     failed => {

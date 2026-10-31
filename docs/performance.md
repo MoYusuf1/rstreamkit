@@ -1800,3 +1800,31 @@ interleaved pairs:
 About 0.62 s sooner: the first frame now waits for the playlist and a third of the segment. No run
 waited for data in the 3 s after the first frame. The unoptimized full Wasm grows 4,154 bytes
 (1,197 Brotli bytes before wasm-opt, which is not installed here).
+
+## Live HLS shows its first picture as soon as it arrives (2026-10-30)
+
+The first segment's first keyframe group is now appended picture by picture as it downloads
+(`Transmuxer::take`), each part holding every picture that is in but the latest, whose duration
+the next one gives. Every part decodes on its own, since a picture only refers to earlier ones in
+decode order. The first part waits until the sound that plays with it is in, so the init has the
+sound track and the timeline starts where it would for the whole segment. The first picture is
+shown paused; playback starts once 1 s is buffered (`START_AHEAD`), so a link that only just
+keeps up does not stall straight away. Cuts made mid-stream (these and `Continuous` keyframe
+groups) now give the last picture its real duration from the next picture's decode time instead
+of repeating the previous gap, which re-based the clock on streams with uneven frame spacing.
+
+Same setup as the two sections above, full builds of 3048b0a (before) and this change (after),
+interleaved:
+
+| Link | Build | First picture | Motion starts (`Playing`) | Waits in the first 10 s |
+| --- | --- | ---: | ---: | --- |
+| 40 Mb/s, 4 pairs | Before | 569-593 ms, median 585 | 556-561 ms | none (3 s watched) |
+| 40 Mb/s, 4 pairs | After | 293-295 ms, median 293 | 419-422 ms | none (3 s watched) |
+| 8 Mb/s, 3 pairs | Before | 1,822-1,845 ms | 1,804-1,807 ms | 2, 1.51-1.52 s in all |
+| 8 Mb/s, 3 pairs | After | 456-465 ms | 1,171-1,177 ms | 2, 2.21-2.22 s in all |
+
+At 8 Mb/s the 6 Mb/s stream barely keeps up either way: both builds have played the same media
+10 s in; the new one shows a picture 1.4 s sooner and moves 0.6 s sooner. Playing from the first
+picture instead (tried first) brought motion to 266 ms at 40 Mb/s but made the 8 Mb/s waits
+2.8 s, hence the 1 s threshold.
+
