@@ -797,6 +797,7 @@ async fn stream_first(
     sb: &mut Option<SourceBuffer>,
     partial: bool,
     early: &mut usize,
+    started: &mut bool,
     report: &mut dyn FnMut(Status),
 ) -> Result<Result<Result<crate::Output, Failure>, Fail>, Failure> {
     let r = match http.get(url, None).await {
@@ -886,7 +887,9 @@ async fn stream_first(
         // The first picture shows at once; it moves once there is enough not to stall straight away.
         if first {
             to_start(video, buffer);
-        } else if video.paused() && buffered_ahead(video) >= START_AHEAD {
+        } else if !*started && buffered_ahead(video) >= START_AHEAD {
+            // Once: a viewer who pauses after this stays paused.
+            *started = true;
             play(video);
             report(Status::Playing);
         }
@@ -1385,14 +1388,23 @@ async fn run(
                     && seg.byte_range.is_none()
                 {
                     stream_first(
-                        http, &url, stop, &tx, video, &ms, &mut sb, partial, &mut early, &mut say,
+                        http,
+                        &url,
+                        stop,
+                        &tx,
+                        video,
+                        &ms,
+                        &mut sb,
+                        partial,
+                        &mut early,
+                        &mut started,
+                        &mut say,
                     )
                     .await
                     .map(Some)?
                 } else {
                     None
                 };
-                started |= !video.paused();
                 match streamed {
                     Some(Ok(result)) => result,
                     failed => {

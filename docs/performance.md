@@ -1846,3 +1846,8 @@ unthrottled, builds of a531a05 (before) and this change (after), four interleave
 | Before | 2,013-2,041 ms, median 2,026 | 2,009-2,013 ms | none |
 | After | 29-34 ms, median 31 | 2,007-2,008 ms | none |
 
+Tried and dropped (2026-10-30): appending the rest of the first live segment a keyframe group at a
+time as it downloads. At 8 Mb/s for the 6 Mb/s stream it moved the stall rather than shortening
+it: waits of 0.28 s at 3.0 s and 1.9 s at 7.4 s against 1.6 s at 3.1 s and 0.6 s at 8.7 s, 2.2 s in
+all either way. On a link that barely keeps up, total waiting is set by bandwidth.
+
