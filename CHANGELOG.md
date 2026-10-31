@@ -2,6 +2,8 @@
 
 ## Unreleased (0.2.0)
 
+- Start encrypted (AES-128) live channels as quickly as clear ones: the first segment is decrypted as it arrives instead of after the whole download, and its key is fetched alongside it. With 6 s 1080p segments at 40 Mb/s the first picture falls from 1.30 to 0.30 s.
+
 - Show a raw TS channel's first picture as soon as it arrives instead of at the next keyframe (on the test stream, 2.03 s to 0.03 s); playback still moves when the first keyframe group is complete, so it does not run dry. `Continuous` gives its first keyframe group picture by picture; add `Continuous::first_group_out`.
 
 - Show a live channel's first picture as soon as it has arrived: the first keyframe group of the first segment is appended picture by picture as it downloads, and playback moves once 1 s is buffered. With 6 s 1080p segments, the first picture falls from 0.58 to 0.29 s at 40 Mb/s and from 1.82 to 0.46 s at 8 Mb/s. `Transmuxer::take` now gives those pictures rather than whole keyframe groups. Fragments cut mid-stream, including `Continuous` keyframe groups, give their last picture its real duration instead of repeating the previous gap, which could re-base the clock on streams with uneven frame spacing. Add `ts::Demuxed::next_dts`.

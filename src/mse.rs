@@ -592,6 +592,12 @@ const KEY_LIMIT: usize = 1 << 10;
 const SKIP_LIMIT: u32 = 5;
 
 async fn decrypt(bytes: &[u8], key: &[u8], iv: &[u8; 16]) -> Result<Vec<u8>, Fail> {
+    let key = import_key(key).await?;
+    cbc("decrypt", &key, iv, bytes).await
+}
+
+/// An AES-128 key for WebCrypto, refused with what the server said when it is not 16 bytes.
+async fn import_key(key: &[u8]) -> Result<JsValue, Fail> {
     if key.len() != 16 {
         // A key server that is down often answers with a short text page: say what it said, as
         // plain words only, since a host may show statuses in its page.
@@ -609,14 +615,13 @@ async fn decrypt(bytes: &[u8], key: &[u8], iv: &[u8; 16]) -> Result<Vec<u8>, Fai
         )));
     }
     let inner = async {
-        let global = js_sys::global();
-        let crypto = js_sys::Reflect::get(&global, &"crypto".into())?;
-        let subtle = js_sys::Reflect::get(&crypto, &"subtle".into())?;
+        let subtle = subtle()?;
         let import =
             js_sys::Reflect::get(&subtle, &"importKey".into())?.dyn_into::<js_sys::Function>()?;
         let usages = js_sys::Array::new();
         usages.push(&"decrypt".into());
-        let key = JsFuture::from(
+        usages.push(&"encrypt".into());
+        JsFuture::from(
             import
                 .call5(
                     &subtle,
@@ -628,23 +633,68 @@ async fn decrypt(bytes: &[u8], key: &[u8], iv: &[u8; 16]) -> Result<Vec<u8>, Fai
                 )?
                 .dyn_into::<js_sys::Promise>()?,
         )
-        .await?;
-        let algorithm = js_sys::Object::new();
-        js_sys::Reflect::set(&algorithm, &"name".into(), &"AES-CBC".into())?;
-        js_sys::Reflect::set(&algorithm, &"iv".into(), &js_sys::Uint8Array::from(&iv[..]))?;
-        let decrypt =
-            js_sys::Reflect::get(&subtle, &"decrypt".into())?.dyn_into::<js_sys::Function>()?;
-        let plain = JsFuture::from(
-            decrypt
-                .call3(&subtle, &algorithm, &key, &js_sys::Uint8Array::from(bytes))?
-                .dyn_into::<js_sys::Promise>()?,
-        )
-        .await?;
-        Ok::<_, JsValue>(js_sys::Uint8Array::new(&plain).to_vec())
+        .await
     };
     inner
         .await
         .map_err(|e| Fail::Final(format!("HLS AES-CBC decryption failed: {}", js_err(e))))
+}
+
+fn subtle() -> Result<JsValue, JsValue> {
+    let crypto = js_sys::Reflect::get(&js_sys::global(), &"crypto".into())?;
+    js_sys::Reflect::get(&crypto, &"subtle".into())
+}
+
+/// One WebCrypto AES-CBC `encrypt` or `decrypt` call (PKCS#7 padding, as WebCrypto always uses).
+async fn cbc(op: &str, key: &JsValue, iv: &[u8; 16], data: &[u8]) -> Result<Vec<u8>, Fail> {
+    let inner = async {
+        let subtle = subtle()?;
+        let algorithm = js_sys::Object::new();
+        js_sys::Reflect::set(&algorithm, &"name".into(), &"AES-CBC".into())?;
+        js_sys::Reflect::set(&algorithm, &"iv".into(), &js_sys::Uint8Array::from(&iv[..]))?;
+        let call = js_sys::Reflect::get(&subtle, &op.into())?.dyn_into::<js_sys::Function>()?;
+        let out = JsFuture::from(
+            call.call3(&subtle, &algorithm, key, &js_sys::Uint8Array::from(data))?
+                .dyn_into::<js_sys::Promise>()?,
+        )
+        .await?;
+        Ok::<_, JsValue>(js_sys::Uint8Array::new(&out).to_vec())
+    };
+    inner
+        .await
+        .map_err(|e| Fail::Final(format!("HLS AES-CBC decryption failed: {}", js_err(e))))
+}
+
+/// AES-128-CBC decryption of a body as it arrives. WebCrypto only decrypts a whole message ending
+/// in padding, so each piece (its whole blocks but the last, kept for the real padding) is closed
+/// with a padding block made with the same key: CBC-encrypting a block of sixteen 16s after the
+/// piece's last block gives exactly the block that decrypts to it.
+struct Cbc {
+    key: JsValue,
+    iv: [u8; 16],
+    pending: Vec<u8>,
+}
+
+impl Cbc {
+    async fn feed(&mut self, chunk: &[u8]) -> Result<Vec<u8>, Fail> {
+        self.pending.extend_from_slice(chunk);
+        let whole = (self.pending.len() / 16).saturating_sub(1) * 16;
+        if whole == 0 {
+            return Ok(vec![]);
+        }
+        let last: [u8; 16] = self.pending[whole - 16..whole].try_into().unwrap();
+        let pad = cbc("encrypt", &self.key, &last, &[16; 16]).await?;
+        let mut piece = self.pending[..whole].to_vec();
+        piece.extend_from_slice(&pad[..16]);
+        let plain = cbc("decrypt", &self.key, &self.iv, &piece).await?;
+        self.iv = last;
+        self.pending.drain(..whole);
+        Ok(plain)
+    }
+
+    async fn finish(self) -> Result<Vec<u8>, Fail> {
+        cbc("decrypt", &self.key, &self.iv, &self.pending).await
+    }
 }
 
 /// A segment, downloaded straight into the transmuxer as it arrives, so no copy of it is ever held
@@ -782,7 +832,7 @@ const START_AHEAD: f64 = 1.0;
 
 /// A live stream's first segment, its first keyframe group appended picture by picture as it
 /// arrives while the rest downloads: the first picture shows as soon as it is in, and playback
-/// starts with [`START_AHEAD`] buffered. `Err(Fail)` when it failed before anything was appended:
+/// starts with [`START_AHEAD`] buffered. An AES-128 segment is decrypted as it arrives ([`Cbc`]). `Err(Fail)` when it failed before anything was appended:
 /// the caller retries it the usual way, this being the first attempt. After that, a failed download
 /// is not tried again, which would append those pictures twice: it is an error, and the segment is
 /// skipped like any unavailable one, the next glued on where this one stopped.
@@ -790,6 +840,8 @@ const START_AHEAD: f64 = 1.0;
 async fn stream_first(
     http: &impl Fetch,
     url: &str,
+    info: &hls::Segment,
+    base: &str,
     stop: &Cell<bool>,
     tx: &RefCell<Transmuxer>,
     video: &HtmlVideoElement,
@@ -800,7 +852,25 @@ async fn stream_first(
     started: &mut bool,
     report: &mut dyn FnMut(Status),
 ) -> Result<Result<Result<crate::Output, Failure>, Fail>, Failure> {
-    let r = match http.get(url, None).await {
+    // The key and the segment are asked for together: one round trip, not two.
+    let cbc = async {
+        let Some(key) = &info.key else {
+            return Ok(None);
+        };
+        let key_url = resolve(base, &key.uri).map_err(Fail::Final)?;
+        let bytes = fetch_resource(http, &key_url, None, KEY_LIMIT).await?.body;
+        Ok(Some(Cbc {
+            key: import_key(&bytes).await?,
+            iv: key.iv_for(info.seq),
+            pending: vec![],
+        }))
+    };
+    let (cbc, r) = both(cbc, http.get(url, None)).await;
+    let mut cbc = match cbc {
+        Ok(c) => c,
+        Err(e) => return Ok(Err(e)),
+    };
+    let r = match r {
         Ok(r) => r,
         Err(e) => return Ok(Err(e.into())),
     };
@@ -833,6 +903,14 @@ async fn stream_first(
             Err(why) => return Ok(Ok(Err(format!("download failed part way: {why}").into()))),
         };
         total += chunk.len();
+        let chunk = match cbc.as_mut() {
+            Some(c) => match c.feed(&chunk).await {
+                Ok(plain) => plain,
+                Err(e) if sb.is_none() => return Ok(Err(e)),
+                Err(e) => return Ok(Ok(Err(fail_why(e)))),
+            },
+            None => chunk,
+        };
         segment.feed(&chunk);
         let mut transmuxer = std::mem::take(&mut *tx.borrow_mut());
         let taken = transmuxer.take_yielded(&mut segment).await;
@@ -894,7 +972,45 @@ async fn stream_first(
             report(Status::Playing);
         }
     }
+    if let Some(c) = cbc {
+        match c.finish().await {
+            Ok(plain) => segment.feed(&plain),
+            Err(e) if sb.is_none() => return Ok(Err(e)),
+            Err(e) => return Ok(Ok(Err(fail_why(e)))),
+        }
+    }
     Ok(Ok(finish_segment(tx, segment).await))
+}
+
+/// Runs two futures at once and waits for both.
+async fn both<A: Future, B: Future>(a: A, b: B) -> (A::Output, B::Output) {
+    let (mut a, mut b) = (std::pin::pin!(a), std::pin::pin!(b));
+    let (mut ra, mut rb) = (None, None);
+    std::future::poll_fn(|cx| {
+        if ra.is_none()
+            && let Poll::Ready(v) = a.as_mut().poll(cx)
+        {
+            ra = Some(v);
+        }
+        if rb.is_none()
+            && let Poll::Ready(v) = b.as_mut().poll(cx)
+        {
+            rb = Some(v);
+        }
+        if ra.is_some() && rb.is_some() {
+            Poll::Ready((ra.take().unwrap(), rb.take().unwrap()))
+        } else {
+            Poll::Pending
+        }
+    })
+    .await
+}
+
+fn fail_why(e: Fail) -> Failure {
+    match e {
+        Fail::Retry(why) | Fail::Final(why) => why.into(),
+        Fail::Unsupported(why) => why.into(),
+    }
 }
 
 // One speculative download, polled alongside browser appends. No decoded state is changed
@@ -1383,13 +1499,14 @@ async fn run(
                 let streamed = if sb.is_none()
                     && audio_url.is_none()
                     && !media.ended
-                    && seg.key.is_none()
                     && seg.map.is_none()
                     && seg.byte_range.is_none()
                 {
                     stream_first(
                         http,
                         &url,
+                        seg,
+                        &latest.url,
                         stop,
                         &tx,
                         video,

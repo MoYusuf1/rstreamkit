@@ -1851,3 +1851,22 @@ time as it downloads. At 8 Mb/s for the 6 Mb/s stream it moved the stall rather 
 it: waits of 0.28 s at 3.0 s and 1.9 s at 7.4 s against 1.6 s at 3.1 s and 0.6 s at 8.7 s, 2.2 s in
 all either way. On a link that barely keeps up, total waiting is set by bandwidth.
 
+## An encrypted live channel starts like a clear one (2026-10-30)
+
+AES-128 segments were left out of the early first-segment path, since AES-CBC is decrypted as a
+whole message, so an encrypted channel still waited for its whole first segment. WebCrypto's
+`decrypt` only takes a message that ends in valid padding, but CBC itself decrypts block by block:
+each piece that arrives (its whole blocks but the last) is closed with one extra block, the
+CBC-encryption of sixteen 16s after the piece's last block, which decrypts to padding WebCrypto
+strips. The key and the segment are now requested together, so the key costs no extra round trip.
+
+The 1080p stream of the sections above re-segmented with `-c copy` and AES-128 (6 s segments,
+live), CDP 40 Mb/s and 100 ms latency, Chrome 156, builds of f8cc0ca (before) and this change
+(after), four interleaved pairs:
+
+| Build | First picture | Motion starts (`Playing`) | Waits in 3 s |
+| --- | ---: | ---: | --- |
+| Before | 1,292-1,302 ms, median 1,300 | 1,268-1,276 ms | none |
+| After, key then segment | 388-396 ms, median 392 | 519-523 ms | none |
+| After, key and segment together | 292-301 ms, median 300 | not recorded | none |
+
