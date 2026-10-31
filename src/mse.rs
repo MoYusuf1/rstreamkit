@@ -1910,11 +1910,16 @@ async fn run_ts(
                     append(video, buffer, &ms, &mut f.moof).await?;
                     append(video, buffer, &ms, &mut f.mdat).await?;
                 }
+                // The first picture shows at once; it moves once the first group is out whole, so
+                // the group after it arrives before that one has played out.
                 if !started {
-                    started = true;
-                    play(video);
-                    if !stop.get() {
-                        report(Status::Playing);
+                    to_start(video, buffer);
+                    if continuous.first_group_out() {
+                        started = true;
+                        play(video);
+                        if !stop.get() {
+                            report(Status::Playing);
+                        }
                     }
                 }
                 trim(video, buffer, &ms, 5.0).await?;
@@ -1935,6 +1940,12 @@ async fn run_ts(
         for f in &mut out.fragments {
             append(video, &buffer, &ms, &mut f.moof).await?;
             append(video, &buffer, &ms, &mut f.mdat).await?;
+        }
+        if !started {
+            begin(video, &buffer);
+            if !stop.get() {
+                report(Status::Playing);
+            }
         }
         wait_idle(&buffer, &ms).await?;
         let _ = ms.end_of_stream();

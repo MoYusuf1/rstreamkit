@@ -769,8 +769,10 @@ impl YieldSlice {
     }
 }
 
-/// Bounded continuous MPEG-TS input, cut into output fragments at keyframes.
-/// Unlike `Segment`, program tables and incomplete PES packets survive between feeds.
+/// Bounded continuous MPEG-TS input, cut into output fragments at keyframes, except the first
+/// keyframe group, which comes out picture by picture as it arrives so the first picture need not
+/// wait for the next keyframe. Unlike `Segment`, program tables and incomplete PES packets survive
+/// between feeds.
 pub struct Continuous {
     demuxer: ts::Demuxer,
     transmuxer: Transmuxer,
@@ -793,12 +795,23 @@ impl Continuous {
         self.transmuxer = self.transmuxer.decode_sound(on);
         self
     }
+    /// Whether the first keyframe group is out whole. From then on output comes a group at a time,
+    /// each when the next keyframe arrives, so playback started earlier may run dry.
+    pub fn first_group_out(&self) -> bool {
+        self.demuxer.first_group_taken()
+    }
+    fn take(&mut self) -> Result<Option<ts::Demuxed>, Error> {
+        match self.demuxer.take_pictures()? {
+            Some(d) => Ok(Some(d)),
+            None => Ok(self.demuxer.take_fragment()?),
+        }
+    }
     pub fn feed(&mut self, bytes: &[u8]) -> Result<Vec<Output>, Error> {
         let mut out = vec![];
         // Even a caller handing over a giant chunk cannot allocate it all before checking the cap.
         for bytes in bytes.chunks(16 << 10) {
             self.demuxer.feed(bytes);
-            while let Some(d) = self.demuxer.take_fragment()? {
+            while let Some(d) = self.take()? {
                 out.push(self.transmuxer.assemble(d)?);
             }
             if self.demuxer.buffered_bytes() > self.limit {
@@ -816,7 +829,7 @@ impl Continuous {
         let mut slice = YieldSlice::new();
         for bytes in bytes.chunks(16 << 10) {
             self.demuxer.feed(bytes);
-            while let Some(d) = self.demuxer.take_fragment()? {
+            while let Some(d) = self.take()? {
                 out.push(self.transmuxer.assemble_yielded(d, &mut slice).await?);
             }
             if self.demuxer.buffered_bytes() > self.limit {
@@ -1125,6 +1138,34 @@ mod tests {
         let video: Vec<u64> = parts.iter().map(|o| base_times(&o.fragment())[0]).collect();
         assert_eq!(video[0], 0);
         assert!(video.windows(2).all(|w| w[0] < w[1]), "{video:?}");
+    }
+
+    /// A continuous stream's first picture comes out as soon as it is in, not at the next keyframe
+    /// (here 97% of the way through), and the stream still holds exactly what one segment would.
+    #[test]
+    fn a_continuous_stream_starts_before_its_second_keyframe() {
+        let clip: &[u8] = include_bytes!("../tests/fixtures/bbb_480p.ts");
+        let mut w = Transmuxer::default();
+        let whole = w.push(clip).unwrap();
+        let mut c = Continuous::default();
+        let (mut parts, mut first_at) = (vec![], None);
+        for (i, chunk) in clip.chunks(1316).enumerate() {
+            let out = c.feed(chunk).unwrap();
+            if !out.is_empty() {
+                first_at.get_or_insert(i);
+            }
+            parts.extend(out);
+        }
+        assert!(first_at.unwrap() < clip.len() / 1316 / 6, "{first_at:?}");
+        let (vend, aend) = (c.transmuxer.vend, c.transmuxer.aend);
+        parts.push(c.finish().unwrap());
+        let payload = |o: &Output| o.fragments.iter().map(|f| f.mdat.len() - 8).sum::<usize>();
+        assert_eq!(parts.iter().map(payload).sum::<usize>(), payload(&whole));
+        assert!(vend > 0 && aend > 0);
+        assert_eq!(
+            parts[0].init.as_ref().unwrap().bytes,
+            whole.init.as_ref().unwrap().bytes
+        );
     }
 
     /// A download that fails part way is dropped, and the transmuxer has not noticed: the next

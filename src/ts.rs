@@ -317,7 +317,7 @@ pub struct Demuxer {
     carry: Vec<u8>,
     synced: bool,
     invalid_sync: bool,
-    /// `take_pictures` reached the end of the first keyframe group.
+    /// A cut reached the end of the first keyframe group.
     first_group_taken: bool,
     scrambled: bool,
     /// What the pictures' buffer started with, so a rebuild keeps it.
@@ -556,6 +556,10 @@ impl Demuxer {
     /// The first keyframe group's completed pictures as they arrive: all but the latest, whose
     /// duration the next one gives, once the sound they play with is in. Nothing after that group,
     /// where a new init could be due. Otherwise as [`take_fragment`](Self::take_fragment).
+    pub(crate) fn first_group_taken(&self) -> bool {
+        self.first_group_taken
+    }
+
     pub(crate) fn take_pictures(&mut self) -> Result<Option<Demuxed>, Error> {
         if self.first_group_taken {
             return Ok(None);
@@ -603,7 +607,7 @@ impl Demuxer {
         if !whole_groups && !audio_in {
             return Ok(None);
         }
-        self.first_group_taken |= !whole_groups && group_end.is_some();
+        self.first_group_taken |= group_end == Some(cut);
         let clock_reset = earlier(self.out.video[cut].dts, self.out.video[cut - 1].dts);
         let bytes: usize = self.out.video[..cut].iter().map(|v| v.len as usize).sum();
         // The next fragment's buffer starts at this one's size, so it doesn't grow (and copy, and

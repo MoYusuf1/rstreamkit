@@ -1828,3 +1828,21 @@ At 8 Mb/s the 6 Mb/s stream barely keeps up either way: both builds have played 
 picture instead (tried first) brought motion to 266 ms at 40 Mb/s but made the 8 Mb/s waits
 2.8 s, hence the 1 s threshold.
 
+## A raw TS channel shows its first picture without waiting for the next keyframe (2026-10-30)
+
+A raw MPEG-TS stream (no playlist) arrives in real time, and `Continuous` cut it at keyframes, so
+the first picture waited for the second keyframe: a whole keyframe interval of wall-clock time,
+1-5 s on typical IPTV. Its first keyframe group now comes out picture by picture, as the first
+live HLS segment's does. Motion still starts when that group is out whole
+(`Continuous::first_group_out`): later groups each come out when the next keyframe arrives, so
+starting earlier would only run dry, as a trial that played from the first picture did (one 2 s
+stall in every run).
+
+`tools/server.py`'s `/raw.ts` (320×180, one keyframe per 2 s, a 2 s piece every 2 s), Chrome 156
+unthrottled, builds of a531a05 (before) and this change (after), four interleaved pairs:
+
+| Build | First picture | Motion starts (`Playing`) | Waits in 6 s |
+| --- | ---: | ---: | --- |
+| Before | 2,013-2,041 ms, median 2,026 | 2,009-2,013 ms | none |
+| After | 29-34 ms, median 31 | 2,007-2,008 ms | none |
+
